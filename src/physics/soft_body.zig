@@ -205,7 +205,7 @@ pub const SoftBody = struct {
         var body = SoftBody.init(allocator, def);
         errdefer body.deinit();
 
-        const step = size / @as(f32, @floatFromInt(resolution - 1));
+        const spacing = size / @as(f32, @floatFromInt(resolution - 1));
         const half = size * 0.5;
 
         // Create particle grid
@@ -216,9 +216,9 @@ pub const SoftBody = struct {
             for (0..resolution) |iy| {
                 for (0..resolution) |ix| {
                     const pos: [3]f32 = .{
-                        center[0] - half + @as(f32, @floatFromInt(ix)) * step,
-                        center[1] - half + @as(f32, @floatFromInt(iy)) * step,
-                        center[2] - half + @as(f32, @floatFromInt(iz)) * step,
+                        center[0] - half + @as(f32, @floatFromInt(ix)) * spacing,
+                        center[1] - half + @as(f32, @floatFromInt(iy)) * spacing,
+                        center[2] - half + @as(f32, @floatFromInt(iz)) * spacing,
                     };
 
                     const idx = try body.addParticle(pos, false);

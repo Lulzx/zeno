@@ -128,6 +128,8 @@ envs.close()
 | `Zeno/Hopper-v0` | Single-leg hopping |
 | `Zeno/Walker2d-v0` | Bipedal walking |
 | `Zeno/Swimmer-v0` | 3-link swimmer |
+| `Zeno/Reacher-v0` | 2-link planar arm reaching |
+| `Zeno/Pusher-v0` | 3-DOF arm pushing object |
 
 ## Stable-Baselines3 Integration
 

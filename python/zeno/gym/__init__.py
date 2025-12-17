@@ -29,6 +29,8 @@ Available Environments
 - Zeno/Hopper-v0
 - Zeno/Walker2d-v0
 - Zeno/Swimmer-v0
+- Zeno/Reacher-v0
+- Zeno/Pusher-v0
 """
 
 from .registration import (

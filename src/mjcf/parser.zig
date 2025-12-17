@@ -61,6 +61,11 @@ fn parseXmlWithIncludes(allocator: std.mem.Allocator, xml: []const u8, model_dir
 
 /// Process include directives recursively.
 fn processIncludes(allocator: std.mem.Allocator, xml: []const u8, model_dir: []const u8) ![]const u8 {
+    // Quick check: if no includes at all, return original XML (avoid copying)
+    if (std.mem.indexOf(u8, xml, "<include") == null) {
+        return xml;
+    }
+
     // Find include directives
     var result: std.ArrayListUnmanaged(u8) = .{};
     errdefer result.deinit(allocator);

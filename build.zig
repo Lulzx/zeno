@@ -88,6 +88,10 @@ pub fn build(b: *std.Build) void {
         "tests/test_collision.zig",
         "tests/test_mjcf.zig",
         "tests/test_xpbd.zig",
+        "tests/test_memory.zig",
+        "tests/test_environments.zig",
+        "tests/test_softbody.zig",
+        "tests/test_fluid.zig",
     };
 
     for (test_files) |test_file| {

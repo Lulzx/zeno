@@ -74,6 +74,16 @@ ENV_CONFIGS = {
         "max_episode_steps": 1000,
         "reward_threshold": 360.0,
     },
+    "Reacher": {
+        "mjcf_file": "reacher.xml",
+        "max_episode_steps": 50,
+        "reward_threshold": -3.75,
+    },
+    "Pusher": {
+        "mjcf_file": "pusher.xml",
+        "max_episode_steps": 100,
+        "reward_threshold": 0.0,
+    },
 }
 
 

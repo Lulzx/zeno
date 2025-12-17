@@ -1,0 +1,78 @@
+<!-- Pusher: 3-DOF planar arm pushing object to target
+     Based on MuJoCo Gymnasium Pusher-v4 environment
+     Task: Control arm to push a cylinder to a goal position -->
+<mujoco model="pusher">
+    <option timestep="0.02" gravity="0 0 -9.81"/>
+
+    <default>
+        <joint damping="0.5" armature="0.01"/>
+        <geom friction="1 0.5 0.01"/>
+    </default>
+
+    <worldbody>
+        <!-- Table surface -->
+        <geom name="table" type="plane" size="1 1 0.1" rgba="0.6 0.5 0.4 1"/>
+
+        <!-- Robot base -->
+        <body name="base" pos="0 0 0">
+            <geom type="cylinder" size="0.08 0.02" rgba="0.3 0.3 0.3 1"/>
+
+            <!-- Shoulder link -->
+            <body name="r_shoulder" pos="0 0 0.02">
+                <joint name="r_shoulder_pan_joint" type="hinge" axis="0 0 1" range="-2.28 1.71"/>
+                <geom type="capsule" fromto="0 0 0 0.1 0 0" size="0.02" rgba="0.5 0.5 0.5 1"/>
+
+                <!-- Upper arm -->
+                <body name="r_upper_arm" pos="0.1 0 0">
+                    <joint name="r_shoulder_lift_joint" type="hinge" axis="0 0 1" range="-0.52 1.39"/>
+                    <geom type="capsule" fromto="0 0 0 0.1 0 0" size="0.02" rgba="0.5 0.5 0.5 1"/>
+
+                    <!-- Forearm -->
+                    <body name="r_forearm" pos="0.1 0 0">
+                        <joint name="r_elbow_flex_joint" type="hinge" axis="0 0 1" range="-2.32 0"/>
+                        <geom type="capsule" fromto="0 0 0 0.1 0 0" size="0.02" rgba="0.5 0.5 0.5 1"/>
+
+                        <!-- Wrist / End effector -->
+                        <body name="r_wrist" pos="0.1 0 0">
+                            <geom name="fingertip" type="sphere" size="0.03" rgba="0.8 0.2 0.2 1"/>
+                        </body>
+                    </body>
+                </body>
+            </body>
+        </body>
+
+        <!-- Object to push -->
+        <body name="object" pos="0.2 0.1 0.03">
+            <joint name="object_x" type="slide" axis="1 0 0" damping="0.01"/>
+            <joint name="object_y" type="slide" axis="0 1 0" damping="0.01"/>
+            <geom name="object" type="cylinder" size="0.03 0.03" mass="0.1" rgba="0.2 0.2 0.8 1"/>
+        </body>
+
+        <!-- Goal position marker -->
+        <body name="goal" pos="0.3 0.2 0.01">
+            <geom name="goal" type="cylinder" size="0.05 0.005" rgba="0.2 0.8 0.2 0.5"/>
+        </body>
+    </worldbody>
+
+    <actuator>
+        <motor joint="r_shoulder_pan_joint" ctrlrange="-2 2" gear="100"/>
+        <motor joint="r_shoulder_lift_joint" ctrlrange="-2 2" gear="100"/>
+        <motor joint="r_elbow_flex_joint" ctrlrange="-2 2" gear="100"/>
+    </actuator>
+
+    <sensor>
+        <!-- Robot state -->
+        <jointpos joint="r_shoulder_pan_joint"/>
+        <jointpos joint="r_shoulder_lift_joint"/>
+        <jointpos joint="r_elbow_flex_joint"/>
+        <jointvel joint="r_shoulder_pan_joint"/>
+        <jointvel joint="r_shoulder_lift_joint"/>
+        <jointvel joint="r_elbow_flex_joint"/>
+        <!-- End effector position -->
+        <framepos objtype="geom" objname="fingertip"/>
+        <!-- Object position -->
+        <framepos objtype="body" objname="object"/>
+        <!-- Goal position -->
+        <framepos objtype="body" objname="goal"/>
+    </sensor>
+</mujoco>

@@ -36,6 +36,12 @@ The name references Zeno of Elea, whose paradoxes on motion and infinity are fou
 - **Cartpole** — 3 bodies, 2 joints, 1 actuator
 - **Ant** — 9 bodies, 9 joints, 8 actuators
 - **Humanoid** — 14 bodies, 14 joints, 13 actuators
+- **HalfCheetah** — 8 bodies, 6 joints, 6 actuators
+- **Hopper** — 5 bodies, 3 joints, 3 actuators
+- **Walker2d** — 8 bodies, 6 joints, 6 actuators
+- **Swimmer** — 4 bodies, 2 joints, 2 actuators
+- **Reacher** — 5 bodies, 2 joints, 2 actuators
+- **Pusher** — 6 bodies, 5 joints, 3 actuators
 
 ## Performance
 
@@ -198,7 +204,7 @@ pub fn main() !void {
 
 ## Supported Models
 
-Zeno includes several standard robotics environments:
+Zeno includes 10 standard robotics environments:
 
 | Environment | Bodies | Joints | Actuators | Description |
 |-------------|--------|--------|-----------|-------------|
@@ -206,6 +212,12 @@ Zeno includes several standard robotics environments:
 | Cartpole | 3 | 2 | 1 | Classic cart-pole balancing |
 | Ant | 9 | 9 | 8 | Quadruped locomotion |
 | Humanoid | 14 | 14 | 13 | Bipedal humanoid walking |
+| HalfCheetah | 8 | 6 | 6 | Fast running cheetah |
+| Hopper | 5 | 3 | 3 | Single-leg hopping |
+| Walker2d | 8 | 6 | 6 | Bipedal walking |
+| Swimmer | 4 | 2 | 2 | 3-link swimmer |
+| Reacher | 5 | 2 | 2 | 2-link planar arm reaching |
+| Pusher | 6 | 5 | 3 | 3-DOF arm pushing object |
 
 ## Architecture
 

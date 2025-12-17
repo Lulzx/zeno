@@ -17,6 +17,10 @@ pub const physics = struct {
     pub const joint = @import("physics/joint.zig");
     pub const contact = @import("physics/contact.zig");
     pub const state = @import("physics/state.zig");
+    pub const soft_body = @import("physics/soft_body.zig");
+    pub const fluid = @import("physics/fluid.zig");
+    pub const xpbd = @import("physics/xpbd.zig");
+    pub const tendon = @import("physics/tendon.zig");
 };
 pub const collision = struct {
     pub const primitives = @import("collision/primitives.zig");
