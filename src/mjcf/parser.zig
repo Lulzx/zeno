@@ -997,9 +997,15 @@ fn convertGeom(mjcf_geom: *const schema.MjcfGeom) primitives.Geom {
             geom.size = .{ 0, 0, 0 };
         },
         .mesh => {
-            // Not supported, use sphere approximation
-            geom.geom_type = .sphere;
+            // Mesh geom - for now use sphere approximation
+            geom.geom_type = .mesh;
             geom.size = .{ 0.1, 0, 0 };
+        },
+        .hfield => {
+            // Heightfield terrain
+            geom.geom_type = .heightfield;
+            // Size will be set based on heightfield asset
+            geom.size = .{ 1, 1, 1 };
         },
     }
 

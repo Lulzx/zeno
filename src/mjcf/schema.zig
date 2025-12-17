@@ -10,6 +10,7 @@ pub const GeomType = enum {
     cylinder,
     box,
     mesh,
+    hfield,
 
     pub fn fromString(s: []const u8) ?GeomType {
         const map = std.StaticStringMap(GeomType).initComptime(.{
@@ -19,6 +20,7 @@ pub const GeomType = enum {
             .{ "cylinder", .cylinder },
             .{ "box", .box },
             .{ "mesh", .mesh },
+            .{ "hfield", .hfield },
         });
         return map.get(s);
     }
@@ -165,6 +167,7 @@ pub const MjcfGeom = struct {
     group: u32 = 0,
     mesh: []const u8 = "", // Reference to mesh asset name
     material: []const u8 = "", // Reference to material asset name
+    hfield: []const u8 = "", // Reference to heightfield asset name
 };
 
 /// Parsed MJCF site element.
@@ -214,6 +217,19 @@ pub const MjcfMesh = struct {
     name: []const u8 = "",
     file: []const u8 = "",
     scale: [3]f32 = .{ 1, 1, 1 },
+};
+
+/// Parsed MJCF heightfield asset.
+pub const MjcfHeightfield = struct {
+    name: []const u8 = "",
+    /// File containing height data (PNG grayscale image).
+    file: []const u8 = "",
+    /// Number of rows in the heightfield grid.
+    nrow: u32 = 0,
+    /// Number of columns in the heightfield grid.
+    ncol: u32 = 0,
+    /// Size: [radius_x, radius_y, elevation, base].
+    size: [4]f32 = .{ 1, 1, 1, 0 },
 };
 
 /// Texture type enumeration.
@@ -403,6 +419,7 @@ pub const MjcfModel = struct {
     actuators: std.ArrayListUnmanaged(MjcfActuator) = .{},
     sensors: std.ArrayListUnmanaged(MjcfSensor) = .{},
     meshes: std.ArrayListUnmanaged(MjcfMesh) = .{},
+    heightfields: std.ArrayListUnmanaged(MjcfHeightfield) = .{},
     textures: std.ArrayListUnmanaged(MjcfTexture) = .{},
     materials: std.ArrayListUnmanaged(MjcfMaterial) = .{},
     tendons: std.ArrayListUnmanaged(MjcfTendon) = .{},
@@ -415,6 +432,7 @@ pub const MjcfModel = struct {
         self.sensors.deinit(allocator);
         self.defaults.deinit(allocator);
         self.meshes.deinit(allocator);
+        self.heightfields.deinit(allocator);
         self.textures.deinit(allocator);
         self.materials.deinit(allocator);
         for (self.tendons.items) |*t| {

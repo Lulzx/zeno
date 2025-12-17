@@ -41,6 +41,7 @@ pub fn detectCollision(
             .capsule => sphereCapsule(pos_a, geom_a.getRadius(), pos_b, geom_b, transform_b),
             .box => sphereBox(pos_a, geom_a.getRadius(), pos_b, geom_b, transform_b),
             .plane => spherePlane(pos_a, geom_a.getRadius(), geom_b, transform_b),
+            .heightfield => sphereHeightfield(pos_a, geom_a.getRadius(), geom_b, transform_b),
             else => null,
         },
         .capsule => switch (geom_b.geom_type) {
@@ -52,6 +53,7 @@ pub fn detectCollision(
             },
             .capsule => capsuleCapsule(pos_a, geom_a, transform_a, pos_b, geom_b, transform_b),
             .plane => capsulePlane(pos_a, geom_a, transform_a, geom_b, transform_b),
+            .heightfield => capsuleHeightfield(pos_a, geom_a, transform_a, geom_b, transform_b),
             else => null,
         },
         .box => switch (geom_b.geom_type) {
@@ -63,6 +65,7 @@ pub fn detectCollision(
             },
             .plane => boxPlane(pos_a, geom_a, transform_a, geom_b, transform_b),
             .box => boxBox(pos_a, geom_a, transform_a, pos_b, geom_b, transform_b),
+            .heightfield => boxHeightfield(pos_a, geom_a, transform_a, geom_b, transform_b),
             else => null,
         },
         .plane => switch (geom_b.geom_type) {
@@ -80,6 +83,27 @@ pub fn detectCollision(
             },
             .box => blk: {
                 if (boxPlane(pos_b, geom_b, transform_b, geom_a, transform_a)) |r| {
+                    break :blk flipContact(r);
+                }
+                break :blk null;
+            },
+            else => null,
+        },
+        .heightfield => switch (geom_b.geom_type) {
+            .sphere => blk: {
+                if (sphereHeightfield(pos_b, geom_b.getRadius(), geom_a, transform_a)) |r| {
+                    break :blk flipContact(r);
+                }
+                break :blk null;
+            },
+            .capsule => blk: {
+                if (capsuleHeightfield(pos_b, geom_b, transform_b, geom_a, transform_a)) |r| {
+                    break :blk flipContact(r);
+                }
+                break :blk null;
+            },
+            .box => blk: {
+                if (boxHeightfield(pos_b, geom_b, transform_b, geom_a, transform_a)) |r| {
                     break :blk flipContact(r);
                 }
                 break :blk null;
@@ -475,6 +499,184 @@ fn boxBox(
         .penetration = min_overlap,
         .local_a = .{ 0, 0, 0 },
         .local_b = .{ 0, 0, 0 },
+    };
+}
+
+/// Sphere-heightfield collision.
+fn sphereHeightfield(
+    sphere_pos: [3]f32,
+    sphere_radius: f32,
+    hf_geom: *const primitives.Geom,
+    hf_transform: *const body.Transform,
+) ?ContactResult {
+    const hf = hf_geom.heightfield_ptr orelse return null;
+
+    // Transform sphere to heightfield local space
+    const inv_transform = hf_transform.inverse();
+    const local_pos = inv_transform.transformPoint(sphere_pos);
+
+    // Sample height at sphere XY position
+    const terrain_height = hf.sampleHeight(local_pos[0], local_pos[1]) orelse return null;
+
+    // Check if sphere is above terrain
+    const sphere_bottom = local_pos[2] - sphere_radius;
+    if (sphere_bottom >= terrain_height) {
+        return null;
+    }
+
+    // Get terrain normal at this position
+    const local_normal = hf.sampleNormal(local_pos[0], local_pos[1]) orelse [3]f32{ 0, 0, 1 };
+
+    // Transform normal to world space
+    const world_normal = hf_transform.transformVector(local_normal);
+
+    const penetration = terrain_height - sphere_bottom;
+    const contact_point = hf_transform.transformPoint(.{
+        local_pos[0],
+        local_pos[1],
+        terrain_height,
+    });
+
+    return ContactResult{
+        .point = contact_point,
+        .normal = world_normal,
+        .penetration = penetration,
+        .local_a = scale(world_normal, -sphere_radius),
+        .local_b = .{ local_pos[0], local_pos[1], terrain_height },
+    };
+}
+
+/// Capsule-heightfield collision.
+fn capsuleHeightfield(
+    capsule_pos: [3]f32,
+    capsule: *const primitives.Geom,
+    capsule_transform: *const body.Transform,
+    hf_geom: *const primitives.Geom,
+    hf_transform: *const body.Transform,
+) ?ContactResult {
+    const hf = hf_geom.heightfield_ptr orelse return null;
+
+    const radius = capsule.getRadius();
+    const half_len = capsule.getHalfLength();
+    const axis = capsule_transform.transformVector(.{ 0, 0, 1 });
+
+    // Check both capsule endpoints against heightfield
+    const p1 = sub(capsule_pos, scale(axis, half_len));
+    const p2 = add(capsule_pos, scale(axis, half_len));
+
+    // Transform to heightfield local space
+    const inv_transform = hf_transform.inverse();
+    const local_p1 = inv_transform.transformPoint(p1);
+    const local_p2 = inv_transform.transformPoint(p2);
+
+    // Sample heights at both endpoints
+    const h1 = hf.sampleHeight(local_p1[0], local_p1[1]);
+    const h2 = hf.sampleHeight(local_p2[0], local_p2[1]);
+
+    if (h1 == null and h2 == null) return null;
+
+    // Find deepest penetrating endpoint
+    var deepest_local: [3]f32 = undefined;
+    var deepest_world: [3]f32 = undefined;
+    var max_pen: f32 = -std.math.inf(f32);
+
+    if (h1) |terrain_h1| {
+        const pen1 = terrain_h1 - (local_p1[2] - radius);
+        if (pen1 > max_pen) {
+            max_pen = pen1;
+            deepest_local = local_p1;
+            deepest_world = p1;
+        }
+    }
+
+    if (h2) |terrain_h2| {
+        const pen2 = terrain_h2 - (local_p2[2] - radius);
+        if (pen2 > max_pen) {
+            max_pen = pen2;
+            deepest_local = local_p2;
+            deepest_world = p2;
+        }
+    }
+
+    if (max_pen <= 0) return null;
+
+    // Get terrain normal at deepest point
+    const local_normal = hf.sampleNormal(deepest_local[0], deepest_local[1]) orelse [3]f32{ 0, 0, 1 };
+    const world_normal = hf_transform.transformVector(local_normal);
+
+    const terrain_height = hf.sampleHeight(deepest_local[0], deepest_local[1]) orelse 0;
+    const contact_point = hf_transform.transformPoint(.{
+        deepest_local[0],
+        deepest_local[1],
+        terrain_height,
+    });
+
+    return ContactResult{
+        .point = contact_point,
+        .normal = world_normal,
+        .penetration = max_pen,
+        .local_a = scale(world_normal, -radius),
+        .local_b = .{ deepest_local[0], deepest_local[1], terrain_height },
+    };
+}
+
+/// Box-heightfield collision.
+fn boxHeightfield(
+    _: [3]f32, // box_pos unused
+    box: *const primitives.Geom,
+    box_transform: *const body.Transform,
+    hf_geom: *const primitives.Geom,
+    hf_transform: *const body.Transform,
+) ?ContactResult {
+    const hf = hf_geom.heightfield_ptr orelse return null;
+
+    const half_extents = box.getHalfExtents();
+    const inv_hf_transform = hf_transform.inverse();
+
+    // Check all 8 corners of the box
+    const corners = [8][3]f32{
+        .{ -half_extents[0], -half_extents[1], -half_extents[2] },
+        .{ half_extents[0], -half_extents[1], -half_extents[2] },
+        .{ -half_extents[0], half_extents[1], -half_extents[2] },
+        .{ half_extents[0], half_extents[1], -half_extents[2] },
+        .{ -half_extents[0], -half_extents[1], half_extents[2] },
+        .{ half_extents[0], -half_extents[1], half_extents[2] },
+        .{ -half_extents[0], half_extents[1], half_extents[2] },
+        .{ half_extents[0], half_extents[1], half_extents[2] },
+    };
+
+    var max_pen: f32 = -std.math.inf(f32);
+    var deepest_corner: [3]f32 = undefined;
+    var deepest_world: [3]f32 = undefined;
+    var deepest_local_hf: [3]f32 = undefined;
+
+    for (corners) |corner| {
+        const world_corner = box_transform.transformPoint(corner);
+        const local_hf = inv_hf_transform.transformPoint(world_corner);
+
+        if (hf.sampleHeight(local_hf[0], local_hf[1])) |terrain_h| {
+            const pen = terrain_h - local_hf[2];
+            if (pen > max_pen) {
+                max_pen = pen;
+                deepest_corner = corner;
+                deepest_world = world_corner;
+                deepest_local_hf = local_hf;
+            }
+        }
+    }
+
+    if (max_pen <= 0) return null;
+
+    // Get terrain normal at deepest point
+    const local_normal = hf.sampleNormal(deepest_local_hf[0], deepest_local_hf[1]) orelse [3]f32{ 0, 0, 1 };
+    const world_normal = hf_transform.transformVector(local_normal);
+
+    return ContactResult{
+        .point = deepest_world,
+        .normal = world_normal,
+        .penetration = max_pen,
+        .local_a = deepest_corner,
+        .local_b = deepest_local_hf,
     };
 }
 

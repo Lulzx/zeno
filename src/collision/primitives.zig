@@ -6,6 +6,120 @@ const constants = @import("../physics/constants.zig");
 
 const mesh_mod = @import("mesh.zig");
 
+/// Heightfield terrain data.
+/// Stores height samples in a regular grid for efficient terrain collision.
+pub const Heightfield = struct {
+    /// Height data (row-major, size = rows * cols).
+    data: []const f32,
+    /// Number of rows (Y direction).
+    rows: u32,
+    /// Number of columns (X direction).
+    cols: u32,
+    /// Grid spacing in X direction.
+    spacing_x: f32,
+    /// Grid spacing in Y direction.
+    spacing_y: f32,
+    /// Base height offset.
+    base_height: f32 = 0.0,
+    /// Scale factor for height values.
+    height_scale: f32 = 1.0,
+
+    /// Sample height at a world XY position.
+    /// Returns interpolated height or null if outside bounds.
+    pub fn sampleHeight(self: *const Heightfield, world_x: f32, world_y: f32) ?f32 {
+        // Convert world coords to grid coords
+        const half_width = @as(f32, @floatFromInt(self.cols - 1)) * self.spacing_x * 0.5;
+        const half_height = @as(f32, @floatFromInt(self.rows - 1)) * self.spacing_y * 0.5;
+
+        const grid_x = (world_x + half_width) / self.spacing_x;
+        const grid_y = (world_y + half_height) / self.spacing_y;
+
+        // Check bounds
+        if (grid_x < 0 or grid_y < 0) return null;
+        if (grid_x >= @as(f32, @floatFromInt(self.cols - 1)) or
+            grid_y >= @as(f32, @floatFromInt(self.rows - 1)))
+        {
+            return null;
+        }
+
+        // Bilinear interpolation
+        const ix: u32 = @intFromFloat(grid_x);
+        const iy: u32 = @intFromFloat(grid_y);
+        const fx = grid_x - @as(f32, @floatFromInt(ix));
+        const fy = grid_y - @as(f32, @floatFromInt(iy));
+
+        const h00 = self.getHeight(ix, iy);
+        const h10 = self.getHeight(ix + 1, iy);
+        const h01 = self.getHeight(ix, iy + 1);
+        const h11 = self.getHeight(ix + 1, iy + 1);
+
+        // Bilinear interpolation
+        const h0 = h00 * (1 - fx) + h10 * fx;
+        const h1 = h01 * (1 - fx) + h11 * fx;
+        const height = h0 * (1 - fy) + h1 * fy;
+
+        return height * self.height_scale + self.base_height;
+    }
+
+    /// Sample surface normal at a world XY position.
+    pub fn sampleNormal(self: *const Heightfield, world_x: f32, world_y: f32) ?[3]f32 {
+        const half_width = @as(f32, @floatFromInt(self.cols - 1)) * self.spacing_x * 0.5;
+        const half_height = @as(f32, @floatFromInt(self.rows - 1)) * self.spacing_y * 0.5;
+
+        const grid_x = (world_x + half_width) / self.spacing_x;
+        const grid_y = (world_y + half_height) / self.spacing_y;
+
+        if (grid_x < 1 or grid_y < 1) return null;
+        if (grid_x >= @as(f32, @floatFromInt(self.cols - 2)) or
+            grid_y >= @as(f32, @floatFromInt(self.rows - 2)))
+        {
+            return null;
+        }
+
+        const ix: u32 = @intFromFloat(grid_x);
+        const iy: u32 = @intFromFloat(grid_y);
+
+        // Compute gradient using central differences
+        const hL = self.getHeight(ix - 1, iy) * self.height_scale;
+        const hR = self.getHeight(ix + 1, iy) * self.height_scale;
+        const hD = self.getHeight(ix, iy - 1) * self.height_scale;
+        const hU = self.getHeight(ix, iy + 1) * self.height_scale;
+
+        const dx = (hR - hL) / (2.0 * self.spacing_x);
+        const dy = (hU - hD) / (2.0 * self.spacing_y);
+
+        // Normal = normalize(-dx, -dy, 1)
+        const len = @sqrt(dx * dx + dy * dy + 1.0);
+        return .{ -dx / len, -dy / len, 1.0 / len };
+    }
+
+    /// Get height at grid coordinates (clamped to bounds).
+    pub fn getHeight(self: *const Heightfield, x: u32, y: u32) f32 {
+        const cx = @min(x, self.cols - 1);
+        const cy = @min(y, self.rows - 1);
+        return self.data[cy * self.cols + cx];
+    }
+
+    /// Get world-space bounds of the heightfield.
+    pub fn getBounds(self: *const Heightfield) struct { min: [3]f32, max: [3]f32 } {
+        const half_width = @as(f32, @floatFromInt(self.cols - 1)) * self.spacing_x * 0.5;
+        const half_depth = @as(f32, @floatFromInt(self.rows - 1)) * self.spacing_y * 0.5;
+
+        // Find min/max heights
+        var min_h: f32 = std.math.inf(f32);
+        var max_h: f32 = -std.math.inf(f32);
+        for (self.data) |h| {
+            min_h = @min(min_h, h);
+            max_h = @max(max_h, h);
+        }
+
+        return .{
+            .min = .{ -half_width, -half_depth, min_h * self.height_scale + self.base_height },
+            .max = .{ half_width, half_depth, max_h * self.height_scale + self.base_height },
+        };
+    }
+};
+
 /// Geometry type enumeration.
 pub const GeomType = enum(u8) {
     sphere = 0,
@@ -14,6 +128,7 @@ pub const GeomType = enum(u8) {
     plane = 3,
     cylinder = 4,
     mesh = 5,
+    heightfield = 6,
 };
 
 /// Geometry definition.
@@ -44,6 +159,10 @@ pub const Geom = struct {
     mesh_id: u32 = 0,
     /// Optional pointer to mesh data (not owned).
     mesh_ptr: ?*const mesh_mod.Mesh = null,
+    /// Heightfield asset index (for heightfield type).
+    heightfield_id: u32 = 0,
+    /// Optional pointer to heightfield data (not owned).
+    heightfield_ptr: ?*const Heightfield = null,
 
     /// Create a sphere geometry.
     pub fn sphere(radius: f32) Geom {
@@ -83,6 +202,20 @@ pub const Geom = struct {
         return .{
             .geom_type = .cylinder,
             .size = .{ radius, half_height, 0 },
+        };
+    }
+
+    /// Create a heightfield geometry.
+    pub fn heightfield(hf: *const Heightfield) Geom {
+        const bounds = hf.getBounds();
+        return .{
+            .geom_type = .heightfield,
+            .size = .{
+                (bounds.max[0] - bounds.min[0]) * 0.5,
+                (bounds.max[1] - bounds.min[1]) * 0.5,
+                (bounds.max[2] - bounds.min[2]) * 0.5,
+            },
+            .heightfield_ptr = hf,
         };
     }
 
@@ -153,6 +286,24 @@ pub const Geom = struct {
                     .min = .{ -1, -1, -1 },
                     .max = .{ 1, 1, 1 },
                 },
+            .heightfield => if (self.heightfield_ptr) |hf| blk: {
+                const bounds = hf.getBounds();
+                break :blk body.AABB{
+                    .min = .{
+                        self.local_pos[0] + bounds.min[0],
+                        self.local_pos[1] + bounds.min[1],
+                        self.local_pos[2] + bounds.min[2],
+                    },
+                    .max = .{
+                        self.local_pos[0] + bounds.max[0],
+                        self.local_pos[1] + bounds.max[1],
+                        self.local_pos[2] + bounds.max[2],
+                    },
+                };
+            } else body.AABB{
+                .min = .{ -10, -10, -1 },
+                .max = .{ 10, 10, 1 },
+            },
         };
     }
 
@@ -209,6 +360,7 @@ pub const Geom = struct {
             },
             .plane => 0.0,
             .mesh => if (self.mesh_ptr) |m| m.volume() else 0.0,
+            .heightfield => 0.0, // Heightfield is static terrain, no volume
         };
     }
 
@@ -253,6 +405,7 @@ pub const Geom = struct {
             },
             .plane => .{ 0, 0, 0 },
             .mesh => if (self.mesh_ptr) |m| m.computeInertia(mass) else .{ 0, 0, 0 },
+            .heightfield => .{ 0, 0, 0 }, // Heightfield is static terrain
         };
     }
 
