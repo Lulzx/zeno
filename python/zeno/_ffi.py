@@ -1,12 +1,35 @@
 """
 CFFI bindings for the Zeno physics engine.
 Provides zero-copy access to GPU buffers via unified memory.
+
+Zero-Copy Architecture
+----------------------
+Zeno leverages Apple Silicon's unified memory to provide true zero-copy
+access to simulation state. All state arrays (positions, velocities, etc.)
+are stored in MTLBuffer objects with storageModeShared, meaning both CPU
+and GPU can access the same physical memory without copies.
+
+The numpy arrays returned by get_* methods are views into this shared memory,
+providing O(1) state access regardless of the number of environments.
+
+Thread Safety
+-------------
+State accessors are thread-safe for reading. Writing to state arrays
+should only be done when no GPU work is in flight (after step() returns).
+
+Memory Layout
+-------------
+All state is stored in Structure-of-Arrays (SoA) format with float4 alignment:
+- Positions: [num_envs, num_bodies, 4] (x, y, z, padding)
+- Quaternions: [num_envs, num_bodies, 4] (x, y, z, w)
+- Velocities: [num_envs, num_bodies, 4] (vx, vy, vz, padding)
 """
 
 import os
 import sys
+import weakref
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, Tuple, List
 
 import cffi
 import numpy as np
@@ -14,7 +37,7 @@ import numpy as np
 # Initialize FFI
 ffi = cffi.FFI()
 
-# C declarations
+# C declarations - Extended API
 ffi.cdef("""
     // Types
     typedef void* ZenoWorldHandle;
@@ -26,6 +49,10 @@ ffi.cdef("""
         uint32_t max_contacts_per_env;
         uint64_t seed;
         uint32_t substeps;
+        bool enable_profiling;
+        uint32_t max_bodies_per_env;
+        uint32_t max_joints_per_env;
+        uint32_t max_geoms_per_env;
     } ZenoConfig;
 
     typedef struct {
@@ -33,11 +60,25 @@ ffi.cdef("""
         uint32_t num_bodies;
         uint32_t num_joints;
         uint32_t num_actuators;
+        uint32_t num_sensors;
+        uint32_t num_geoms;
         uint32_t obs_dim;
         uint32_t action_dim;
         float timestep;
         uint64_t memory_usage;
+        uint64_t gpu_memory_usage;
+        bool metal_available;
     } ZenoInfo;
+
+    typedef struct {
+        float integrate_ns;
+        float collision_broad_ns;
+        float collision_narrow_ns;
+        float constraint_solve_ns;
+        float total_step_ns;
+        uint32_t num_contacts;
+        uint32_t num_active_constraints;
+    } ZenoProfilingData;
 
     typedef enum {
         ZENO_SUCCESS = 0,
@@ -47,6 +88,7 @@ ffi.cdef("""
         ZENO_METAL_ERROR = -4,
         ZENO_OUT_OF_MEMORY = -5,
         ZENO_INVALID_ARGUMENT = -6,
+        ZENO_NOT_IMPLEMENTED = -7,
     } ZenoError;
 
     // World lifecycle
@@ -74,22 +116,95 @@ ffi.cdef("""
         const uint8_t* env_mask
     );
 
-    // State access (zero-copy)
+    int zeno_world_reset_to_state(
+        ZenoWorldHandle world,
+        const float* positions,
+        const float* quaternions,
+        const float* velocities,
+        const float* angular_velocities,
+        const uint8_t* env_mask
+    );
+
+    // State access (zero-copy) - Core
     float* zeno_world_get_observations(ZenoWorldHandle world);
     float* zeno_world_get_rewards(ZenoWorldHandle world);
     uint8_t* zeno_world_get_dones(ZenoWorldHandle world);
+
+    // State access (zero-copy) - Body state
     float* zeno_world_get_body_positions(ZenoWorldHandle world);
     float* zeno_world_get_body_quaternions(ZenoWorldHandle world);
+    float* zeno_world_get_body_velocities(ZenoWorldHandle world);
+    float* zeno_world_get_body_angular_velocities(ZenoWorldHandle world);
+    float* zeno_world_get_body_accelerations(ZenoWorldHandle world);
+
+    // State access (zero-copy) - Joint state
+    float* zeno_world_get_joint_positions(ZenoWorldHandle world);
+    float* zeno_world_get_joint_velocities(ZenoWorldHandle world);
+    float* zeno_world_get_joint_forces(ZenoWorldHandle world);
+
+    // State access (zero-copy) - Contact state
+    float* zeno_world_get_contact_forces(ZenoWorldHandle world);
+    uint32_t* zeno_world_get_contact_counts(ZenoWorldHandle world);
+
+    // State access (zero-copy) - Sensor data
+    float* zeno_world_get_sensor_data(ZenoWorldHandle world);
+
+    // State mutation (for curriculum learning, domain randomization)
+    int zeno_world_set_body_positions(
+        ZenoWorldHandle world,
+        const float* positions,
+        const uint8_t* env_mask
+    );
+
+    int zeno_world_set_body_velocities(
+        ZenoWorldHandle world,
+        const float* velocities,
+        const uint8_t* env_mask
+    );
+
+    int zeno_world_set_gravity(
+        ZenoWorldHandle world,
+        float gx, float gy, float gz
+    );
+
+    int zeno_world_set_timestep(
+        ZenoWorldHandle world,
+        float timestep
+    );
 
     // Metadata
     uint32_t zeno_world_num_envs(ZenoWorldHandle world);
+    uint32_t zeno_world_num_bodies(ZenoWorldHandle world);
+    uint32_t zeno_world_num_joints(ZenoWorldHandle world);
+    uint32_t zeno_world_num_sensors(ZenoWorldHandle world);
     uint32_t zeno_world_obs_dim(ZenoWorldHandle world);
     uint32_t zeno_world_action_dim(ZenoWorldHandle world);
     int zeno_world_get_info(ZenoWorldHandle world, ZenoInfo* info);
 
+    // Profiling
+    int zeno_world_get_profiling(ZenoWorldHandle world, ZenoProfilingData* data);
+    void zeno_world_reset_profiling(ZenoWorldHandle world);
+
+    // Batched operations
+    int zeno_world_step_subset(
+        ZenoWorldHandle world,
+        const float* actions,
+        const uint8_t* env_mask,
+        uint32_t substeps
+    );
+
+    // Rendering support
+    float* zeno_world_get_geom_positions(ZenoWorldHandle world);
+    float* zeno_world_get_geom_quaternions(ZenoWorldHandle world);
+
     // Utility
     const char* zeno_version();
     bool zeno_metal_available();
+    const char* zeno_error_string(int error_code);
+
+    // Memory management
+    uint64_t zeno_world_memory_usage(ZenoWorldHandle world);
+    void zeno_world_compact_memory(ZenoWorldHandle world);
 """)
 
 
@@ -158,8 +273,116 @@ def is_metal_available() -> bool:
     return _lib.zeno_metal_available()
 
 
+class ZeroCopyArray:
+    """
+    A numpy array view into GPU-shared memory with lifecycle management.
+
+    This class wraps a numpy array that points directly to unified memory
+    shared between CPU and GPU. It ensures the underlying world remains
+    alive while the array is in use.
+
+    Attributes
+    ----------
+    array : np.ndarray
+        The underlying numpy array (view into shared memory).
+    shape : tuple
+        Shape of the array.
+    dtype : np.dtype
+        Data type of the array.
+
+    Notes
+    -----
+    Modifying this array directly modifies GPU memory. Changes are visible
+    to the GPU on the next step() call without any explicit synchronization.
+    """
+
+    __slots__ = ('_array', '_world_ref', '_ptr')
+
+    def __init__(self, array: np.ndarray, world: 'ZenoWorld', ptr):
+        self._array = array
+        self._world_ref = weakref.ref(world)
+        self._ptr = ptr
+
+    @property
+    def array(self) -> np.ndarray:
+        """Get the underlying numpy array."""
+        if self._world_ref() is None:
+            raise RuntimeError("World has been destroyed")
+        return self._array
+
+    def __array__(self, dtype=None):
+        """Support numpy array conversion."""
+        arr = self.array
+        if dtype is not None:
+            return arr.astype(dtype)
+        return arr
+
+    def __getattr__(self, name):
+        """Delegate attribute access to underlying array."""
+        return getattr(self._array, name)
+
+    def __getitem__(self, key):
+        return self._array[key]
+
+    def __setitem__(self, key, value):
+        self._array[key] = value
+
+    def __len__(self):
+        return len(self._array)
+
+    def __repr__(self):
+        return f"ZeroCopyArray({self._array.shape}, dtype={self._array.dtype})"
+
+    def copy(self) -> np.ndarray:
+        """Create a regular numpy copy (for safe storage)."""
+        return self._array.copy()
+
+    def is_valid(self) -> bool:
+        """Check if the underlying world is still alive."""
+        return self._world_ref() is not None
+
+
 class ZenoWorld:
-    """Low-level wrapper around a Zeno world handle."""
+    """
+    Low-level wrapper around a Zeno world handle.
+
+    This class provides direct access to the simulation state via zero-copy
+    numpy arrays backed by unified GPU memory. All state accessors return
+    views into shared memory, enabling O(1) access regardless of batch size.
+
+    Parameters
+    ----------
+    mjcf_path : str, optional
+        Path to MJCF file.
+    mjcf_string : str, optional
+        MJCF XML string.
+    num_envs : int
+        Number of parallel environments (default: 1).
+    timestep : float
+        Physics timestep in seconds (default: 0.002).
+    contact_iterations : int
+        PBD solver iterations for contacts (default: 4).
+    max_contacts_per_env : int
+        Maximum contacts per environment (default: 64).
+    seed : int
+        Random seed (default: 42).
+    substeps : int
+        Physics substeps per step() call (default: 1).
+    enable_profiling : bool
+        Enable GPU profiling (default: False).
+
+    Examples
+    --------
+    >>> world = ZenoWorld("ant.xml", num_envs=1024)
+    >>> world.reset()
+    >>>
+    >>> # Zero-copy state access
+    >>> positions = world.get_body_positions()  # View into GPU memory
+    >>> print(positions.shape)  # (1024, 9, 4)
+    >>>
+    >>> # Modify state directly (reflected on GPU)
+    >>> positions[0, 0, 2] += 0.1  # Lift first body in first env
+    """
 
     def __init__(
         self,
@@ -171,6 +394,10 @@ class ZenoWorld:
         max_contacts_per_env: int = 64,
         seed: int = 42,
         substeps: int = 1,
+        enable_profiling: bool = False,
+        max_bodies_per_env: int = 64,
+        max_joints_per_env: int = 64,
+        max_geoms_per_env: int = 128,
     ):
         _check_lib()
 
@@ -185,6 +412,10 @@ class ZenoWorld:
         config.max_contacts_per_env = max_contacts_per_env
         config.seed = seed
         config.substeps = substeps
+        config.enable_profiling = enable_profiling
+        config.max_bodies_per_env = max_bodies_per_env
+        config.max_joints_per_env = max_joints_per_env
+        config.max_geoms_per_env = max_geoms_per_env
 
         # Create world
         if mjcf_path is not None:
@@ -207,7 +438,14 @@ class ZenoWorld:
         _lib.zeno_world_get_info(self._handle, info)
         self._num_bodies = info.num_bodies
         self._num_joints = info.num_joints
+        self._num_sensors = info.num_sensors
+        self._num_geoms = info.num_geoms
         self._timestep = info.timestep
+        self._memory_usage = info.memory_usage
+        self._gpu_memory_usage = info.gpu_memory_usage
+
+        # Cache for zero-copy arrays (to prevent garbage collection issues)
+        self._cached_arrays: Dict[str, ZeroCopyArray] = {}
 
     def __del__(self):
         if hasattr(self, "_handle") and self._handle != ffi.NULL:
@@ -215,34 +453,136 @@ class ZenoWorld:
 
     @property
     def num_envs(self) -> int:
+        """Number of parallel environments."""
         return self._num_envs
 
     @property
     def obs_dim(self) -> int:
+        """Observation dimension."""
         return self._obs_dim
 
     @property
     def action_dim(self) -> int:
+        """Action dimension."""
         return self._action_dim
 
     @property
     def num_bodies(self) -> int:
+        """Number of bodies per environment."""
         return self._num_bodies
 
     @property
+    def num_joints(self) -> int:
+        """Number of joints per environment."""
+        return self._num_joints
+
+    @property
+    def num_sensors(self) -> int:
+        """Number of sensors per environment."""
+        return self._num_sensors
+
+    @property
+    def num_geoms(self) -> int:
+        """Number of geometries per environment."""
+        return self._num_geoms
+
+    @property
     def timestep(self) -> float:
+        """Physics timestep in seconds."""
         return self._timestep
 
+    @property
+    def memory_usage(self) -> int:
+        """Total memory usage in bytes."""
+        return self._memory_usage
+
+    @property
+    def gpu_memory_usage(self) -> int:
+        """GPU memory usage in bytes."""
+        return self._gpu_memory_usage
+
+    def _make_zero_copy_array(
+        self,
+        ptr,
+        shape: Tuple[int, ...],
+        dtype: np.dtype = np.float32,
+        cache_key: Optional[str] = None
+    ) -> np.ndarray:
+        """Create a zero-copy numpy array from a pointer."""
+        if ptr == ffi.NULL:
+            return np.zeros(shape, dtype=dtype)
+
+        # Calculate buffer size
+        size = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        buffer = ffi.buffer(ptr, size)
+        arr = np.frombuffer(buffer, dtype=dtype).reshape(shape)
+
+        # Optionally cache for lifecycle management
+        if cache_key is not None:
+            self._cached_arrays[cache_key] = ZeroCopyArray(arr, self, ptr)
+
+        return arr
+
     def step(self, actions: np.ndarray, substeps: int = 0) -> None:
-        """Execute physics step with given actions."""
+        """
+        Execute physics step with given actions.
+
+        Parameters
+        ----------
+        actions : np.ndarray
+            Actions array of shape (num_envs, action_dim) or flattened.
+        substeps : int, optional
+            Override number of substeps (0 uses default).
+        """
         actions = np.ascontiguousarray(actions, dtype=np.float32).flatten()
         actions_ptr = ffi.cast("float*", actions.ctypes.data)
         result = _lib.zeno_world_step(self._handle, actions_ptr, substeps)
         if result != 0:
             raise RuntimeError(f"Step failed with error code {result}")
 
+    def step_subset(
+        self,
+        actions: np.ndarray,
+        env_mask: np.ndarray,
+        substeps: int = 0
+    ) -> None:
+        """
+        Execute physics step only for selected environments.
+
+        This is useful for asynchronous training where different
+        environments may need different step counts.
+
+        Parameters
+        ----------
+        actions : np.ndarray
+            Actions for all environments.
+        env_mask : np.ndarray
+            Boolean mask indicating which environments to step.
+        substeps : int, optional
+            Override number of substeps.
+        """
+        actions = np.ascontiguousarray(actions, dtype=np.float32).flatten()
+        mask = np.ascontiguousarray(env_mask, dtype=np.uint8)
+
+        actions_ptr = ffi.cast("float*", actions.ctypes.data)
+        mask_ptr = ffi.cast("uint8_t*", mask.ctypes.data)
+
+        result = _lib.zeno_world_step_subset(
+            self._handle, actions_ptr, mask_ptr, substeps
+        )
+        if result != 0:
+            raise RuntimeError(f"Step subset failed with error code {result}")
+
     def reset(self, mask: Optional[np.ndarray] = None) -> None:
-        """Reset environments. If mask is None, reset all."""
+        """
+        Reset environments to initial state.
+
+        Parameters
+        ----------
+        mask : np.ndarray, optional
+            Boolean mask indicating which environments to reset.
+            If None, all environments are reset.
+        """
         if mask is not None:
             mask = np.ascontiguousarray(mask, dtype=np.uint8)
             mask_ptr = ffi.cast("uint8_t*", mask.ctypes.data)
@@ -252,53 +592,421 @@ class ZenoWorld:
         if result != 0:
             raise RuntimeError(f"Reset failed with error code {result}")
 
-    def get_observations(self) -> np.ndarray:
-        """Get observations as a zero-copy numpy array."""
-        ptr = _lib.zeno_world_get_observations(self._handle)
-        if ptr == ffi.NULL:
-            return np.zeros((self._num_envs, self._obs_dim), dtype=np.float32)
+    def reset_to_state(
+        self,
+        positions: np.ndarray,
+        quaternions: np.ndarray,
+        velocities: Optional[np.ndarray] = None,
+        angular_velocities: Optional[np.ndarray] = None,
+        mask: Optional[np.ndarray] = None
+    ) -> None:
+        """
+        Reset environments to a specific state.
 
-        # Create zero-copy view
-        buffer = ffi.buffer(ptr, self._num_envs * self._obs_dim * 4)
-        arr = np.frombuffer(buffer, dtype=np.float32)
-        return arr.reshape(self._num_envs, self._obs_dim)
+        Useful for curriculum learning, domain randomization,
+        or restoring checkpoints.
+
+        Parameters
+        ----------
+        positions : np.ndarray
+            Body positions of shape (num_envs, num_bodies, 4).
+        quaternions : np.ndarray
+            Body quaternions of shape (num_envs, num_bodies, 4).
+        velocities : np.ndarray, optional
+            Linear velocities of shape (num_envs, num_bodies, 4).
+        angular_velocities : np.ndarray, optional
+            Angular velocities of shape (num_envs, num_bodies, 4).
+        mask : np.ndarray, optional
+            Boolean mask for which environments to reset.
+        """
+        positions = np.ascontiguousarray(positions, dtype=np.float32)
+        quaternions = np.ascontiguousarray(quaternions, dtype=np.float32)
+
+        pos_ptr = ffi.cast("float*", positions.ctypes.data)
+        quat_ptr = ffi.cast("float*", quaternions.ctypes.data)
+
+        vel_ptr = ffi.NULL
+        angvel_ptr = ffi.NULL
+
+        if velocities is not None:
+            velocities = np.ascontiguousarray(velocities, dtype=np.float32)
+            vel_ptr = ffi.cast("float*", velocities.ctypes.data)
+
+        if angular_velocities is not None:
+            angular_velocities = np.ascontiguousarray(angular_velocities, dtype=np.float32)
+            angvel_ptr = ffi.cast("float*", angular_velocities.ctypes.data)
+
+        mask_ptr = ffi.NULL
+        if mask is not None:
+            mask = np.ascontiguousarray(mask, dtype=np.uint8)
+            mask_ptr = ffi.cast("uint8_t*", mask.ctypes.data)
+
+        result = _lib.zeno_world_reset_to_state(
+            self._handle, pos_ptr, quat_ptr, vel_ptr, angvel_ptr, mask_ptr
+        )
+        if result != 0:
+            raise RuntimeError(f"Reset to state failed with error code {result}")
+
+    # ===== Zero-Copy State Accessors =====
+
+    def get_observations(self, zero_copy: bool = False) -> np.ndarray:
+        """
+        Get observations as numpy array.
+
+        Parameters
+        ----------
+        zero_copy : bool
+            If True, returns a view into GPU memory (faster but unsafe
+            to store). If False, returns a copy (safe for storage).
+
+        Returns
+        -------
+        np.ndarray
+            Observations of shape (num_envs, obs_dim).
+        """
+        ptr = _lib.zeno_world_get_observations(self._handle)
+        arr = self._make_zero_copy_array(
+            ptr,
+            (self._num_envs, self._obs_dim),
+            cache_key="observations" if zero_copy else None
+        )
+        return arr if zero_copy else arr.copy()
 
     def get_rewards(self) -> np.ndarray:
-        """Get rewards as a zero-copy numpy array."""
+        """Get rewards array of shape (num_envs,)."""
         ptr = _lib.zeno_world_get_rewards(self._handle)
-        if ptr == ffi.NULL:
-            return np.zeros(self._num_envs, dtype=np.float32)
-
-        buffer = ffi.buffer(ptr, self._num_envs * 4)
-        return np.frombuffer(buffer, dtype=np.float32).copy()
+        arr = self._make_zero_copy_array(ptr, (self._num_envs,))
+        return arr.copy()
 
     def get_dones(self) -> np.ndarray:
-        """Get done flags as a numpy array."""
+        """Get done flags array of shape (num_envs,)."""
         ptr = _lib.zeno_world_get_dones(self._handle)
         if ptr == ffi.NULL:
             return np.zeros(self._num_envs, dtype=np.uint8)
-
         buffer = ffi.buffer(ptr, self._num_envs)
         return np.frombuffer(buffer, dtype=np.uint8).copy()
 
-    def get_body_positions(self) -> np.ndarray:
-        """Get body positions for visualization."""
+    def get_body_positions(self, zero_copy: bool = True) -> np.ndarray:
+        """
+        Get body positions (zero-copy view into GPU memory).
+
+        Returns
+        -------
+        np.ndarray
+            Positions of shape (num_envs, num_bodies, 4).
+            Format is (x, y, z, padding).
+        """
         ptr = _lib.zeno_world_get_body_positions(self._handle)
-        if ptr == ffi.NULL:
-            return np.zeros((self._num_envs, self._num_bodies, 4), dtype=np.float32)
+        arr = self._make_zero_copy_array(
+            ptr,
+            (self._num_envs, self._num_bodies, 4),
+            cache_key="body_positions" if zero_copy else None
+        )
+        return arr if zero_copy else arr.copy()
 
-        size = self._num_envs * self._num_bodies * 4 * 4
-        buffer = ffi.buffer(ptr, size)
-        arr = np.frombuffer(buffer, dtype=np.float32)
-        return arr.reshape(self._num_envs, self._num_bodies, 4)
+    def get_body_quaternions(self, zero_copy: bool = True) -> np.ndarray:
+        """
+        Get body quaternions (zero-copy view into GPU memory).
 
-    def get_body_quaternions(self) -> np.ndarray:
-        """Get body quaternions for visualization."""
+        Returns
+        -------
+        np.ndarray
+            Quaternions of shape (num_envs, num_bodies, 4).
+            Format is (x, y, z, w).
+        """
         ptr = _lib.zeno_world_get_body_quaternions(self._handle)
-        if ptr == ffi.NULL:
-            return np.zeros((self._num_envs, self._num_bodies, 4), dtype=np.float32)
+        arr = self._make_zero_copy_array(
+            ptr,
+            (self._num_envs, self._num_bodies, 4),
+            cache_key="body_quaternions" if zero_copy else None
+        )
+        return arr if zero_copy else arr.copy()
 
-        size = self._num_envs * self._num_bodies * 4 * 4
-        buffer = ffi.buffer(ptr, size)
-        arr = np.frombuffer(buffer, dtype=np.float32)
-        return arr.reshape(self._num_envs, self._num_bodies, 4)
+    def get_body_velocities(self, zero_copy: bool = True) -> np.ndarray:
+        """
+        Get body linear velocities (zero-copy view into GPU memory).
+
+        Returns
+        -------
+        np.ndarray
+            Velocities of shape (num_envs, num_bodies, 4).
+            Format is (vx, vy, vz, padding).
+        """
+        ptr = _lib.zeno_world_get_body_velocities(self._handle)
+        arr = self._make_zero_copy_array(
+            ptr,
+            (self._num_envs, self._num_bodies, 4),
+            cache_key="body_velocities" if zero_copy else None
+        )
+        return arr if zero_copy else arr.copy()
+
+    def get_body_angular_velocities(self, zero_copy: bool = True) -> np.ndarray:
+        """
+        Get body angular velocities (zero-copy view into GPU memory).
+
+        Returns
+        -------
+        np.ndarray
+            Angular velocities of shape (num_envs, num_bodies, 4).
+            Format is (wx, wy, wz, padding) in world frame.
+        """
+        ptr = _lib.zeno_world_get_body_angular_velocities(self._handle)
+        arr = self._make_zero_copy_array(
+            ptr,
+            (self._num_envs, self._num_bodies, 4),
+            cache_key="body_angular_velocities" if zero_copy else None
+        )
+        return arr if zero_copy else arr.copy()
+
+    def get_joint_positions(self, zero_copy: bool = True) -> np.ndarray:
+        """
+        Get joint positions/angles.
+
+        Returns
+        -------
+        np.ndarray
+            Joint positions of shape (num_envs, num_joints).
+        """
+        ptr = _lib.zeno_world_get_joint_positions(self._handle)
+        arr = self._make_zero_copy_array(
+            ptr,
+            (self._num_envs, self._num_joints),
+            cache_key="joint_positions" if zero_copy else None
+        )
+        return arr if zero_copy else arr.copy()
+
+    def get_joint_velocities(self, zero_copy: bool = True) -> np.ndarray:
+        """
+        Get joint velocities.
+
+        Returns
+        -------
+        np.ndarray
+            Joint velocities of shape (num_envs, num_joints).
+        """
+        ptr = _lib.zeno_world_get_joint_velocities(self._handle)
+        arr = self._make_zero_copy_array(
+            ptr,
+            (self._num_envs, self._num_joints),
+            cache_key="joint_velocities" if zero_copy else None
+        )
+        return arr if zero_copy else arr.copy()
+
+    def get_contact_forces(self, zero_copy: bool = True) -> np.ndarray:
+        """
+        Get contact forces (zero-copy view into GPU memory).
+
+        Returns
+        -------
+        np.ndarray
+            Contact forces of shape (num_envs, max_contacts, 4).
+            Format is (fx, fy, fz, magnitude).
+        """
+        ptr = _lib.zeno_world_get_contact_forces(self._handle)
+        # Assume max 64 contacts per env
+        max_contacts = 64
+        arr = self._make_zero_copy_array(
+            ptr,
+            (self._num_envs, max_contacts, 4),
+            cache_key="contact_forces" if zero_copy else None
+        )
+        return arr if zero_copy else arr.copy()
+
+    def get_sensor_data(self, zero_copy: bool = True) -> np.ndarray:
+        """
+        Get sensor readings.
+
+        Returns
+        -------
+        np.ndarray
+            Sensor data of shape (num_envs, num_sensors).
+        """
+        ptr = _lib.zeno_world_get_sensor_data(self._handle)
+        arr = self._make_zero_copy_array(
+            ptr,
+            (self._num_envs, max(self._num_sensors, 1)),
+            cache_key="sensor_data" if zero_copy else None
+        )
+        return arr if zero_copy else arr.copy()
+
+    # ===== State Mutation =====
+
+    def set_body_positions(
+        self,
+        positions: np.ndarray,
+        mask: Optional[np.ndarray] = None
+    ) -> None:
+        """
+        Set body positions for specified environments.
+
+        Parameters
+        ----------
+        positions : np.ndarray
+            Positions of shape (num_envs, num_bodies, 4).
+        mask : np.ndarray, optional
+            Boolean mask for which environments to modify.
+        """
+        positions = np.ascontiguousarray(positions, dtype=np.float32)
+        pos_ptr = ffi.cast("float*", positions.ctypes.data)
+
+        mask_ptr = ffi.NULL
+        if mask is not None:
+            mask = np.ascontiguousarray(mask, dtype=np.uint8)
+            mask_ptr = ffi.cast("uint8_t*", mask.ctypes.data)
+
+        result = _lib.zeno_world_set_body_positions(self._handle, pos_ptr, mask_ptr)
+        if result != 0:
+            raise RuntimeError(f"Set body positions failed: {result}")
+
+    def set_body_velocities(
+        self,
+        velocities: np.ndarray,
+        mask: Optional[np.ndarray] = None
+    ) -> None:
+        """
+        Set body velocities for specified environments.
+
+        Parameters
+        ----------
+        velocities : np.ndarray
+            Velocities of shape (num_envs, num_bodies, 4).
+        mask : np.ndarray, optional
+            Boolean mask for which environments to modify.
+        """
+        velocities = np.ascontiguousarray(velocities, dtype=np.float32)
+        vel_ptr = ffi.cast("float*", velocities.ctypes.data)
+
+        mask_ptr = ffi.NULL
+        if mask is not None:
+            mask = np.ascontiguousarray(mask, dtype=np.uint8)
+            mask_ptr = ffi.cast("uint8_t*", mask.ctypes.data)
+
+        result = _lib.zeno_world_set_body_velocities(self._handle, vel_ptr, mask_ptr)
+        if result != 0:
+            raise RuntimeError(f"Set body velocities failed: {result}")
+
+    def set_gravity(self, gravity: Tuple[float, float, float]) -> None:
+        """
+        Set gravity vector.
+
+        Parameters
+        ----------
+        gravity : tuple
+            Gravity vector (gx, gy, gz).
+        """
+        result = _lib.zeno_world_set_gravity(
+            self._handle, gravity[0], gravity[1], gravity[2]
+        )
+        if result != 0:
+            raise RuntimeError(f"Set gravity failed: {result}")
+
+    def set_timestep(self, timestep: float) -> None:
+        """
+        Set physics timestep.
+
+        Parameters
+        ----------
+        timestep : float
+            New timestep in seconds.
+        """
+        result = _lib.zeno_world_set_timestep(self._handle, timestep)
+        if result != 0:
+            raise RuntimeError(f"Set timestep failed: {result}")
+        self._timestep = timestep
+
+    # ===== Profiling =====
+
+    def get_profiling_data(self) -> Dict[str, Any]:
+        """
+        Get profiling data from the last step.
+
+        Returns
+        -------
+        dict
+            Dictionary with timing and count information.
+        """
+        data = ffi.new("ZenoProfilingData*")
+        result = _lib.zeno_world_get_profiling(self._handle, data)
+        if result != 0:
+            return {}
+
+        return {
+            "integrate_ms": data.integrate_ns / 1e6,
+            "collision_broad_ms": data.collision_broad_ns / 1e6,
+            "collision_narrow_ms": data.collision_narrow_ns / 1e6,
+            "constraint_solve_ms": data.constraint_solve_ns / 1e6,
+            "total_step_ms": data.total_step_ns / 1e6,
+            "num_contacts": data.num_contacts,
+            "num_active_constraints": data.num_active_constraints,
+        }
+
+    def reset_profiling(self) -> None:
+        """Reset profiling counters."""
+        _lib.zeno_world_reset_profiling(self._handle)
+
+    # ===== State Dictionary (for checkpointing) =====
+
+    def get_state(self) -> Dict[str, np.ndarray]:
+        """
+        Get complete simulation state as a dictionary.
+
+        Useful for checkpointing and replay.
+
+        Returns
+        -------
+        dict
+            Dictionary containing all state arrays (copies).
+        """
+        return {
+            "body_positions": self.get_body_positions(zero_copy=False),
+            "body_quaternions": self.get_body_quaternions(zero_copy=False),
+            "body_velocities": self.get_body_velocities(zero_copy=False),
+            "body_angular_velocities": self.get_body_angular_velocities(zero_copy=False),
+            "joint_positions": self.get_joint_positions(zero_copy=False),
+            "joint_velocities": self.get_joint_velocities(zero_copy=False),
+        }
+
+    def set_state(self, state: Dict[str, np.ndarray]) -> None:
+        """
+        Restore simulation state from a dictionary.
+
+        Parameters
+        ----------
+        state : dict
+            State dictionary from get_state().
+        """
+        self.reset_to_state(
+            positions=state["body_positions"],
+            quaternions=state["body_quaternions"],
+            velocities=state.get("body_velocities"),
+            angular_velocities=state.get("body_angular_velocities"),
+        )
+
+    # ===== Info =====
+
+    def get_info(self) -> Dict[str, Any]:
+        """
+        Get world information.
+
+        Returns
+        -------
+        dict
+            Dictionary with world metadata.
+        """
+        info = ffi.new("ZenoInfo*")
+        _lib.zeno_world_get_info(self._handle, info)
+
+        return {
+            "num_envs": info.num_envs,
+            "num_bodies": info.num_bodies,
+            "num_joints": info.num_joints,
+            "num_actuators": info.num_actuators,
+            "num_sensors": info.num_sensors,
+            "num_geoms": info.num_geoms,
+            "obs_dim": info.obs_dim,
+            "action_dim": info.action_dim,
+            "timestep": info.timestep,
+            "memory_usage_mb": info.memory_usage / (1024 * 1024),
+            "gpu_memory_usage_mb": info.gpu_memory_usage / (1024 * 1024),
+            "metal_available": info.metal_available,
+        }
