@@ -9,12 +9,29 @@ The name references Zeno of Elea, whose paradoxes on motion and infinity are fou
 
 ## Features
 
-- **Native Metal Compute**: Hand-written Metal shaders for maximum GPU utilization
-- **Unified Memory**: Zero-copy data transfer between CPU and GPU
-- **Batched Simulation**: Simulate thousands of environments in parallel
-- **MJCF Support**: Compatible with MuJoCo XML model format
-- **Gymnasium Integration**: Standard RL environment interface
-- **Minimal Dependencies**: Pure Zig + Metal, no heavy frameworks
+### Core Engine
+- **Native Metal Compute** — Hand-written MSL shaders, 8-stage compute pipeline
+- **Unified Memory** — Zero-copy CPU↔GPU via Apple Silicon shared memory
+- **Batched Simulation** — 1,024 to 16,384+ parallel environments
+- **SoA Memory Layout** — float4-aligned, coalesced GPU access
+
+### Physics
+- **Rigid Body Dynamics** — Semi-implicit Euler integration, quaternion rotations
+- **Joint Constraints** — Fixed, revolute, prismatic, ball, free (PBD solver)
+- **Collision Detection** — Spatial hashing broad phase, sphere/capsule/box/plane primitives
+- **Contact Resolution** — Position-Based Dynamics with Coulomb friction
+
+### Integration
+- **MJCF Parser** — Bodies, joints, geoms, actuators, sensors, defaults
+- **Python Bindings** — cffi-based, zero-copy numpy arrays
+- **Gymnasium API** — `gym.make("Zeno/Ant-v0")` compatible
+- **C ABI** — Full FFI for custom language bindings
+
+### Environments
+- **Pendulum** — 3 bodies, 1 joint, 1 actuator
+- **Cartpole** — 3 bodies, 2 joints, 1 actuator
+- **Ant** — 9 bodies, 9 joints, 8 actuators
+- **Humanoid** — 14 bodies, 14 joints, 13 actuators
 
 ## Performance
 
