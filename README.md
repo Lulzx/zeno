@@ -26,8 +26,9 @@ The name references Zeno of Elea, whose paradoxes on motion and infinity are fou
 
 ### Integration
 - **MJCF Parser** — Bodies, joints, geoms, actuators, sensors, defaults
-- **Python Bindings** — cffi-based, zero-copy numpy arrays
-- **Gymnasium API** — `gym.make("Zeno/Ant-v0")` compatible
+- **Python Bindings** — cffi-based, zero-copy numpy arrays via unified memory
+- **Gymnasium API** — Full API compliance with vectorized environment support
+- **Stable-Baselines3** — Direct integration with SB3 and other RL libraries
 - **C ABI** — Full FFI for custom language bindings
 
 ### Environments
@@ -131,11 +132,37 @@ for _ in range(1000):
     if terminated or truncated:
         obs, info = env.reset()
 
-# Vectorized environments
+# Vectorized environments (native GPU batching)
 from zeno.gym import make_vec
 
 envs = make_vec("ant", num_envs=1024)
 obs, info = envs.reset()
+```
+
+### Zero-Copy State Access
+
+```python
+# Direct access to GPU memory (no copy overhead)
+positions = env._world.get_body_positions(zero_copy=True)
+velocities = env._world.get_body_velocities(zero_copy=True)
+
+# Modify state directly (changes reflected on GPU)
+positions[0, 0, 2] += 0.1
+
+# Checkpointing
+state = env._world.get_state()
+env._world.set_state(state)  # Restore later
+```
+
+### Stable-Baselines3
+
+```python
+from stable_baselines3 import PPO
+from zeno.gym import make_sb3_env
+
+env = make_sb3_env("ant", num_envs=8)
+model = PPO("MlpPolicy", env, verbose=1)
+model.learn(total_timesteps=1_000_000)
 ```
 
 ### Basic Usage (Zig)
