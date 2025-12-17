@@ -117,6 +117,7 @@ pub fn build(b: *std.Build) void {
         "benchmarks/bench_integration.zig",
         "benchmarks/bench_collision.zig",
         "benchmarks/bench_envs.zig",
+        "benchmarks/bench_full_physics.zig",
     };
 
     for (bench_files) |bench_file| {
