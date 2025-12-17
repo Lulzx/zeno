@@ -85,6 +85,7 @@ pub fn build(b: *std.Build) void {
     const test_files = [_][]const u8{
         "tests/test_metal.zig",
         "tests/test_physics.zig",
+        "tests/test_physics_integration.zig",
         "tests/test_collision.zig",
         "tests/test_mjcf.zig",
         "tests/test_xpbd.zig",
