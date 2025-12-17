@@ -266,6 +266,28 @@ if length(v_t) > ε:
 3. **Add damping** to reduce high-frequency oscillations
 4. **Use substeps** for highly dynamic scenarios
 
+### Known Limitations
+
+#### Race Condition in Parallel Constraint Solving
+
+The current `solve_joints` kernel dispatches all constraints in parallel on the GPU. When multiple constraints share the same body (e.g., two joints connected to the same link), their position/quaternion updates can race:
+
+```
+Thread 1: Read body position → Compute correction A → Write position
+Thread 2: Read body position → Compute correction B → Write position
+```
+
+Both threads read the same initial position, compute independent corrections, and one overwrites the other.
+
+**Impact**: Constraint solving may require more iterations to converge, and very stiff constraint chains may exhibit slight instability.
+
+**Workarounds**:
+- Increase `contact_iterations` to compensate for lost corrections
+- Use compliance > 0 for less stiff, more forgiving constraints
+- Avoid complex constraint graphs with many shared bodies
+
+**Future Fix**: Proper resolution requires constraint graph coloring to group non-conflicting constraints, or sequential solving of conflicting constraint groups.
+
 ## Actuators
 
 ### Motor Actuator

@@ -877,20 +877,28 @@ kernel void solve_joints(
             float w = w_a + w_b;
 
             if (w > 1e-8) {
-                float d_lambda = (-ang_C) / (w + alpha_tilde);
-                float3 ang_impulse = d_lambda * n;
+                // XPBD correction: λ = -C / (w + α)
+                // We want to rotate A toward B and B toward A
+                // n = cross(axis_a, axis_b) points such that rotating a around n moves it toward b
+                float d_lambda = -ang_C / (w + alpha_tilde);
+
+                // Split correction between bodies based on inverse inertia ratio
+                float ratio_a = w_a / w;
+                float ratio_b = w_b / w;
 
                 // Apply angular corrections
+                // Body A rotates in +n direction (toward B's axis)
                 if (inv_mass_a > 0) {
-                    float3 d_omega = ang_impulse * inv_mi_a.yzw;
-                    float4 dq = quat_multiply(float4(d_omega, 0), quat_a_curr) * 0.5;
+                    float3 d_omega_a = (-d_lambda * ratio_b) * n * inv_mi_a.yzw;
+                    float4 dq = quat_multiply(float4(d_omega_a, 0), quat_a_curr) * 0.5;
                     quaternions[idx_a] = quat_normalize(quat_a_curr + dq);
                 }
 
+                // Body B rotates in -n direction (toward A's axis)
                 if (inv_mass_b > 0) {
-                    float3 d_omega = ang_impulse * inv_mi_b.yzw;
-                    float4 dq = quat_multiply(float4(d_omega, 0), quat_b_curr) * 0.5;
-                    quaternions[idx_b] = quat_normalize(quat_b_curr - dq);
+                    float3 d_omega_b = (d_lambda * ratio_a) * n * inv_mi_b.yzw;
+                    float4 dq = quat_multiply(float4(d_omega_b, 0), quat_b_curr) * 0.5;
+                    quaternions[idx_b] = quat_normalize(quat_b_curr + dq);
                 }
             }
         }
@@ -1218,7 +1226,10 @@ kernel void solve_contacts(
     }
 
     // Friction (Coulomb friction cone)
-    if (tangent_speed > 1e-6 && j_n > 0) {
+    // Use accumulated normal impulse for friction cone, not just this iteration's delta
+    float j_n_accumulated = contacts[contact_idx].impulses.x + j_n;
+
+    if (tangent_speed > 1e-6 && j_n_accumulated > 1e-6) {
         float3 tangent = vel_tangent / tangent_speed;
 
         // Compute generalized inverse mass for tangent direction
@@ -1232,8 +1243,8 @@ kernel void solve_contacts(
             // Desired friction impulse to stop tangential motion
             float j_t_desired = tangent_speed / w_tangent;
 
-            // Friction cone limit: |j_t| ≤ μ * j_n
-            float j_t_max = friction * j_n;
+            // Friction cone limit: |j_t| ≤ μ * j_n_accumulated
+            float j_t_max = friction * j_n_accumulated;
             float j_t = min(j_t_desired, j_t_max);
 
             // Apply friction impulse
