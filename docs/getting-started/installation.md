@@ -3,8 +3,8 @@
 ## Requirements
 
 - **macOS 13+** (Ventura or later)
-- **Zig 0.13+** ([download](https://ziglang.org/download/))
-- **Apple Silicon** (M1/M2/M3/M4) or Intel Mac with Metal support
+- **Zig 0.15+** ([download](https://ziglang.org/download/))
+- **Apple Silicon** (M1/M2/M3/M4) recommended
 
 ## Building from Source
 
@@ -104,8 +104,8 @@ If you see errors about Metal not being available:
 
 If the Zig build fails:
 
-1. Verify Zig version: `zig version` (should be 0.13+)
-2. Clean and rebuild: `rm -rf zig-cache && zig build`
+1. Verify Zig version: `zig version` (should be 0.15+)
+2. Clean and rebuild: `rm -rf .zig-cache && zig build`
 
 ### Python Import Errors
 

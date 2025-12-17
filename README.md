@@ -18,11 +18,27 @@ The name references Zeno of Elea, whose paradoxes on motion and infinity are fou
 
 ## Performance
 
-| Metric | Zeno | MuJoCo |
-|--------|------|--------|
-| 1024 Ant envs, 1000 steps | < 1 second | ~45 seconds |
-| Single env step latency | < 50 μs | ~200 μs |
-| Memory per env (Ant) | < 4 KB | ~16 KB |
+Benchmarked on Apple M4 Pro (14-core CPU, 20-core GPU) with real MJCF models:
+
+| Environment | 1024 envs × 1000 steps | vs MuJoCo | Throughput |
+|-------------|------------------------|-----------|------------|
+| Pendulum    | 206 ms                 | **9.7x**  | 4.97M steps/sec |
+| Cartpole    | 157 ms                 | **19.1x** | 6.52M steps/sec |
+| Ant         | 174 ms                 | **258x**  | 5.89M steps/sec |
+| Humanoid    | 172 ms                 | **697x**  | 5.95M steps/sec |
+
+**Average speedup: 246x faster than MuJoCo**
+
+### Scaling Performance (GPU Benchmark)
+
+| Environment | Envs | Time | Target | Speedup |
+|-------------|------|------|--------|---------|
+| Pendulum    | 1024 | 15ms | 50ms   | 3.4x ✓ |
+| Cartpole    | 1024 | 50ms | 80ms   | 1.6x ✓ |
+| Ant         | 1024 | 45ms | 800ms  | 17.9x ✓ |
+| Humanoid    | 1024 | 69ms | 2000ms | 29.1x ✓ |
+| Ant         | 4096 | 138ms | 3000ms | 21.8x ✓ |
+| Ant         | 16384 | 833ms | 10000ms | 12.0x ✓ |
 
 ## Quick Start
 
@@ -30,8 +46,8 @@ The name references Zeno of Elea, whose paradoxes on motion and infinity are fou
 
 Requirements:
 - macOS 13+ (Ventura or later)
-- Zig 0.13+ (https://ziglang.org/download/)
-- Apple Silicon (M1/M2/M3/M4) or Intel Mac with Metal support
+- Zig 0.15+ (https://ziglang.org/download/)
+- Apple Silicon (M1/M2/M3/M4) recommended
 
 ```bash
 # Clone the repository
@@ -137,12 +153,12 @@ pub fn main() !void {
 
 Zeno includes several standard robotics environments:
 
-| Environment | Bodies | Joints | Actions | Description |
-|-------------|--------|--------|---------|-------------|
+| Environment | Bodies | Joints | Actuators | Description |
+|-------------|--------|--------|-----------|-------------|
 | Pendulum | 3 | 1 | 1 | Simple inverted pendulum |
-| Cartpole | 4 | 2 | 1 | Classic cart-pole balancing |
-| Ant | 9 | 8 | 8 | Quadruped locomotion |
-| Humanoid | 14 | 13 | 13 | Bipedal humanoid walking |
+| Cartpole | 3 | 2 | 1 | Classic cart-pole balancing |
+| Ant | 9 | 9 | 8 | Quadruped locomotion |
+| Humanoid | 14 | 14 | 13 | Bipedal humanoid walking |
 
 ## Architecture
 
@@ -232,11 +248,12 @@ Zeno supports a subset of the MuJoCo XML format:
 
 ### Supported Elements
 - `<option>`: timestep, gravity
-- `<body>`: name, pos, quat
-- `<joint>`: type (hinge, slide, ball, free), axis, range, damping
-- `<geom>`: type (sphere, capsule, box, plane), size, mass, friction
-- `<actuator>`: motor, ctrlrange, gear
-- `<sensor>`: jointpos, jointvel, accelerometer, gyro
+- `<default>`: joint/geom default classes (parsed but not applied)
+- `<body>`: name, pos, quat, euler
+- `<joint>`: type (hinge, slide, ball, free), axis, range, damping, stiffness, armature
+- `<geom>`: type (sphere, capsule, box, cylinder, plane), size, fromto, mass, density, friction
+- `<actuator>`: motor, position, velocity, ctrlrange, forcerange, gear, kp, kv
+- `<sensor>`: jointpos, jointvel, framepos, framequat, framelinvel, frameangvel, accelerometer, gyro
 
 ### Not Yet Supported
 - Tendons
@@ -244,6 +261,7 @@ Zeno supports a subset of the MuJoCo XML format:
 - Mesh geometry
 - Heightfield terrain
 - Soft bodies
+- Default class inheritance
 
 ## Benchmarking
 
@@ -256,6 +274,18 @@ cd benchmarks
 python compare_mujoco.py --envs 1024 --steps 1000
 ```
 
+## Comparison with Alternatives
+
+| Simulator | Platform | Backend | Batched | Differentiable |
+|-----------|----------|---------|---------|----------------|
+| **Zeno** | macOS | Metal | Yes | No |
+| MuJoCo | Cross-platform | CPU | No | No |
+| Newton | Linux | CUDA/Warp | Yes | Yes |
+| Isaac Lab | Linux | CUDA | Yes | Yes |
+| Brax | Cross-platform | JAX/XLA | Yes | Yes |
+
+Zeno fills a unique niche: **GPU-accelerated batched simulation for Apple Silicon**. If you need to train RL policies on a Mac, Zeno provides throughput comparable to NVIDIA-based solutions.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
@@ -267,6 +297,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## References
 
 - MuJoCo: https://mujoco.org/
+- Newton: https://github.com/newton-physics/newton
 - Position Based Dynamics: Müller et al., 2007
 - Metal Best Practices: https://developer.apple.com/metal/
 

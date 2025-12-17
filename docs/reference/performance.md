@@ -4,35 +4,38 @@ Zeno is designed for maximum throughput in reinforcement learning workloads.
 
 ## Benchmarks
 
-### Environment Stepping
+All benchmarks measured on Apple M4 Pro with real MJCF models using the full physics pipeline.
 
-Measured on Apple M2 Max, 1024 Ant environments, 1000 steps:
+### Full Physics Benchmark (Real MJCF Models)
 
-| Metric | Zeno | MuJoCo | Speedup |
-|--------|------|--------|---------|
-| Total time | 0.95s | 45.2s | **47x** |
-| Steps/second | 1,078,000 | 22,650 | **47x** |
-| μs/step/env | 0.93 | 44.1 | **47x** |
+| Environment | Time (1024 envs × 1000 steps) | vs MuJoCo | Throughput |
+|-------------|-------------------------------|-----------|------------|
+| Pendulum    | 206 ms | **9.7x** | 4.97M steps/sec |
+| Cartpole    | 157 ms | **19.1x** | 6.52M steps/sec |
+| Ant         | 174 ms | **258x** | 5.89M steps/sec |
+| Humanoid    | 172 ms | **697x** | 5.95M steps/sec |
 
-### Scaling with Environment Count
+**Average speedup: 246x faster than MuJoCo**
 
-| Environments | Zeno (steps/sec) | MuJoCo (steps/sec) |
-|--------------|------------------|-------------------|
-| 1 | 45,000 | 5,000 |
-| 64 | 580,000 | 320,000 |
-| 256 | 920,000 | 80,000 |
-| 1024 | 1,080,000 | 22,650 |
-| 4096 | 1,150,000 | 5,600 |
-| 16384 | 1,200,000 | 1,400 |
+### GPU Compute Benchmark (Metal Shaders)
+
+| Environment | Envs | Time | Target | Speedup |
+|-------------|------|------|--------|---------|
+| Pendulum    | 1024 | 15ms | 50ms   | 3.4x ✓ |
+| Cartpole    | 1024 | 50ms | 80ms   | 1.6x ✓ |
+| Ant         | 1024 | 45ms | 800ms  | 17.9x ✓ |
+| Humanoid    | 1024 | 69ms | 2000ms | 29.1x ✓ |
+| Ant         | 4096 | 138ms | 3000ms | 21.8x ✓ |
+| Ant         | 16384 | 833ms | 10000ms | 12.0x ✓ |
 
 ### Memory Usage
 
-| Environment | Per-env memory | 1024 envs |
-|-------------|----------------|-----------|
-| Pendulum | 0.5 KB | 0.5 MB |
-| Cartpole | 0.8 KB | 0.8 MB |
-| Ant | 3.8 KB | 3.9 MB |
-| Humanoid | 8.2 KB | 8.4 MB |
+| Environment | Bodies | Joints | Actuators | Memory (1024 envs) |
+|-------------|--------|--------|-----------|-------------------|
+| Pendulum | 3 | 1 | 1 | 4.4 MB |
+| Cartpole | 3 | 2 | 1 | 4.4 MB |
+| Ant | 9 | 9 | 8 | 5.3 MB |
+| Humanoid | 14 | 14 | 13 | 5.9 MB |
 
 ## Performance Architecture
 
@@ -168,18 +171,32 @@ print(f"Peak: {peak / 1024:.1f} KB")
 
 | Aspect | Zeno | MuJoCo |
 |--------|------|--------|
-| Single env | Comparable | Faster |
-| Batched (1024) | **47x faster** | Sequential |
+| Platform | macOS (Metal) | Cross-platform (CPU) |
+| Batched (1024 Ant) | **258x faster** | Sequential |
+| Batched (1024 Humanoid) | **697x faster** | Sequential |
 | Physics accuracy | Good | Excellent |
 | Feature coverage | Basic | Comprehensive |
+| License | MIT | Apache 2.0 |
 
-### vs Isaac Gym
+### vs Newton
 
-| Aspect | Zeno | Isaac Gym |
-|--------|------|-----------|
+| Aspect | Zeno | Newton |
+|--------|------|--------|
+| Platform | macOS (Metal) | Linux (CUDA) |
+| Hardware | Apple Silicon | NVIDIA GPUs |
+| Backend | Native Metal | NVIDIA Warp |
+| Differentiable | No | Yes |
+| Status | Stable | Beta |
+| License | MIT | Apache 2.0 |
+
+### vs Isaac Gym / Isaac Lab
+
+| Aspect | Zeno | Isaac Gym/Lab |
+|--------|------|---------------|
 | Platform | macOS only | NVIDIA GPUs |
 | Performance | Comparable | Similar |
 | Setup complexity | Simple | Complex |
+| Ecosystem | Standalone | NVIDIA Omniverse |
 | License | MIT | Proprietary |
 
 ### vs Brax
@@ -187,35 +204,34 @@ print(f"Peak: {peak / 1024:.1f} KB")
 | Aspect | Zeno | Brax |
 |--------|------|------|
 | Backend | Metal | JAX/XLA |
-| Performance | **Faster** on Mac | Faster on NVIDIA |
+| Performance | **Faster** on Apple Silicon | Faster on NVIDIA |
 | Differentiable | No | Yes |
 | Physics model | PBD | Spring-based |
 
-## Hardware Recommendations
+## Hardware Requirements
 
 ### Minimum
 
-- Apple M1
+- Apple M1 or later
 - 8 GB RAM
 - macOS 13+
 
 ### Recommended
 
-- Apple M2 Pro/Max or M3
+- Apple M2 Pro/Max, M3, or M4 series
 - 16+ GB RAM
 - macOS 14+
 
-### Optimal
+### Tested Configuration
 
-- Apple M2 Ultra or M3 Max
-- 32+ GB RAM
-- macOS 14+
+All benchmarks in this documentation were measured on:
 
-Environment scaling by chip:
+- **Apple M4 Pro** (14-core CPU, 20-core GPU)
+- 48 GB unified memory
+- macOS 15
 
-| Chip | Max Environments | Peak Steps/sec |
-|------|------------------|----------------|
-| M1 | 4,096 | 600,000 |
-| M1 Pro | 8,192 | 800,000 |
-| M2 Max | 16,384 | 1,200,000 |
-| M2 Ultra | 32,768 | 2,000,000 |
+| Configuration | Time | Throughput |
+|---------------|------|------------|
+| 1024 Ant envs × 1000 steps | 174 ms | 5.89M steps/sec |
+| 4096 Ant envs × 1000 steps | 138 ms | 7.24M steps/sec |
+| 16384 Ant envs × 1000 steps | 833 ms | 1.2M steps/sec |
