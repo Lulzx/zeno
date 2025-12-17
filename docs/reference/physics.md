@@ -11,6 +11,37 @@ Zeno uses maximal coordinates where each body has independent state:
 - **Linear velocity**: 3D vector
 - **Angular velocity**: 3D vector in world frame
 
+### Simulation Pipeline
+
+Each physics step executes the following stages:
+
+| Stage | Description |
+|-------|-------------|
+| 1. Apply Actions | Convert control inputs to joint torques via actuators |
+| 1.5. Apply Joint Forces | Map joint torques to body forces using action/reaction |
+| 2. Update Kinematic | Update kinematic body positions from their velocities |
+| 3. Compute Forces | Compute gravity, damping, and external forces |
+| 4. Integrate | Semi-implicit Euler integration |
+| 5. Broad Phase | Spatial hashing for collision candidate pairs |
+| 6. Narrow Phase | Precise contact generation |
+| 7. Solve Joints | XPBD constraint iterations for joint constraints |
+| 8. Solve Contacts | XPBD iterations for contact constraints |
+| 9. Update Joint States | Compute joint angles/velocities from body state |
+| 10. Read Sensors | Generate observations from simulation state |
+
+### Body Types
+
+| Type | Description | Behavior |
+|------|-------------|----------|
+| `dynamic` | Fully simulated | Affected by forces, gravity, collisions |
+| `kinematic` | Animation-driven | Follows specified velocity, infinite mass |
+| `static` | Immovable | Zero velocity, infinite mass |
+
+Kinematic bodies are useful for:
+- Moving platforms
+- Animated obstacles
+- User-controlled objects
+
 ### Integration Method
 
 Semi-implicit (symplectic) Euler integration:
@@ -45,24 +76,82 @@ This method is:
 | `ball` | 3 | Free rotation (spherical joint) |
 | `free` | 6 | No constraint (floating base) |
 
-### Constraint Formulation
+### XPBD Constraint Solver
 
-Joints are enforced using Position-Based Dynamics (PBD):
+Zeno uses **Extended Position-Based Dynamics (XPBD)** for constraint solving, which provides:
+- Unified handling of joints and contacts
+- Proper physics with compliance and damping
+- Stable simulation at large timesteps
+- Better energy conservation than standard PBD
 
-1. Compute constraint violation: `C(x)`
-2. Compute gradient: `∇C`
-3. Project positions: `Δx = -λ * ∇C`
-4. Update velocities: `v = (x_new - x_old) / dt`
+#### XPBD Update Equation
 
-The Lagrange multiplier `λ` is computed as:
+The core XPBD update computes position corrections via Lagrange multipliers:
 
 ```
-λ = C(x) / (∇C · W · ∇C^T + α/dt²)
+λ = (-C - α̃ * λ_prev) / (w + α̃)
+Δx = λ * ∇C
 ```
 
 Where:
-- `W` is the inverse mass matrix
-- `α` is compliance (inverse stiffness)
+- `C` is the constraint violation
+- `α̃ = compliance / dt²` is the time-scaled compliance
+- `w = Σ(m_inv * |∇C|²)` is the generalized inverse mass
+- `λ` is the accumulated Lagrange multiplier
+
+#### Constraint Types
+
+| Type | Code | Description |
+|------|------|-------------|
+| Contact Normal | 0 | Non-penetration constraint |
+| Contact Friction | 1 | Tangential friction |
+| Positional | 2 | Point-to-point (ball joint anchor) |
+| Angular | 3 | Axis alignment (hinge constraint) |
+| Angular Limit | 4 | Joint rotation limits |
+| Linear Limit | 5 | Prismatic joint limits |
+| Tendon | 6 | Cable/muscle length constraint |
+| Weld | 7 | Fixed relative pose |
+| Connect | 8 | Distance between anchor points |
+| Joint Equality | 9 | Coupled joint positions |
+
+#### Joint Decomposition
+
+High-level joint types are decomposed into primitive constraints:
+
+| Joint Type | Primitive Constraints |
+|-----------|----------------------|
+| Fixed | Weld (position + orientation) |
+| Revolute | Point + Angular + Angular Limit (optional) |
+| Prismatic | Slider + Linear Limit (optional) |
+| Ball | Point + Cone Limit (optional) |
+| Universal | Point + 2× Angular |
+| Free | None |
+
+#### Warm Starting
+
+XPBD uses warm starting for faster convergence:
+- Accumulated impulses (λ) are cached between frames
+- Initial guess uses `λ_prev` from the previous timestep
+- Significantly improves stability for stiff constraints
+
+#### Compliance and Damping
+
+Soft constraints are achieved via compliance:
+- `compliance = 0`: Rigid constraint
+- `compliance > 0`: Soft constraint (spring-like behavior)
+- `damping`: Velocity-dependent resistance
+
+Example configurations:
+```
+// Rigid joint
+compliance = 0.0, damping = 0.0
+
+// Soft spring joint
+compliance = 1e-4, damping = 0.01
+
+// Very soft (rubber-like)
+compliance = 1e-2, damping = 0.1
+```
 
 ### Joint Limits
 
