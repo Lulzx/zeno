@@ -300,6 +300,106 @@ export fn zeno_world_get_body_quaternions(handle: ZenoWorldHandle) ?[*]f32 {
     return @ptrCast(&quats[0]);
 }
 
+/// Get body velocities.
+export fn zeno_world_get_body_velocities(handle: ZenoWorldHandle) ?[*]f32 {
+    if (handle == null) return null;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.getBodyVelocitiesPtr();
+}
+
+/// Get body angular velocities.
+export fn zeno_world_get_body_angular_velocities(handle: ZenoWorldHandle) ?[*]f32 {
+    if (handle == null) return null;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.getBodyAngularVelocitiesPtr();
+}
+
+/// Get joint positions.
+export fn zeno_world_get_joint_positions(handle: ZenoWorldHandle) ?[*]f32 {
+    if (handle == null) return null;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.getJointPositionsPtr();
+}
+
+/// Get joint velocities.
+export fn zeno_world_get_joint_velocities(handle: ZenoWorldHandle) ?[*]f32 {
+    if (handle == null) return null;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.getJointVelocitiesPtr();
+}
+
+/// Get contact counts.
+export fn zeno_world_get_contact_counts(handle: ZenoWorldHandle) ?[*]u32 {
+    if (handle == null) return null;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.getContactCountsPtr();
+}
+
+/// Get sensor data.
+export fn zeno_world_get_sensor_data(handle: ZenoWorldHandle) ?[*]f32 {
+    if (handle == null) return null;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.getSensorDataPtr();
+}
+
+/// Set body positions.
+export fn zeno_world_set_body_positions(
+    handle: ZenoWorldHandle,
+    positions: [*]const f32,
+    env_mask: ?[*]const u8,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    const total_floats = world_ptr.config.num_envs * world_ptr.params.num_bodies * 4;
+    
+    // Create slice from pointer
+    const pos_slice = positions[0..total_floats];
+    
+    // Create mask slice if present
+    var mask_slice: ?[]const u8 = null;
+    if (env_mask) |m| {
+        mask_slice = m[0..world_ptr.config.num_envs];
+    }
+
+    world_ptr.setBodyPositions(pos_slice, mask_slice) catch {
+        return .metal_error;
+    };
+
+    return .success;
+}
+
+/// Set body velocities.
+export fn zeno_world_set_body_velocities(
+    handle: ZenoWorldHandle,
+    velocities: [*]const f32,
+    env_mask: ?[*]const u8,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    const total_floats = world_ptr.config.num_envs * world_ptr.params.num_bodies * 4;
+    
+    const vel_slice = velocities[0..total_floats];
+    
+    var mask_slice: ?[]const u8 = null;
+    if (env_mask) |m| {
+        mask_slice = m[0..world_ptr.config.num_envs];
+    }
+
+    world_ptr.setBodyVelocities(vel_slice, mask_slice) catch {
+        return .metal_error;
+    };
+
+    return .success;
+}
+
 /// Get library version.
 export fn zeno_version() [*:0]const u8 {
     return "0.1.0";

@@ -497,6 +497,86 @@ pub const World = struct {
         return self.state.getQuaternions();
     }
 
+    /// Get body velocities pointer.
+    pub fn getBodyVelocitiesPtr(self: *World) ?[*]f32 {
+        const slice = self.state.getVelocities();
+        if (slice.len == 0) return null;
+        return @ptrCast(slice.ptr);
+    }
+
+    /// Get body angular velocities pointer.
+    pub fn getBodyAngularVelocitiesPtr(self: *World) ?[*]f32 {
+        const slice = self.state.getAngularVelocities();
+        if (slice.len == 0) return null;
+        return @ptrCast(slice.ptr);
+    }
+
+    /// Get joint positions pointer.
+    pub fn getJointPositionsPtr(self: *World) ?[*]f32 {
+        const slice = self.state.getJointPositions();
+        if (slice.len == 0) return null;
+        return slice.ptr;
+    }
+
+    /// Get joint velocities pointer.
+    pub fn getJointVelocitiesPtr(self: *World) ?[*]f32 {
+        const slice = self.state.getJointVelocities();
+        if (slice.len == 0) return null;
+        return slice.ptr;
+    }
+
+    /// Get contact counts pointer.
+    pub fn getContactCountsPtr(self: *World) ?[*]u32 {
+        const slice = self.state.contact_counts_buffer.getSlice(u32);
+        if (slice.len == 0) return null;
+        return slice.ptr;
+    }
+
+    /// Get sensor data pointer.
+    pub fn getSensorDataPtr(self: *World) ?[*]f32 {
+        const slice = self.sensor_data_buffer.getSlice(f32);
+        if (slice.len == 0) return null;
+        return slice.ptr;
+    }
+
+    /// Set body positions from external buffer.
+    pub fn setBodyPositions(self: *World, positions: []const f32, mask: ?[]const u8) !void {
+        const dest = self.state.getPositions();
+        const src: []const [4]f32 = @alignCast(@ptrCast(positions));
+
+        if (mask) |m| {
+            for (m, 0..) |should_set, env_id| {
+                if (should_set != 0) {
+                    for (0..self.params.num_bodies) |b| {
+                        const idx = self.state.bodyIndex(@intCast(env_id), @intCast(b));
+                        dest[idx] = src[idx];
+                    }
+                }
+            }
+        } else {
+            @memcpy(dest, src);
+        }
+    }
+
+    /// Set body velocities from external buffer.
+    pub fn setBodyVelocities(self: *World, velocities: []const f32, mask: ?[]const u8) !void {
+        const dest = self.state.getVelocities();
+        const src: []const [4]f32 = @alignCast(@ptrCast(velocities));
+
+        if (mask) |m| {
+            for (m, 0..) |should_set, env_id| {
+                if (should_set != 0) {
+                    for (0..self.params.num_bodies) |b| {
+                        const idx = self.state.bodyIndex(@intCast(env_id), @intCast(b));
+                        dest[idx] = src[idx];
+                    }
+                }
+            }
+        } else {
+            @memcpy(dest, src);
+        }
+    }
+
     /// Get simulation info.
     pub fn getInfo(self: *const World) WorldInfo {
         return .{
