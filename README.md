@@ -18,8 +18,11 @@ The name references Zeno of Elea, whose paradoxes on motion and infinity are fou
 ### Physics
 - **Rigid Body Dynamics** — Semi-implicit Euler integration, quaternion rotations
 - **Joint Constraints** — Fixed, revolute, prismatic, ball, free (PBD solver)
-- **Collision Detection** — Spatial hashing broad phase, sphere/capsule/box/plane primitives
+- **Collision Detection** — Spatial hashing broad phase, sphere/capsule/box/plane/mesh/heightfield primitives
 - **Contact Resolution** — Position-Based Dynamics with Coulomb friction
+- **Soft Bodies** — PBD deformable cloth and volumetric bodies
+- **Fluids** — SPH fluid simulation with spatial hashing
+- **Materials** — PBR materials with texture support
 
 ### Integration
 - **MJCF Parser** — Bodies, joints, geoms, actuators, sensors, defaults
@@ -246,10 +249,11 @@ zeno/
 ├── src/
 │   ├── main.zig              # C ABI exports
 │   ├── metal/                # Metal infrastructure
-│   ├── physics/              # Physics core
+│   ├── physics/              # Physics core (rigid bodies, soft bodies, fluids)
 │   ├── collision/            # Collision detection
 │   ├── world/                # World management
 │   ├── mjcf/                 # MJCF parser
+│   ├── render/               # Rendering (materials, textures)
 │   └── shaders/              # Metal compute shaders
 ├── python/
 │   └── zeno/                 # Python bindings
@@ -265,20 +269,25 @@ Zeno supports a subset of the MuJoCo XML format:
 
 ### Supported Elements
 - `<option>`: timestep, gravity
-- `<default>`: joint/geom default classes (parsed but not applied)
+- `<default>`: joint/geom default classes with inheritance
 - `<body>`: name, pos, quat, euler
 - `<joint>`: type (hinge, slide, ball, free), axis, range, damping, stiffness, armature
-- `<geom>`: type (sphere, capsule, box, cylinder, plane), size, fromto, mass, density, friction
+- `<geom>`: type (sphere, capsule, box, cylinder, plane, mesh, hfield), size, fromto, mass, density, friction
 - `<actuator>`: motor, position, velocity, ctrlrange, forcerange, gear, kp, kv
 - `<sensor>`: jointpos, jointvel, framepos, framequat, framelinvel, frameangvel, accelerometer, gyro
+- `<tendon>`: fixed and spatial tendons with spring behavior, wrapping objects
+- `<equality>`: weld, connect, joint, tendon constraints
+- `<asset>`: mesh loading (STL, OBJ) with convex hull approximation, heightfield terrain
+
+### Advanced Features (API Only)
+- **Soft Bodies** — PBD cloth and volumetric deformables (via Zig API)
+- **Fluids** — SPH simulation (via Zig API)
+- **Materials** — PBR textures (via Zig API)
 
 ### Not Yet Supported
-- Tendons
-- Equality constraints
-- Mesh geometry
-- Heightfield terrain
-- Soft bodies
-- Default class inheritance
+- MJCF composite bodies
+- MJCF flexcomp
+- Advanced solver options (CG, Newton)
 
 ## Benchmarking
 

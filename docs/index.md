@@ -28,9 +28,21 @@ Zeno is a GPU-accelerated rigid body physics simulation engine optimized for rei
 
     ---
 
-    Load existing MuJoCo XML models directly.
+    Load existing MuJoCo XML models with tendons, constraints, and terrain.
 
 </div>
+
+## Features
+
+- **Collision Primitives**: Sphere, capsule, box, cylinder, plane, mesh, heightfield
+- **Joint Types**: Free, ball, hinge, slide, fixed, universal
+- **Tendons**: Fixed and spatial tendons with spring behavior
+- **Equality Constraints**: Weld, connect, joint, tendon constraints
+- **Sensors**: Joint position/velocity, accelerometer, gyro, frame pose
+- **Actuators**: Motor, position servo, velocity servo
+- **Soft Bodies**: PBD deformable cloth and volumetric bodies
+- **Fluids**: SPH fluid simulation with spatial hashing
+- **Materials**: PBR materials with texture support
 
 ## Performance
 

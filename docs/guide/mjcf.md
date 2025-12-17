@@ -107,7 +107,10 @@ Collision geometry and visual shape.
 | `sphere` | radius | Sphere |
 | `capsule` | radius, half-length | Cylinder with hemisphere caps |
 | `box` | half-x, half-y, half-z | Rectangular box |
+| `cylinder` | radius, half-height | Cylinder |
 | `plane` | - | Infinite ground plane |
+| `mesh` | - | Convex mesh (loaded from STL/OBJ) |
+| `hfield` | - | Heightfield terrain |
 
 **Capsule with `fromto`:**
 
@@ -224,15 +227,113 @@ State observation sensors.
 </mujoco>
 ```
 
+### `<asset>`
+
+Asset definitions for meshes, textures, and heightfields.
+
+```xml
+<asset>
+  <mesh name="torso_mesh" file="torso.stl" scale="1 1 1"/>
+  <hfield name="terrain" file="terrain.png" size="10 10 1 0"/>
+</asset>
+```
+
+**Mesh Attributes:**
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | string | required | Asset identifier |
+| `file` | string | required | Path to STL or OBJ file |
+| `scale` | vec3 | "1 1 1" | Scale factors |
+
+**Heightfield Attributes:**
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | string | required | Asset identifier |
+| `file` | string | "" | Path to PNG height image |
+| `nrow` | int | 0 | Number of rows |
+| `ncol` | int | 0 | Number of columns |
+| `size` | vec4 | "1 1 1 0" | radius_x, radius_y, elevation, base |
+
+### `<tendon>`
+
+Tendon definitions connecting joints or sites.
+
+```xml
+<tendon>
+  <!-- Fixed tendon: linear combination of joint positions -->
+  <fixed name="tendon1" stiffness="100" damping="10">
+    <joint joint="joint1" coef="1.0"/>
+    <joint joint="joint2" coef="-1.0"/>
+  </fixed>
+
+  <!-- Spatial tendon: path through sites -->
+  <spatial name="tendon2" stiffness="50">
+    <site site="site1"/>
+    <site site="site2"/>
+    <site site="site3"/>
+  </spatial>
+</tendon>
+```
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | string | "" | Tendon identifier |
+| `stiffness` | float | 0 | Spring stiffness |
+| `damping` | float | 0 | Damping coefficient |
+| `limited` | bool | false | Enable length limits |
+| `range` | vec2 | "0 0" | Length limits (if limited) |
+
+### `<equality>`
+
+Equality constraints between bodies, joints, or tendons.
+
+```xml
+<equality>
+  <!-- Weld two bodies together -->
+  <weld body1="body1" body2="body2"/>
+
+  <!-- Connect bodies at a point -->
+  <connect body1="body1" body2="body2" anchor="0 0 0.5"/>
+
+  <!-- Couple joint positions -->
+  <joint joint1="joint1" joint2="joint2" polycoef="0 1 0 0 0"/>
+
+  <!-- Constrain tendon length -->
+  <tendon tendon1="tendon1"/>
+</equality>
+```
+
+| Type | Description |
+|------|-------------|
+| `weld` | Rigidly attach two bodies |
+| `connect` | Connect bodies at anchor point |
+| `joint` | Couple joint positions with polynomial |
+| `tendon` | Constrain tendon length |
+
+### `<include>`
+
+Include external MJCF files.
+
+```xml
+<include file="robot_arm.xml"/>
+```
+
+This allows modular model definitions.
+
+## Advanced Features
+
+The following features are implemented in Zeno's physics engine but have limited or no MJCF loading support:
+
+- **Soft Bodies**: PBD deformables available via API (cloth, volumetric)
+- **Fluids**: SPH simulation available via API
+- **Textures/Materials**: PBR material system available via API
+
 ## Not Yet Supported
 
 The following MJCF features are not currently supported:
 
-- Tendons (`<tendon>`)
-- Equality constraints (`<equality>`)
-- Mesh geometry (`type="mesh"`)
-- Heightfield terrain (`type="hfield"`)
-- Soft bodies
-- Sites (partially supported for sensors)
-- Include files (`<include>`)
-- Assets and textures
+- Composite bodies (particle systems)
+- Flexcomp (flexible composites)
+- Some advanced solver options (CG, Newton)
