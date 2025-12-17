@@ -348,6 +348,14 @@ export fn zeno_world_get_sensor_data(handle: ZenoWorldHandle) ?[*]f32 {
     return world_ptr.getSensorDataPtr();
 }
 
+/// Get contacts buffer.
+export fn zeno_world_get_contacts(handle: ZenoWorldHandle) ?*anyopaque {
+    if (handle == null) return null;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.getContactsPtr();
+}
+
 /// Set body positions.
 export fn zeno_world_set_body_positions(
     handle: ZenoWorldHandle,

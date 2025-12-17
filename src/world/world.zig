@@ -539,6 +539,13 @@ pub const World = struct {
         return slice.ptr;
     }
 
+    /// Get contacts buffer pointer.
+    pub fn getContactsPtr(self: *World) ?*anyopaque {
+        const slice = self.state.contacts_buffer.getSlice(u8);
+        if (slice.len == 0) return null;
+        return @ptrCast(slice.ptr);
+    }
+
     /// Set body positions from external buffer.
     pub fn setBodyPositions(self: *World, positions: []const f32, mask: ?[]const u8) !void {
         const dest = self.state.getPositions();

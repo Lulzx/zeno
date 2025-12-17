@@ -143,7 +143,7 @@ ffi.cdef("""
     float* zeno_world_get_joint_forces(ZenoWorldHandle world);
 
     // State access (zero-copy) - Contact state
-    float* zeno_world_get_contact_forces(ZenoWorldHandle world);
+    void* zeno_world_get_contacts(ZenoWorldHandle world);
     uint32_t* zeno_world_get_contact_counts(ZenoWorldHandle world);
 
     // State access (zero-copy) - Sensor data
@@ -192,10 +192,6 @@ ffi.cdef("""
         const uint8_t* env_mask,
         uint32_t substeps
     );
-
-    // Rendering support
-    float* zeno_world_get_geom_positions(ZenoWorldHandle world);
-    float* zeno_world_get_geom_quaternions(ZenoWorldHandle world);
 
     // Utility
     const char* zeno_version();
@@ -792,25 +788,69 @@ class ZenoWorld:
         )
         return arr if zero_copy else arr.copy()
 
-    def get_contact_forces(self, zero_copy: bool = True) -> np.ndarray:
+    def get_contacts(self, zero_copy: bool = True) -> np.ndarray:
         """
-        Get contact forces (zero-copy view into GPU memory).
+        Get contact data (zero-copy view into GPU memory).
 
         Returns
         -------
         np.ndarray
-            Contact forces of shape (num_envs, max_contacts, 4).
-            Format is (fx, fy, fz, magnitude).
+            Structured array of shape (num_envs, max_contacts) with fields:
+            - position_pen: (4,) float32 (x, y, z, penetration)
+            - normal_friction: (4,) float32 (nx, ny, nz, friction)
+            - indices: (4,) uint32 (body_a, body_b, geom_a, geom_b)
+            - impulses: (4,) float32 (impulse_n, impulse_t1, impulse_t2, restitution)
         """
-        ptr = _lib.zeno_world_get_contact_forces(self._handle)
-        # Assume max 64 contacts per env
+        ptr = _lib.zeno_world_get_contacts(self._handle)
+        if ptr == ffi.NULL:
+             # Assume max 64 contacts per env (default)
+            max_contacts = 64
+            # Return empty structured array with correct shape
+            contact_dtype = np.dtype([
+                ('position_pen', '4f4'),
+                ('normal_friction', '4f4'),
+                ('indices', '4u4'),
+                ('impulses', '4f4')
+            ])
+            return np.zeros((self._num_envs, max_contacts), dtype=contact_dtype)
+
+        # Define structured dtype matching ContactGPU layout (64 bytes)
+        contact_dtype = np.dtype([
+            ('position_pen', '4f4'),
+            ('normal_friction', '4f4'),
+            ('indices', '4u4'),
+            ('impulses', '4f4')
+        ])
+
+        # Assume max 64 contacts per env for now (should be exposed via API)
         max_contacts = 64
-        arr = self._make_zero_copy_array(
-            ptr,
-            (self._num_envs, max_contacts, 4),
-            cache_key="contact_forces" if zero_copy else None
-        )
-        return arr if zero_copy else arr.copy()
+        size_bytes = self._num_envs * max_contacts * 64
+        
+        buffer = ffi.buffer(ptr, size_bytes)
+        arr = np.frombuffer(buffer, dtype=contact_dtype).reshape(self._num_envs, max_contacts)
+
+        if zero_copy:
+             self._cached_arrays["contacts"] = ZeroCopyArray(arr, self, ptr)
+             return arr
+        return arr.copy()
+
+    def get_contact_counts(self) -> np.ndarray:
+        """
+        Get number of active contacts per environment.
+
+        Returns
+        -------
+        np.ndarray
+            Counts of shape (num_envs,).
+        """
+        ptr = _lib.zeno_world_get_contact_counts(self._handle)
+        if ptr == ffi.NULL:
+            return np.zeros(self._num_envs, dtype=np.uint32)
+        
+        # Buffer size = num_envs * sizeof(uint32)
+        size_bytes = self._num_envs * 4
+        buffer = ffi.buffer(ptr, size_bytes)
+        return np.frombuffer(buffer, dtype=np.uint32).copy()
 
     def get_sensor_data(self, zero_copy: bool = True) -> np.ndarray:
         """
