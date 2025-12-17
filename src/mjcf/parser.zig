@@ -797,6 +797,7 @@ fn parseDefaults(tokenizer: *XmlTokenizer, allocator: std.mem.Allocator, default
 /// Convert parsed MJCF model to Scene.
 fn convertToScene(allocator: std.mem.Allocator, model: *const schema.MjcfModel) !Scene {
     var scene = Scene.init(allocator);
+    errdefer scene.deinit(); // Clean up on error to avoid memory leaks
 
     // Set physics config from options
     scene.physics_config.timestep = model.option.timestep;

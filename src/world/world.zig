@@ -48,6 +48,10 @@ pub const SimParams = extern struct {
     restitution: f32,
     baumgarte: f32,
     slop: f32,
+    target_color: u32,      // For constraint graph coloring (solve_joints)
+    num_constraints: u32,   // Total constraints to process for current color
+    constraint_offset: u32, // Offset into constraint buffer for current color
+    _padding: u32,          // Alignment padding
 };
 
 /// Main simulation world.
@@ -74,6 +78,10 @@ pub const World = struct {
     params_buffer: Buffer,
     constraints_buffer: Buffer,
     num_constraints_per_env: u32,
+
+    // Constraint graph coloring for race-free parallel solving
+    num_colors: u8,
+    color_ranges: ?[][2]u32, // [color] = (start_offset, count)
 
     // Allocator
     allocator: std.mem.Allocator,
@@ -343,7 +351,18 @@ fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
             opts,
         );
 
-        // Populate for all envs
+        // Apply graph coloring to template constraints to avoid race conditions
+        // Constraints sharing bodies get different colors, allowing parallel solving per color
+        var num_colors: u8 = 0;
+        var color_ranges: ?[][2]u32 = null;
+
+        if (num_constraints_per_env > 0) {
+            num_colors = try xpbd_mod.colorConstraints(template_constraints.items, num_bodies, allocator);
+            xpbd_mod.sortConstraintsByColor(template_constraints.items);
+            color_ranges = try xpbd_mod.getColorRanges(template_constraints.items, num_colors, allocator);
+        }
+
+        // Populate for all envs (constraints are sorted by color)
         if (num_constraints_per_env > 0) {
             const constraints_ptr = constraints_buffer.getSlice(XPBDConstraint);
             for (0..config.num_envs) |env_id| {
@@ -379,6 +398,10 @@ fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
             .restitution = scene.physics_config.restitution,
             .baumgarte = scene.physics_config.baumgarte_factor,
             .slop = scene.physics_config.penetration_slop,
+            .target_color = 0,
+            .num_constraints = 0,
+            .constraint_offset = 0,
+            ._padding = 0,
         };
 
         var world = World{
@@ -397,6 +420,8 @@ fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
             .params_buffer = params_buffer,
             .constraints_buffer = constraints_buffer,
             .num_constraints_per_env = num_constraints_per_env,
+            .num_colors = num_colors,
+            .color_ranges = color_ranges,
             .allocator = allocator,
         };
 
@@ -610,22 +635,42 @@ fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
         }
 
-        // Stage 7: Joint solver (XPBD iterations)
-        if (self.num_constraints_per_env > 0) {
-            for (0..self.config.contact_iterations) |_| {
-                var encoder = try cmd.computeEncoder();
-                defer encoder.endEncoding();
+        // Stage 7: Joint solver (XPBD iterations with graph coloring)
+        // Process constraints by color to avoid race conditions when constraints share bodies
+        if (self.num_constraints_per_env > 0 and self.color_ranges != null) {
+            const params_ptr = self.params_buffer.getSlice(SimParams);
+            const ranges = self.color_ranges.?;
 
-                const pipeline = try self.pipelines.getPipeline("solve_joints");
-                encoder.setPipeline(pipeline);
-                encoder.setBuffer(&self.state.positions_buffer, 0, 0);
-                encoder.setBuffer(&self.state.velocities_buffer, 0, 1);
-                encoder.setBuffer(&self.state.quaternions_buffer, 0, 2);
-                encoder.setBuffer(&self.state.angular_velocities_buffer, 0, 3);
-                encoder.setBuffer(&self.constraints_buffer, 0, 4);
-                encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 5);
-                encoder.setBuffer(&self.params_buffer, 0, 6);
-                encoder.dispatch1D(pipeline, self.config.num_envs * self.num_constraints_per_env);
+            for (0..self.config.contact_iterations) |_| {
+                // Process each color sequentially (constraints within a color don't share bodies)
+                for (0..self.num_colors) |color| {
+                    const range = ranges[color];
+                    const offset = range[0];
+                    const count = range[1];
+
+                    if (count == 0) continue;
+
+                    // Update params for this color group
+                    // target_color is repurposed to pass constraints_per_env to shader
+                    params_ptr[0].constraint_offset = offset;
+                    params_ptr[0].num_constraints = count;
+                    params_ptr[0].target_color = self.num_constraints_per_env;
+
+                    var encoder = try cmd.computeEncoder();
+                    defer encoder.endEncoding();
+
+                    const pipeline = try self.pipelines.getPipeline("solve_joints");
+                    encoder.setPipeline(pipeline);
+                    encoder.setBuffer(&self.state.positions_buffer, 0, 0);
+                    encoder.setBuffer(&self.state.velocities_buffer, 0, 1);
+                    encoder.setBuffer(&self.state.quaternions_buffer, 0, 2);
+                    encoder.setBuffer(&self.state.angular_velocities_buffer, 0, 3);
+                    encoder.setBuffer(&self.constraints_buffer, 0, 4);
+                    encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 5);
+                    encoder.setBuffer(&self.params_buffer, 0, 6);
+                    // Dispatch count * num_envs threads (one per constraint instance)
+                    encoder.dispatch1D(pipeline, self.config.num_envs * count);
+                }
             }
         }
 
@@ -857,6 +902,11 @@ fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
     pub fn deinit(self: *World) void {
         if (self.initial_state) |*init_state| {
             init_state.deinit();
+        }
+
+        // Free color ranges if allocated
+        if (self.color_ranges) |ranges| {
+            self.allocator.free(ranges);
         }
 
         self.body_data_buffer.deinit();

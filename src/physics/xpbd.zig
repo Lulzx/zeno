@@ -47,7 +47,8 @@ pub const ConstraintType = enum(u8) {
 /// Layout optimized for coalesced memory access in compute shaders.
 pub const XPBDConstraint = extern struct {
     // --- 16 bytes ---
-    /// Body indices: (body_a, body_b, env_id, type)
+    /// Body indices: (body_a, body_b, env_id, type_and_color)
+    /// type_and_color format: (type & 0xFF) | (color << 8)
     indices: [4]u32 align(16),
 
     // --- 16 bytes ---
@@ -85,7 +86,15 @@ pub const XPBDConstraint = extern struct {
     }
 
     pub fn getType(self: *const XPBDConstraint) ConstraintType {
-        return @enumFromInt(self.indices[3]);
+        return @enumFromInt(self.indices[3] & 0xFF);
+    }
+
+    pub fn getColor(self: *const XPBDConstraint) u8 {
+        return @truncate(self.indices[3] >> 8);
+    }
+
+    pub fn setColor(self: *XPBDConstraint, color: u8) void {
+        self.indices[3] = (self.indices[3] & 0xFF) | (@as(u32, color) << 8);
     }
 
     pub fn getCompliance(self: *const XPBDConstraint) f32 {
@@ -514,4 +523,116 @@ fn scale(v: [3]f32, s: f32) [3]f32 {
 
 fn length(v: [3]f32) f32 {
     return @sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
+
+/// Assign colors to constraints using greedy graph coloring.
+/// Constraints sharing the same body get different colors.
+/// Returns the number of colors used.
+pub fn colorConstraints(constraints: []XPBDConstraint, num_bodies: u32, allocator: std.mem.Allocator) !u8 {
+    const n = constraints.len;
+    if (n == 0) return 0;
+
+    // Build adjacency: for each body, track which constraints reference it
+    var body_constraints = try allocator.alloc(std.ArrayListUnmanaged(u32), num_bodies);
+    defer {
+        for (body_constraints) |*list| {
+            list.deinit(allocator);
+        }
+        allocator.free(body_constraints);
+    }
+    for (body_constraints) |*list| {
+        list.* = .{};
+    }
+
+    // Populate body -> constraint mappings
+    for (constraints, 0..) |c, i| {
+        const body_a = c.getBodyA();
+        const body_b = c.getBodyB();
+        if (body_a < num_bodies) {
+            try body_constraints[body_a].append(allocator, @intCast(i));
+        }
+        if (body_b < num_bodies and body_b != body_a) {
+            try body_constraints[body_b].append(allocator, @intCast(i));
+        }
+    }
+
+    // Greedy coloring
+    var max_color: u8 = 0;
+    var neighbor_colors = try allocator.alloc(bool, 256);
+    defer allocator.free(neighbor_colors);
+
+    for (constraints, 0..) |*c, i| {
+        // Reset neighbor colors
+        @memset(neighbor_colors, false);
+
+        // Find colors used by neighboring constraints (those sharing a body)
+        const body_a = c.getBodyA();
+        const body_b = c.getBodyB();
+
+        if (body_a < num_bodies) {
+            for (body_constraints[body_a].items) |neighbor_idx| {
+                if (neighbor_idx < i) {
+                    const neighbor_color = constraints[neighbor_idx].getColor();
+                    neighbor_colors[neighbor_color] = true;
+                }
+            }
+        }
+
+        if (body_b < num_bodies and body_b != body_a) {
+            for (body_constraints[body_b].items) |neighbor_idx| {
+                if (neighbor_idx < i) {
+                    const neighbor_color = constraints[neighbor_idx].getColor();
+                    neighbor_colors[neighbor_color] = true;
+                }
+            }
+        }
+
+        // Find smallest available color
+        var color: u8 = 0;
+        while (color < 255 and neighbor_colors[color]) {
+            color += 1;
+        }
+
+        c.setColor(color);
+        if (color > max_color) {
+            max_color = color;
+        }
+    }
+
+    return max_color + 1;
+}
+
+/// Sort constraints by color for efficient GPU dispatch.
+/// After sorting, constraints of the same color are contiguous.
+pub fn sortConstraintsByColor(constraints: []XPBDConstraint) void {
+    std.mem.sort(XPBDConstraint, constraints, {}, struct {
+        fn lessThan(_: void, a: XPBDConstraint, b: XPBDConstraint) bool {
+            return a.getColor() < b.getColor();
+        }
+    }.lessThan);
+}
+
+/// Get the start index and count for each color group.
+/// Returns array of (start, count) pairs indexed by color.
+pub fn getColorRanges(constraints: []const XPBDConstraint, num_colors: u8, allocator: std.mem.Allocator) ![][2]u32 {
+    var ranges = try allocator.alloc([2]u32, num_colors);
+    @memset(ranges, .{ 0, 0 });
+
+    if (constraints.len == 0) return ranges;
+
+    var current_color: u8 = constraints[0].getColor();
+    var start: u32 = 0;
+
+    for (constraints, 0..) |c, i| {
+        const color = c.getColor();
+        if (color != current_color) {
+            ranges[current_color] = .{ start, @intCast(i - start) };
+            current_color = color;
+            start = @intCast(i);
+        }
+    }
+    // Final color group
+    ranges[current_color] = .{ start, @intCast(constraints.len - start) };
+
+    return ranges;
 }

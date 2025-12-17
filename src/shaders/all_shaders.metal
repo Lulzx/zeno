@@ -27,6 +27,10 @@ struct SimParams {
     float restitution;
     float baumgarte;
     float slop;
+    uint target_color;      // For constraint graph coloring (solve_joints)
+    uint num_constraints;   // Total constraints to process
+    uint constraint_offset; // Offset into constraint buffer for current color
+    uint _padding;          // Alignment padding
 };
 
 struct BodyData {
@@ -646,28 +650,44 @@ kernel void solve_joints(
     constant SimParams& params [[buffer(6)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    // We assume 1 thread per constraint
-    // But we need to handle batching/coloring to avoid race conditions if needed.
-    // For now, let's assume atomic updates or low collision probability, or standard coloring.
-    // Zeno usually batches by environment.
-    // If we dispatch (num_envs * max_constraints), we need to check if constraint is active.
-    // But here we might just dispatch total constraints if we pre-flattened them?
-    // Let's assume we dispatch over all constraints in the buffer.
-    
-    // NOTE: SimParams doesn't store num_constraints. 
-    // We should pass the count or check gid < total_constraints.
-    // For now, let's assume the caller handles dispatch size correctly.
-    
-    XPBDConstraint c = constraints[gid];
-    uint type = c.indices.w;
-    
+    // Graph coloring dispatch: each color group is dispatched separately
+    // to avoid race conditions when constraints share bodies.
+    //
+    // Buffer layout: [env0_c0, env0_c1, ..., env1_c0, env1_c1, ...]
+    // Within each env, constraints are sorted by color.
+    // params.constraint_offset = start index within each env's constraints
+    // params.num_constraints = count for current color (per env)
+    //
+    // gid = env_id * count + local_constraint_idx
+    // constraint_idx = env_id * total_constraints_per_env + offset + local_idx
+
+    uint count = params.num_constraints;
+    if (count == 0) return;
+
+    uint env_id = gid / count;
+    uint local_idx = gid % count;
+
+    if (env_id >= params.num_envs) return;
+
+    // Total constraints per env (needed to compute actual buffer index)
+    // We pass this as constraint_offset's high bits or compute from context
+    // For now, use: constraint_idx = env_id * (total per env) + offset + local_idx
+    // We need total_constraints_per_env, which we can derive from dispatch size
+    // Actually, let's pass it explicitly via target_color (repurposed as constraints_per_env)
+    uint constraints_per_env = params.target_color;  // Repurposed field
+    uint constraint_idx = env_id * constraints_per_env + params.constraint_offset + local_idx;
+
+    XPBDConstraint c = constraints[constraint_idx];
+    uint type_and_color = c.indices.w;
+    uint type = type_and_color & 0xFF;  // Lower 8 bits = type
+
     // Skip if invalid/padding
     if (type > 9) return;
-    
+
     uint body_a = c.indices.x;
     uint body_b = c.indices.y;
-    uint env_id = c.indices.z;
-    
+    // env_id already computed from gid above (matches c.indices.z)
+
     uint idx_a = env_id * params.num_bodies + body_a;
     uint idx_b = env_id * params.num_bodies + body_b;
     

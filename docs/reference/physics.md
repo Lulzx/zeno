@@ -266,27 +266,20 @@ if length(v_t) > ε:
 3. **Add damping** to reduce high-frequency oscillations
 4. **Use substeps** for highly dynamic scenarios
 
-### Known Limitations
+### Constraint Graph Coloring
 
-#### Race Condition in Parallel Constraint Solving
+To avoid race conditions when constraints share bodies, Zeno implements **constraint graph coloring**:
 
-The current `solve_joints` kernel dispatches all constraints in parallel on the GPU. When multiple constraints share the same body (e.g., two joints connected to the same link), their position/quaternion updates can race:
+1. **Color Assignment**: During initialization, constraints are analyzed to build a conflict graph where constraints sharing a body are connected. A greedy coloring algorithm assigns each constraint a color such that no two constraints with the same color share a body.
 
-```
-Thread 1: Read body position → Compute correction A → Write position
-Thread 2: Read body position → Compute correction B → Write position
-```
+2. **Sorted Buffer**: Constraints are sorted by color so constraints of the same color are contiguous in memory.
 
-Both threads read the same initial position, compute independent corrections, and one overwrites the other.
+3. **Sequential Dispatch**: During solving, each color group is dispatched as a separate GPU kernel. Within a color group, all constraints can run in parallel safely. Color groups are processed sequentially with implicit barriers between dispatches.
 
-**Impact**: Constraint solving may require more iterations to converge, and very stiff constraint chains may exhibit slight instability.
-
-**Workarounds**:
-- Increase `contact_iterations` to compensate for lost corrections
-- Use compliance > 0 for less stiff, more forgiving constraints
-- Avoid complex constraint graphs with many shared bodies
-
-**Future Fix**: Proper resolution requires constraint graph coloring to group non-conflicting constraints, or sequential solving of conflicting constraint groups.
+This approach provides:
+- **Race-free solving**: No two constraints updating the same body run simultaneously
+- **Maximum parallelism**: All constraints within a color group run in parallel
+- **Minimal overhead**: Greedy coloring is O(n) and typically produces few colors (2-4 for most models)
 
 ## Actuators
 
