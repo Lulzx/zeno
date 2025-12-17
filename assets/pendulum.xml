@@ -1,0 +1,33 @@
+<mujoco model="pendulum">
+    <option timestep="0.02" gravity="0 0 -9.81"/>
+
+    <worldbody>
+        <!-- Ground plane -->
+        <geom type="plane" size="5 5 0.1" rgba="0.8 0.8 0.8 1"/>
+
+        <!-- Pendulum base (fixed) -->
+        <body name="base" pos="0 0 1.5">
+            <geom type="sphere" size="0.05" rgba="0.3 0.3 0.3 1" mass="0"/>
+
+            <!-- Pendulum arm -->
+            <body name="pole" pos="0 0 0">
+                <joint name="hinge" type="hinge" axis="0 1 0" damping="0.1"/>
+                <geom type="capsule" fromto="0 0 0 0 0 -1" size="0.02" mass="1" rgba="0.8 0.2 0.2 1"/>
+
+                <!-- Pendulum bob -->
+                <body name="bob" pos="0 0 -1">
+                    <geom type="sphere" size="0.1" mass="1" rgba="0.2 0.2 0.8 1"/>
+                </body>
+            </body>
+        </body>
+    </worldbody>
+
+    <actuator>
+        <motor joint="hinge" ctrlrange="-5 5" gear="1"/>
+    </actuator>
+
+    <sensor>
+        <jointpos joint="hinge"/>
+        <jointvel joint="hinge"/>
+    </sensor>
+</mujoco>

@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61.0", "cffi>=1.15.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zeno-physics"
+version = "0.1.0"
+description = "High-Performance Batched Robotics Simulation Engine"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Lulzx", email = "lulzx@example.com"}
+]
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+keywords = ["physics", "simulation", "robotics", "reinforcement-learning", "gpu", "metal"]
+dependencies = [
+    "numpy>=1.21.0",
+    "cffi>=1.15.0",
+]
+
+[project.optional-dependencies]
+gymnasium = ["gymnasium>=0.29.0"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-benchmark>=4.0.0",
+]
+all = ["zeno-physics[gymnasium,dev]"]
+
+[project.urls]
+Homepage = "https://github.com/lulzx/zeno"
+Documentation = "https://github.com/lulzx/zeno#readme"
+Repository = "https://github.com/lulzx/zeno"
+Issues = "https://github.com/lulzx/zeno/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["zeno*"]
+
+[tool.setuptools.package-data]
+zeno = ["*.so", "*.dylib"]
+
+[project.entry-points."gymnasium.envs"]
+__root__ = "zeno.gym:register_envs"

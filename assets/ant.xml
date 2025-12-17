@@ -1,0 +1,101 @@
+<mujoco model="ant">
+    <option timestep="0.01" gravity="0 0 -9.81"/>
+
+    <default>
+        <joint armature="1" damping="1" limited="true"/>
+        <geom contype="1" conaffinity="1" condim="3" friction="1 0.5 0.5" density="5" margin="0.01"/>
+    </default>
+
+    <worldbody>
+        <!-- Ground plane -->
+        <geom type="plane" size="40 40 0.1" rgba="0.8 0.9 0.8 1"/>
+
+        <!-- Torso -->
+        <body name="torso" pos="0 0 0.75">
+            <joint name="root" type="free"/>
+            <geom name="torso_geom" type="sphere" size="0.25" rgba="0.8 0.6 0.4 1"/>
+
+            <!-- Front Right Leg -->
+            <body name="front_right_leg" pos="0.2 0.2 0">
+                <joint name="hip_1" type="hinge" axis="0 0 1" range="-30 30"/>
+                <geom type="capsule" fromto="0 0 0 0.2 0.2 0" size="0.08" rgba="0.8 0.6 0.4 1"/>
+
+                <body name="front_right_foot" pos="0.2 0.2 0">
+                    <joint name="ankle_1" type="hinge" axis="-1 1 0" range="-70 -30"/>
+                    <geom type="capsule" fromto="0 0 0 0.4 0.4 0" size="0.08" rgba="0.8 0.6 0.4 1"/>
+                </body>
+            </body>
+
+            <!-- Front Left Leg -->
+            <body name="front_left_leg" pos="-0.2 0.2 0">
+                <joint name="hip_2" type="hinge" axis="0 0 1" range="-30 30"/>
+                <geom type="capsule" fromto="0 0 0 -0.2 0.2 0" size="0.08" rgba="0.8 0.6 0.4 1"/>
+
+                <body name="front_left_foot" pos="-0.2 0.2 0">
+                    <joint name="ankle_2" type="hinge" axis="1 1 0" range="-70 -30"/>
+                    <geom type="capsule" fromto="0 0 0 -0.4 0.4 0" size="0.08" rgba="0.8 0.6 0.4 1"/>
+                </body>
+            </body>
+
+            <!-- Back Right Leg -->
+            <body name="back_right_leg" pos="0.2 -0.2 0">
+                <joint name="hip_3" type="hinge" axis="0 0 1" range="-30 30"/>
+                <geom type="capsule" fromto="0 0 0 0.2 -0.2 0" size="0.08" rgba="0.8 0.6 0.4 1"/>
+
+                <body name="back_right_foot" pos="0.2 -0.2 0">
+                    <joint name="ankle_3" type="hinge" axis="-1 -1 0" range="-70 -30"/>
+                    <geom type="capsule" fromto="0 0 0 0.4 -0.4 0" size="0.08" rgba="0.8 0.6 0.4 1"/>
+                </body>
+            </body>
+
+            <!-- Back Left Leg -->
+            <body name="back_left_leg" pos="-0.2 -0.2 0">
+                <joint name="hip_4" type="hinge" axis="0 0 1" range="-30 30"/>
+                <geom type="capsule" fromto="0 0 0 -0.2 -0.2 0" size="0.08" rgba="0.8 0.6 0.4 1"/>
+
+                <body name="back_left_foot" pos="-0.2 -0.2 0">
+                    <joint name="ankle_4" type="hinge" axis="1 -1 0" range="-70 -30"/>
+                    <geom type="capsule" fromto="0 0 0 -0.4 -0.4 0" size="0.08" rgba="0.8 0.6 0.4 1"/>
+                </body>
+            </body>
+        </body>
+    </worldbody>
+
+    <actuator>
+        <motor joint="hip_1" ctrlrange="-1 1" gear="150"/>
+        <motor joint="ankle_1" ctrlrange="-1 1" gear="150"/>
+        <motor joint="hip_2" ctrlrange="-1 1" gear="150"/>
+        <motor joint="ankle_2" ctrlrange="-1 1" gear="150"/>
+        <motor joint="hip_3" ctrlrange="-1 1" gear="150"/>
+        <motor joint="ankle_3" ctrlrange="-1 1" gear="150"/>
+        <motor joint="hip_4" ctrlrange="-1 1" gear="150"/>
+        <motor joint="ankle_4" ctrlrange="-1 1" gear="150"/>
+    </actuator>
+
+    <sensor>
+        <!-- Torso sensors -->
+        <framepos objtype="body" objname="torso"/>
+        <framequat objtype="body" objname="torso"/>
+        <framelinvel objtype="body" objname="torso"/>
+        <frameangvel objtype="body" objname="torso"/>
+
+        <!-- Joint sensors -->
+        <jointpos joint="hip_1"/>
+        <jointpos joint="ankle_1"/>
+        <jointpos joint="hip_2"/>
+        <jointpos joint="ankle_2"/>
+        <jointpos joint="hip_3"/>
+        <jointpos joint="ankle_3"/>
+        <jointpos joint="hip_4"/>
+        <jointpos joint="ankle_4"/>
+
+        <jointvel joint="hip_1"/>
+        <jointvel joint="ankle_1"/>
+        <jointvel joint="hip_2"/>
+        <jointvel joint="ankle_2"/>
+        <jointvel joint="hip_3"/>
+        <jointvel joint="ankle_3"/>
+        <jointvel joint="hip_4"/>
+        <jointvel joint="ankle_4"/>
+    </sensor>
+</mujoco>
