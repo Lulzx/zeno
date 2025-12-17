@@ -1,0 +1,67 @@
+<mujoco model="swimmer">
+    <option timestep="0.01" gravity="0 0 0"/>
+
+    <default>
+        <joint armature="0.1" damping="2" limited="true"/>
+        <geom contype="1" conaffinity="1" condim="3" friction="0.1 0.1 0.1" density="1000"/>
+    </default>
+
+    <worldbody>
+        <!-- Fluid medium (no gravity, viscous damping simulated via joint damping) -->
+
+        <!-- Head segment -->
+        <body name="head" pos="0 0 0">
+            <joint name="root" type="free"/>
+            <geom name="head_geom" type="capsule" fromto="-0.1 0 0 0.1 0 0" size="0.1" rgba="0.3 0.6 0.8 1"/>
+
+            <!-- Segment 1 -->
+            <body name="seg1" pos="0.2 0 0">
+                <joint name="joint1" type="hinge" axis="0 0 1" range="-100 100"/>
+                <geom type="capsule" fromto="0 0 0 0.15 0 0" size="0.08" rgba="0.3 0.6 0.8 1"/>
+
+                <!-- Segment 2 -->
+                <body name="seg2" pos="0.15 0 0">
+                    <joint name="joint2" type="hinge" axis="0 0 1" range="-100 100"/>
+                    <geom type="capsule" fromto="0 0 0 0.15 0 0" size="0.08" rgba="0.3 0.6 0.8 1"/>
+
+                    <!-- Segment 3 -->
+                    <body name="seg3" pos="0.15 0 0">
+                        <joint name="joint3" type="hinge" axis="0 0 1" range="-100 100"/>
+                        <geom type="capsule" fromto="0 0 0 0.15 0 0" size="0.08" rgba="0.3 0.6 0.8 1"/>
+
+                        <!-- Tail segment -->
+                        <body name="tail" pos="0.15 0 0">
+                            <joint name="joint4" type="hinge" axis="0 0 1" range="-100 100"/>
+                            <geom type="capsule" fromto="0 0 0 0.15 0 0" size="0.06" rgba="0.2 0.5 0.7 1"/>
+                        </body>
+                    </body>
+                </body>
+            </body>
+        </body>
+    </worldbody>
+
+    <actuator>
+        <motor joint="joint1" ctrlrange="-1 1" gear="50"/>
+        <motor joint="joint2" ctrlrange="-1 1" gear="50"/>
+        <motor joint="joint3" ctrlrange="-1 1" gear="50"/>
+        <motor joint="joint4" ctrlrange="-1 1" gear="50"/>
+    </actuator>
+
+    <sensor>
+        <!-- Head sensors -->
+        <framepos objtype="body" objname="head"/>
+        <framequat objtype="body" objname="head"/>
+        <framelinvel objtype="body" objname="head"/>
+        <frameangvel objtype="body" objname="head"/>
+
+        <!-- Joint sensors -->
+        <jointpos joint="joint1"/>
+        <jointpos joint="joint2"/>
+        <jointpos joint="joint3"/>
+        <jointpos joint="joint4"/>
+        <jointvel joint="joint1"/>
+        <jointvel joint="joint2"/>
+        <jointvel joint="joint3"/>
+        <jointvel joint="joint4"/>
+    </sensor>
+</mujoco>
