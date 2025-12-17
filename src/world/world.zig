@@ -17,6 +17,8 @@ const body_mod = @import("../physics/body.zig");
 const joint_mod = @import("../physics/joint.zig");
 const primitives = @import("../collision/primitives.zig");
 const contact = @import("../physics/contact.zig");
+const xpbd_mod = @import("../physics/xpbd.zig");
+const XPBDConstraint = xpbd_mod.XPBDConstraint;
 
 /// Simulation configuration.
 pub const WorldConfig = struct {
@@ -70,6 +72,8 @@ pub const World = struct {
     actuator_data_buffer: Buffer,
     sensor_data_buffer: Buffer,
     params_buffer: Buffer,
+    constraints_buffer: Buffer,
+    num_constraints_per_env: u32,
 
     // Allocator
     allocator: std.mem.Allocator,
@@ -92,12 +96,14 @@ pub const World = struct {
         // Preload compute pipelines
         try pipelines.preload(&.{
             "apply_actions",
+            "apply_joint_forces",
             "forward_kinematics",
             "compute_forces",
             "integrate",
             "broad_phase",
             "narrow_phase",
             "solve_contacts",
+            "solve_joints",
             "read_sensors",
             "reset_env",
         });
@@ -157,6 +163,117 @@ pub const World = struct {
             opts,
         );
 
+        // Generate constraints from joints
+        var template_constraints: std.ArrayListUnmanaged(XPBDConstraint) = .{};
+        defer template_constraints.deinit(allocator);
+
+        for (scene.joints.items) |joint| {
+            // Decompose joint into primitives
+            const primitives_list = try joint_mod.decomposeJoint(&joint, allocator);
+            defer allocator.free(primitives_list);
+
+            for (primitives_list) |jc| {
+                var c: XPBDConstraint = undefined;
+                // Default compliance 0 (rigid)
+                const compliance: f32 = if (jc.params.compliance > 0) jc.params.compliance else 0.0;
+                
+                switch (jc.constraint_type) {
+                    .point => {
+                        c = xpbd_mod.createPositionalConstraint(
+                            jc.body_a, jc.body_b, 0, // env 0
+                            jc.local_anchor_a, jc.local_anchor_b,
+                            compliance
+                        );
+                        try template_constraints.append(allocator, c);
+                    },
+                    .hinge => {
+                         const body_a = scene.bodies.items[jc.body_a];
+                         const body_b = scene.bodies.items[jc.body_b];
+                         
+                         // Rotate axis from A to World
+                         // q * v * q_inv
+                         const q_a = body_a.quaternion;
+                         const v = jc.axis;
+                         
+                         // q_a * (v, 0)
+                         
+                         // ... Wait, quaternion math is verbose inline.
+                         // Use approximate logic:
+                         // Hinge axis in B is derived from initial pose.
+                         // Assuming bodies are initially aligned such that axis_a_world == axis_b_world.
+                         // We can compute axis_b_local by transforming axis_a_local through initial relative transform.
+                         
+                         // Or just use the simple rotation helpers from `primitives` if I could import them.
+                         // Let's implement minimal rotate here.
+                         
+                         // v_world = rotate(v_a, q_a)
+                         // v_b = rotate(v_world, conjugate(q_b))
+                         
+                         // Inline rotate:
+                         // t = 2 * cross(q.xyz, v)
+                         // v' = v + q.w * t + cross(q.xyz, t)
+                         
+                         const q_xyz = [3]f32{q_a[0], q_a[1], q_a[2]};
+                         const t = [3]f32{
+                             2.0 * (q_xyz[1]*v[2] - q_xyz[2]*v[1]),
+                             2.0 * (q_xyz[2]*v[0] - q_xyz[0]*v[2]),
+                             2.0 * (q_xyz[0]*v[1] - q_xyz[1]*v[0])
+                         };
+                         const v_world = [3]f32{
+                             v[0] + q_a[3]*t[0] + (q_xyz[1]*t[2] - q_xyz[2]*t[1]),
+                             v[1] + q_a[3]*t[1] + (q_xyz[2]*t[0] - q_xyz[0]*t[2]),
+                             v[2] + q_a[3]*t[2] + (q_xyz[0]*t[1] - q_xyz[1]*t[0])
+                         };
+                         
+                         // Rotate inverse B
+                         const q_b = body_b.quaternion;
+                         const q_b_inv = [4]f32{-q_b[0], -q_b[1], -q_b[2], q_b[3]};
+                         const q_b_xyz = [3]f32{q_b_inv[0], q_b_inv[1], q_b_inv[2]};
+                         
+                         const t2 = [3]f32{
+                             2.0 * (q_b_xyz[1]*v_world[2] - q_b_xyz[2]*v_world[1]),
+                             2.0 * (q_b_xyz[2]*v_world[0] - q_b_xyz[0]*v_world[2]),
+                             2.0 * (q_b_xyz[0]*v_world[1] - q_b_xyz[1]*v_world[0])
+                         };
+                         const axis_b = [3]f32{
+                             v_world[0] + q_b_inv[3]*t2[0] + (q_b_xyz[1]*t2[2] - q_b_xyz[2]*t2[1]),
+                             v_world[1] + q_b_inv[3]*t2[1] + (q_b_xyz[2]*t2[0] - q_b_xyz[0]*t2[2]),
+                             v_world[2] + q_b_inv[3]*t2[2] + (q_b_xyz[0]*t2[1] - q_b_xyz[1]*t2[0])
+                         };
+
+                         c = xpbd_mod.createAngularConstraint(
+                            jc.body_a, jc.body_b, 0,
+                            jc.axis, axis_b,
+                            compliance, jc.params.damping
+                         );
+                         try template_constraints.append(allocator, c);
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        const num_constraints_per_env = @as(u32, @intCast(template_constraints.items.len));
+        const total_constraints = num_constraints_per_env * config.num_envs;
+
+        const constraints_buffer = try Buffer.init(
+            device.device,
+            @max(total_constraints, 1) * @sizeOf(XPBDConstraint),
+            opts,
+        );
+
+        // Populate for all envs
+        if (num_constraints_per_env > 0) {
+            const constraints_ptr = constraints_buffer.getSlice(XPBDConstraint);
+            for (0..config.num_envs) |env_id| {
+                for (template_constraints.items, 0..) |tmpl, i| {
+                    var c = tmpl;
+                    c.indices[2] = @intCast(env_id); // Update env_id
+                    constraints_ptr[env_id * num_constraints_per_env + i] = c;
+                }
+            }
+        }
+
         const params_buffer = try Buffer.init(
             device.device,
             @sizeOf(SimParams),
@@ -197,6 +314,8 @@ pub const World = struct {
             .actuator_data_buffer = actuator_data_buffer,
             .sensor_data_buffer = sensor_data_buffer,
             .params_buffer = params_buffer,
+            .constraints_buffer = constraints_buffer,
+            .num_constraints_per_env = num_constraints_per_env,
             .allocator = allocator,
         };
 
@@ -308,21 +427,25 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_actuators);
         }
 
-        // Stage 2: Forward kinematics
-        {
+        // Stage 1.5: Apply joint forces (convert joint torques to body torques)
+        if (self.params.num_joints > 0) {
             var encoder = try cmd.computeEncoder();
             defer encoder.endEncoding();
 
-            const pipeline = try self.pipelines.getPipeline("forward_kinematics");
+            const pipeline = try self.pipelines.getPipeline("apply_joint_forces");
             encoder.setPipeline(pipeline);
-            encoder.setBuffer(&self.state.positions_buffer, 0, 0);
-            encoder.setBuffer(&self.state.quaternions_buffer, 0, 1);
-            encoder.setBuffer(&self.state.joint_positions_buffer, 0, 2);
-            encoder.setBuffer(&self.joint_data_buffer, 0, 3);
-            encoder.setBuffer(&self.body_data_buffer, 0, 4);
-            encoder.setBuffer(&self.params_buffer, 0, 5);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
+            encoder.setBuffer(&self.state.torques_buffer, 0, 0);
+            encoder.setBuffer(&self.state.joint_torques_buffer, 0, 1);
+            encoder.setBuffer(&self.joint_data_buffer, 0, 2);
+            encoder.setBuffer(&self.state.quaternions_buffer, 0, 3);
+            encoder.setBuffer(&self.params_buffer, 0, 4);
+            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_joints);
         }
+
+        // Stage 2: Forward kinematics
+        // Disabled: We use maximal coordinates + constraints
+        // TODO: Bodies marked as 'kinematic' (fixed children) are now static unless
+        // converted to dynamic bodies with Fixed/Weld constraints in Scene/Parser.
 
         // Stage 3: Compute forces
         {
@@ -391,7 +514,26 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
         }
 
-        // Stage 7: Contact solver (PBD iterations)
+        // Stage 7: Joint solver (XPBD iterations)
+        if (self.num_constraints_per_env > 0) {
+            for (0..self.config.contact_iterations) |_| {
+                var encoder = try cmd.computeEncoder();
+                defer encoder.endEncoding();
+
+                const pipeline = try self.pipelines.getPipeline("solve_joints");
+                encoder.setPipeline(pipeline);
+                encoder.setBuffer(&self.state.positions_buffer, 0, 0);
+                encoder.setBuffer(&self.state.velocities_buffer, 0, 1);
+                encoder.setBuffer(&self.state.quaternions_buffer, 0, 2);
+                encoder.setBuffer(&self.state.angular_velocities_buffer, 0, 3);
+                encoder.setBuffer(&self.constraints_buffer, 0, 4);
+                encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 5);
+                encoder.setBuffer(&self.params_buffer, 0, 6);
+                encoder.dispatch1D(pipeline, self.config.num_envs * self.num_constraints_per_env);
+            }
+        }
+
+        // Stage 8: Contact solver (PBD iterations)
         for (0..self.config.contact_iterations) |_| {
             var encoder = try cmd.computeEncoder();
             defer encoder.endEncoding();
@@ -609,6 +751,7 @@ pub const World = struct {
         self.actuator_data_buffer.deinit();
         self.sensor_data_buffer.deinit();
         self.params_buffer.deinit();
+        self.constraints_buffer.deinit();
 
         self.state.deinit();
         self.pipelines.deinit();

@@ -198,13 +198,14 @@ pub const ConstraintParams = struct {
 
 /// Decompose joint into primitive constraints.
 pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]JointConstraint {
-    var constraints = std.ArrayList(JointConstraint).init(allocator);
+    var constraints: std.ArrayListUnmanaged(JointConstraint) = .{};
+    // defer constraints.deinit(allocator); // Don't deinit, we return owned slice
 
     switch (joint.joint_type) {
         .fixed => {
             // Fixed joint = 3 point constraints + 3 angular constraints
             // For simplicity, use a single rigid constraint
-            try constraints.append(.{
+            try constraints.append(allocator, .{
                 .constraint_type = .point,
                 .body_a = joint.parent_body,
                 .body_b = joint.child_body,
@@ -216,7 +217,7 @@ pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]J
         },
         .revolute => {
             // Point constraint at anchor
-            try constraints.append(.{
+            try constraints.append(allocator, .{
                 .constraint_type = .point,
                 .body_a = joint.parent_body,
                 .body_b = joint.child_body,
@@ -226,7 +227,7 @@ pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]J
                 .params = .{},
             });
             // Hinge constraint around axis
-            try constraints.append(.{
+            try constraints.append(allocator, .{
                 .constraint_type = .hinge,
                 .body_a = joint.parent_body,
                 .body_b = joint.child_body,
@@ -239,7 +240,7 @@ pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]J
             });
             // Angular limits if enabled
             if (joint.hasLimits()) {
-                try constraints.append(.{
+                try constraints.append(allocator, .{
                     .constraint_type = .angular_limit,
                     .body_a = joint.parent_body,
                     .body_b = joint.child_body,
@@ -255,7 +256,7 @@ pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]J
         },
         .prismatic => {
             // Slider constraint along axis
-            try constraints.append(.{
+            try constraints.append(allocator, .{
                 .constraint_type = .slider,
                 .body_a = joint.parent_body,
                 .body_b = joint.child_body,
@@ -268,7 +269,7 @@ pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]J
             });
             // Linear limits if enabled
             if (joint.hasLimits()) {
-                try constraints.append(.{
+                try constraints.append(allocator, .{
                     .constraint_type = .linear_limit,
                     .body_a = joint.parent_body,
                     .body_b = joint.child_body,
@@ -284,7 +285,7 @@ pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]J
         },
         .ball => {
             // Point constraint only (free rotation)
-            try constraints.append(.{
+            try constraints.append(allocator, .{
                 .constraint_type = .point,
                 .body_a = joint.parent_body,
                 .body_b = joint.child_body,
@@ -295,7 +296,7 @@ pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]J
             });
             // Cone limit if specified
             if (joint.hasLimits()) {
-                try constraints.append(.{
+                try constraints.append(allocator, .{
                     .constraint_type = .cone_limit,
                     .body_a = joint.parent_body,
                     .body_b = joint.child_body,
@@ -313,7 +314,7 @@ pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]J
         },
         .universal => {
             // Point constraint
-            try constraints.append(.{
+            try constraints.append(allocator, .{
                 .constraint_type = .point,
                 .body_a = joint.parent_body,
                 .body_b = joint.child_body,
@@ -323,7 +324,7 @@ pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]J
                 .params = .{},
             });
             // Two perpendicular hinge constraints
-            try constraints.append(.{
+            try constraints.append(allocator, .{
                 .constraint_type = .hinge,
                 .body_a = joint.parent_body,
                 .body_b = joint.child_body,
@@ -332,7 +333,7 @@ pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]J
                 .axis = joint.axis,
                 .params = .{},
             });
-            try constraints.append(.{
+            try constraints.append(allocator, .{
                 .constraint_type = .hinge,
                 .body_a = joint.parent_body,
                 .body_b = joint.child_body,
@@ -344,5 +345,5 @@ pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]J
         },
     }
 
-    return constraints.toOwnedSlice();
+    return constraints.toOwnedSlice(allocator);
 }

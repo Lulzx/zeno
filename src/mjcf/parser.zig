@@ -802,6 +802,14 @@ fn convertToScene(allocator: std.mem.Allocator, model: *const schema.MjcfModel) 
     scene.physics_config.timestep = model.option.timestep;
     scene.physics_config.gravity = model.option.gravity;
 
+    // Add implicit World Body (Body 0)
+    _ = try scene.addBody(.{
+        .name = "world",
+        .body_type = .static,
+        .position = .{ 0, 0, 0 },
+        .quaternion = .{ 0, 0, 0, 1 },
+    });
+
     // Add ground plane (worldbody geoms)
     for (model.worldbody.geoms.items) |mjcf_geom| {
         var geom = convertGeom(&mjcf_geom);
@@ -810,8 +818,8 @@ fn convertToScene(allocator: std.mem.Allocator, model: *const schema.MjcfModel) 
     }
 
     // Process body hierarchy
-    var body_index: u32 = 0;
-    try processBody(allocator, &scene, &model.worldbody, -1, &body_index, .{ 0, 0, 0 }, .{ 0, 0, 0, 1 });
+    var body_index: u32 = 1;
+    try processBody(allocator, &scene, &model.worldbody, 0, &body_index, .{ 0, 0, 0 }, .{ 0, 0, 0, 1 });
 
     // Add actuators
     for (model.actuators.items) |mjcf_actuator| {
