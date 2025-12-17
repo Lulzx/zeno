@@ -70,6 +70,7 @@ class ZenoEnv:
         self._num_envs = num_envs
         self._step_count = 0
         self._max_episode_steps = 1000
+        self._mjcf_path = mjcf_path  # Store for viewer
 
         # Cache observation and action shapes
         self._obs_shape = (num_envs, self._world.obs_dim)

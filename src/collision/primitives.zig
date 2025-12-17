@@ -4,6 +4,8 @@ const std = @import("std");
 const body = @import("../physics/body.zig");
 const constants = @import("../physics/constants.zig");
 
+const mesh_mod = @import("mesh.zig");
+
 /// Geometry type enumeration.
 pub const GeomType = enum(u8) {
     sphere = 0,
@@ -11,7 +13,7 @@ pub const GeomType = enum(u8) {
     box = 2,
     plane = 3,
     cylinder = 4,
-    mesh = 5, // Not implemented in v0.1
+    mesh = 5,
 };
 
 /// Geometry definition.
@@ -38,6 +40,10 @@ pub const Geom = struct {
     collide: bool = true,
     /// Mass (for inertia calculation).
     mass: f32 = 1.0,
+    /// Mesh asset index (for mesh type).
+    mesh_id: u32 = 0,
+    /// Optional pointer to mesh data (not owned).
+    mesh_ptr: ?*const mesh_mod.Mesh = null,
 
     /// Create a sphere geometry.
     pub fn sphere(radius: f32) Geom {
@@ -129,10 +135,24 @@ pub const Geom = struct {
                     .{ r, r, h },
                 );
             },
-            .mesh => body.AABB{
-                .min = .{ -1, -1, -1 },
-                .max = .{ 1, 1, 1 },
-            },
+            .mesh => if (self.mesh_ptr) |m|
+                body.AABB{
+                    .min = .{
+                        self.local_pos[0] + m.aabb.min[0],
+                        self.local_pos[1] + m.aabb.min[1],
+                        self.local_pos[2] + m.aabb.min[2],
+                    },
+                    .max = .{
+                        self.local_pos[0] + m.aabb.max[0],
+                        self.local_pos[1] + m.aabb.max[1],
+                        self.local_pos[2] + m.aabb.max[2],
+                    },
+                }
+            else
+                body.AABB{
+                    .min = .{ -1, -1, -1 },
+                    .max = .{ 1, 1, 1 },
+                },
         };
     }
 
@@ -187,7 +207,8 @@ pub const Geom = struct {
                 const h = self.size[1] * 2.0;
                 break :blk std.math.pi * r * r * h;
             },
-            .plane, .mesh => 0.0,
+            .plane => 0.0,
+            .mesh => if (self.mesh_ptr) |m| m.volume() else 0.0,
         };
     }
 
@@ -230,7 +251,8 @@ pub const Geom = struct {
                 const i_z = 0.5 * mass * r2;
                 break :blk .{ i_x, i_x, i_z };
             },
-            .plane, .mesh => .{ 0, 0, 0 },
+            .plane => .{ 0, 0, 0 },
+            .mesh => if (self.mesh_ptr) |m| m.computeInertia(mass) else .{ 0, 0, 0 },
         };
     }
 

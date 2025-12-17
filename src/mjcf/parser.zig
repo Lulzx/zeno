@@ -30,15 +30,149 @@ pub fn parseFile(allocator: std.mem.Allocator, path: []const u8) !Scene {
     };
     defer allocator.free(content);
 
-    return parseString(allocator, content);
+    // Get directory containing the file for resolving includes
+    const dir = std.fs.path.dirname(path) orelse ".";
+
+    return parseStringWithDir(allocator, content, dir);
 }
 
-/// Parse MJCF XML string and return a Scene.
+/// Parse MJCF XML string and return a Scene (uses current directory for includes).
 pub fn parseString(allocator: std.mem.Allocator, xml: []const u8) !Scene {
-    var model = try parseXml(allocator, xml);
+    return parseStringWithDir(allocator, xml, ".");
+}
+
+/// Parse MJCF XML string with directory context for resolving includes.
+pub fn parseStringWithDir(allocator: std.mem.Allocator, xml: []const u8, model_dir: []const u8) !Scene {
+    var model = try parseXmlWithIncludes(allocator, xml, model_dir);
     defer model.deinit(allocator);
 
+    model.model_dir = model_dir;
     return convertToScene(allocator, &model);
+}
+
+/// Parse XML into MjcfModel with include file support.
+fn parseXmlWithIncludes(allocator: std.mem.Allocator, xml: []const u8, model_dir: []const u8) !schema.MjcfModel {
+    // First pass: process includes and merge into single XML
+    const merged = try processIncludes(allocator, xml, model_dir);
+    defer if (merged.ptr != xml.ptr) allocator.free(merged);
+
+    return parseXml(allocator, merged);
+}
+
+/// Process include directives recursively.
+fn processIncludes(allocator: std.mem.Allocator, xml: []const u8, model_dir: []const u8) ![]const u8 {
+    // Find include directives
+    var result: std.ArrayListUnmanaged(u8) = .{};
+    errdefer result.deinit(allocator);
+
+    var pos: usize = 0;
+    while (pos < xml.len) {
+        // Look for <include
+        if (std.mem.indexOf(u8, xml[pos..], "<include")) |include_start| {
+            const abs_start = pos + include_start;
+
+            // Copy everything before the include
+            try result.appendSlice(allocator, xml[pos..abs_start]);
+
+            // Find the end of the include tag
+            const tag_end = std.mem.indexOf(u8, xml[abs_start..], "/>") orelse
+                std.mem.indexOf(u8, xml[abs_start..], ">") orelse {
+                pos = abs_start + 8;
+                continue;
+            };
+
+            const include_tag = xml[abs_start .. abs_start + tag_end + 2];
+
+            // Extract file attribute
+            if (extractAttr(include_tag, "file")) |file_path| {
+                // Resolve relative path
+                const full_path = try std.fs.path.join(allocator, &.{ model_dir, file_path });
+                defer allocator.free(full_path);
+
+                // Load the included file
+                const included_content = loadIncludedFile(allocator, full_path) catch |err| {
+                    std.debug.print("Warning: Could not include file '{s}': {}\n", .{ full_path, err });
+                    pos = abs_start + tag_end + 2;
+                    continue;
+                };
+                defer allocator.free(included_content);
+
+                // Recursively process includes in the included file
+                const included_dir = std.fs.path.dirname(full_path) orelse model_dir;
+                const processed = try processIncludes(allocator, included_content, included_dir);
+                defer if (processed.ptr != included_content.ptr) allocator.free(processed);
+
+                // Strip mujoco tags from included content and append
+                const stripped = stripMujocoTags(processed);
+                try result.appendSlice(allocator, stripped);
+            }
+
+            pos = abs_start + tag_end + 2;
+        } else {
+            // No more includes, copy the rest
+            try result.appendSlice(allocator, xml[pos..]);
+            break;
+        }
+    }
+
+    if (result.items.len == 0) {
+        return xml;
+    }
+
+    return try result.toOwnedSlice(allocator);
+}
+
+/// Load content from an included file.
+fn loadIncludedFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const file = std.fs.cwd().openFile(path, .{}) catch return error.FileNotFound;
+    defer file.close();
+
+    return try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
+}
+
+/// Extract attribute value from a tag.
+fn extractAttr(tag: []const u8, name: []const u8) ?[]const u8 {
+    // Look for name="value" or name='value'
+    var search_pos: usize = 0;
+    while (std.mem.indexOf(u8, tag[search_pos..], name)) |name_pos| {
+        const abs_pos = search_pos + name_pos;
+        var pos = abs_pos + name.len;
+
+        // Skip whitespace and =
+        while (pos < tag.len and (tag[pos] == ' ' or tag[pos] == '=' or tag[pos] == '\t')) {
+            pos += 1;
+        }
+
+        if (pos >= tag.len) break;
+
+        const quote = tag[pos];
+        if (quote != '"' and quote != '\'') {
+            search_pos = pos;
+            continue;
+        }
+        pos += 1;
+
+        const value_start = pos;
+        while (pos < tag.len and tag[pos] != quote) {
+            pos += 1;
+        }
+
+        return tag[value_start..pos];
+    }
+    return null;
+}
+
+/// Strip outer mujoco tags from included content.
+fn stripMujocoTags(content: []const u8) []const u8 {
+    // Find opening <mujoco> tag
+    const start_tag = std.mem.indexOf(u8, content, "<mujoco") orelse return content;
+    var start = std.mem.indexOf(u8, content[start_tag..], ">") orelse return content;
+    start = start_tag + start + 1;
+
+    // Find closing </mujoco> tag
+    const end = std.mem.lastIndexOf(u8, content, "</mujoco>") orelse return content;
+
+    return content[start..end];
 }
 
 /// Parse XML into MjcfModel.
@@ -68,14 +202,98 @@ fn parseMujocoContent(tokenizer: *XmlTokenizer, allocator: std.mem.Allocator, mo
         if (token.kind == .element_start) {
             if (std.mem.eql(u8, token.name, "option")) {
                 model.option = parseOption(token.attrs);
+            } else if (std.mem.eql(u8, token.name, "default")) {
+                try parseDefaults(tokenizer, allocator, &model.defaults);
+            } else if (std.mem.eql(u8, token.name, "asset")) {
+                try parseAssets(tokenizer, allocator, model);
             } else if (std.mem.eql(u8, token.name, "worldbody")) {
-                try parseWorldbody(tokenizer, allocator, &model.worldbody);
+                try parseWorldbody(tokenizer, allocator, &model.worldbody, &model.defaults);
             } else if (std.mem.eql(u8, token.name, "actuator")) {
                 try parseActuators(tokenizer, allocator, &model.actuators);
             } else if (std.mem.eql(u8, token.name, "sensor")) {
                 try parseSensors(tokenizer, allocator, &model.sensors);
-            } else if (std.mem.eql(u8, token.name, "default")) {
-                try parseDefaults(tokenizer, allocator, &model.defaults);
+            } else if (std.mem.eql(u8, token.name, "tendon")) {
+                try parseTendons(tokenizer, allocator, &model.tendons);
+            } else if (std.mem.eql(u8, token.name, "equality")) {
+                try parseEqualities(tokenizer, allocator, &model.equalities);
+            }
+        }
+    }
+}
+
+fn parseAssets(tokenizer: *XmlTokenizer, allocator: std.mem.Allocator, model: *schema.MjcfModel) !void {
+    while (tokenizer.next()) |token| {
+        if (token.kind == .element_end and std.mem.eql(u8, token.name, "asset")) {
+            break;
+        }
+
+        if (token.kind == .element_start) {
+            if (std.mem.eql(u8, token.name, "mesh")) {
+                var mesh = schema.MjcfMesh{};
+                mesh.name = getAttr(token.attrs, "name") orelse "";
+                mesh.file = getAttr(token.attrs, "file") orelse "";
+                if (getAttr(token.attrs, "scale")) |v| {
+                    mesh.scale = parseVec3(v) orelse .{ 1, 1, 1 };
+                }
+                try model.meshes.append(allocator, mesh);
+            } else if (std.mem.eql(u8, token.name, "texture")) {
+                var tex = schema.MjcfTexture{};
+                tex.name = getAttr(token.attrs, "name") orelse "";
+                tex.file = getAttr(token.attrs, "file") orelse "";
+                if (getAttr(token.attrs, "type")) |v| {
+                    tex.texture_type = schema.TextureType.fromString(v) orelse ._2d;
+                }
+                if (getAttr(token.attrs, "builtin")) |v| {
+                    tex.builtin = schema.BuiltinTexture.fromString(v) orelse .none;
+                }
+                if (getAttr(token.attrs, "rgb1")) |v| {
+                    tex.rgb1 = parseVec3(v) orelse .{ 0.8, 0.8, 0.8 };
+                }
+                if (getAttr(token.attrs, "rgb2")) |v| {
+                    tex.rgb2 = parseVec3(v) orelse .{ 0.5, 0.5, 0.5 };
+                }
+                if (getAttr(token.attrs, "width")) |v| {
+                    tex.width = parseInt(v) orelse 512;
+                }
+                if (getAttr(token.attrs, "height")) |v| {
+                    tex.height = parseInt(v) orelse 512;
+                }
+                if (getAttr(token.attrs, "mark")) |v| {
+                    tex.mark = v;
+                }
+                if (getAttr(token.attrs, "markrgb")) |v| {
+                    tex.markrgb = parseVec3(v) orelse .{ 0, 0, 0 };
+                }
+                if (getAttr(token.attrs, "random")) |v| {
+                    tex.random = parseFloat(v) orelse 0.01;
+                }
+                try model.textures.append(allocator, tex);
+            } else if (std.mem.eql(u8, token.name, "material")) {
+                var mat = schema.MjcfMaterial{};
+                mat.name = getAttr(token.attrs, "name") orelse "";
+                mat.texture = getAttr(token.attrs, "texture") orelse "";
+                if (getAttr(token.attrs, "texrepeat")) |v| {
+                    mat.texrepeat = parseVec2(v) orelse .{ 1, 1 };
+                }
+                if (getAttr(token.attrs, "texuniform")) |v| {
+                    mat.texuniform = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+                }
+                if (getAttr(token.attrs, "emission")) |v| {
+                    mat.emission = parseFloat(v) orelse 0;
+                }
+                if (getAttr(token.attrs, "specular")) |v| {
+                    mat.specular = parseFloat(v) orelse 0.5;
+                }
+                if (getAttr(token.attrs, "shininess")) |v| {
+                    mat.shininess = parseFloat(v) orelse 0.5;
+                }
+                if (getAttr(token.attrs, "reflectance")) |v| {
+                    mat.reflectance = parseFloat(v) orelse 0;
+                }
+                if (getAttr(token.attrs, "rgba")) |v| {
+                    mat.rgba = parseRgba(v) orelse .{ 1, 1, 1, 1 };
+                }
+                try model.materials.append(allocator, mat);
             }
         }
     }
@@ -95,8 +313,8 @@ fn parseOption(attrs: []const u8) schema.MjcfOption {
     return option;
 }
 
-fn parseWorldbody(tokenizer: *XmlTokenizer, allocator: std.mem.Allocator, worldbody: *schema.MjcfBody) !void {
-    try parseBodyContent(tokenizer, allocator, worldbody, "worldbody");
+fn parseWorldbody(tokenizer: *XmlTokenizer, allocator: std.mem.Allocator, worldbody: *schema.MjcfBody, defaults: *const std.StringHashMapUnmanaged(schema.MjcfDefault)) !void {
+    try parseBodyContent(tokenizer, allocator, worldbody, "worldbody", defaults, "main");
 }
 
 fn parseBodyContent(
@@ -104,6 +322,8 @@ fn parseBodyContent(
     allocator: std.mem.Allocator,
     body: *schema.MjcfBody,
     end_tag: []const u8,
+    defaults: *const std.StringHashMapUnmanaged(schema.MjcfDefault),
+    parent_class: []const u8,
 ) !void {
     while (tokenizer.next()) |token| {
         if (token.kind == .element_end and std.mem.eql(u8, token.name, end_tag)) {
@@ -123,13 +343,16 @@ fn parseBodyContent(
                 if (getAttr(token.attrs, "euler")) |v| {
                     child.euler = parseVec3(v);
                 }
-                try parseBodyContent(tokenizer, allocator, &child, "body");
+                // Check for childclass attribute
+                const child_class = getAttr(token.attrs, "childclass") orelse parent_class;
+                child.childclass = child_class;
+                try parseBodyContent(tokenizer, allocator, &child, "body", defaults, child_class);
                 try body.children.append(allocator, child);
             } else if (std.mem.eql(u8, token.name, "joint")) {
-                const joint = parseJoint(token.attrs);
+                const joint = parseJointWithDefaults(token.attrs, defaults, parent_class);
                 try body.joints.append(allocator, joint);
             } else if (std.mem.eql(u8, token.name, "geom")) {
-                const geom = parseGeom(token.attrs);
+                const geom = parseGeomWithDefaults(token.attrs, defaults, parent_class);
                 try body.geoms.append(allocator, geom);
             } else if (std.mem.eql(u8, token.name, "site")) {
                 const site = parseSite(token.attrs);
@@ -141,19 +364,33 @@ fn parseBodyContent(
 
 fn parseJoint(attrs: []const u8) schema.MjcfJoint {
     var joint = schema.MjcfJoint{};
+    return applyJointAttrs(&joint, attrs);
+}
 
-    joint.name = getAttr(attrs, "name") orelse "";
+fn parseJointWithDefaults(attrs: []const u8, defaults: *const std.StringHashMapUnmanaged(schema.MjcfDefault), class: []const u8) schema.MjcfJoint {
+    // First check for explicit class attribute
+    const use_class = getAttr(attrs, "class") orelse class;
+
+    // Start with defaults if available
+    var joint = if (defaults.get(use_class)) |def| def.joint else schema.MjcfJoint{};
+
+    // Apply attributes from the element (overriding defaults)
+    return applyJointAttrs(&joint, attrs);
+}
+
+fn applyJointAttrs(joint: *schema.MjcfJoint, attrs: []const u8) schema.MjcfJoint {
+    joint.name = getAttr(attrs, "name") orelse joint.name;
 
     if (getAttr(attrs, "type")) |v| {
-        joint.joint_type = schema.JointType.fromString(v) orelse .hinge;
+        joint.joint_type = schema.JointType.fromString(v) orelse joint.joint_type;
     }
 
     if (getAttr(attrs, "pos")) |v| {
-        joint.pos = parseVec3(v) orelse .{ 0, 0, 0 };
+        joint.pos = parseVec3(v) orelse joint.pos;
     }
 
     if (getAttr(attrs, "axis")) |v| {
-        joint.axis = parseVec3(v) orelse .{ 0, 0, 1 };
+        joint.axis = parseVec3(v) orelse joint.axis;
     }
 
     if (getAttr(attrs, "range")) |v| {
@@ -162,39 +399,53 @@ fn parseJoint(attrs: []const u8) schema.MjcfJoint {
     }
 
     if (getAttr(attrs, "damping")) |v| {
-        joint.damping = parseFloat(v) orelse 0;
+        joint.damping = parseFloat(v) orelse joint.damping;
     }
 
     if (getAttr(attrs, "stiffness")) |v| {
-        joint.stiffness = parseFloat(v) orelse 0;
+        joint.stiffness = parseFloat(v) orelse joint.stiffness;
     }
 
     if (getAttr(attrs, "armature")) |v| {
-        joint.armature = parseFloat(v) orelse 0;
+        joint.armature = parseFloat(v) orelse joint.armature;
     }
 
     if (getAttr(attrs, "ref")) |v| {
-        joint.ref = parseFloat(v) orelse 0;
+        joint.ref = parseFloat(v) orelse joint.ref;
     }
 
-    return joint;
+    return joint.*;
 }
 
 fn parseGeom(attrs: []const u8) schema.MjcfGeom {
     var geom = schema.MjcfGeom{};
+    return applyGeomAttrs(&geom, attrs);
+}
 
-    geom.name = getAttr(attrs, "name") orelse "";
+fn parseGeomWithDefaults(attrs: []const u8, defaults: *const std.StringHashMapUnmanaged(schema.MjcfDefault), class: []const u8) schema.MjcfGeom {
+    // First check for explicit class attribute
+    const use_class = getAttr(attrs, "class") orelse class;
+
+    // Start with defaults if available
+    var geom = if (defaults.get(use_class)) |def| def.geom else schema.MjcfGeom{};
+
+    // Apply attributes from the element (overriding defaults)
+    return applyGeomAttrs(&geom, attrs);
+}
+
+fn applyGeomAttrs(geom: *schema.MjcfGeom, attrs: []const u8) schema.MjcfGeom {
+    geom.name = getAttr(attrs, "name") orelse geom.name;
 
     if (getAttr(attrs, "type")) |v| {
-        geom.geom_type = schema.GeomType.fromString(v) orelse .sphere;
+        geom.geom_type = schema.GeomType.fromString(v) orelse geom.geom_type;
     }
 
     if (getAttr(attrs, "pos")) |v| {
-        geom.pos = parseVec3(v) orelse .{ 0, 0, 0 };
+        geom.pos = parseVec3(v) orelse geom.pos;
     }
 
     if (getAttr(attrs, "quat")) |v| {
-        geom.quat = parseQuat(v) orelse .{ 1, 0, 0, 0 };
+        geom.quat = parseQuat(v) orelse geom.quat;
     }
 
     if (getAttr(attrs, "size")) |v| {
@@ -210,22 +461,35 @@ fn parseGeom(attrs: []const u8) schema.MjcfGeom {
     }
 
     if (getAttr(attrs, "density")) |v| {
-        geom.density = parseFloat(v) orelse 1000;
+        geom.density = parseFloat(v) orelse geom.density;
     }
 
     if (getAttr(attrs, "friction")) |v| {
-        geom.friction = parseVec3(v) orelse .{ 1, 0.005, 0.0001 };
+        geom.friction = parseVec3(v) orelse geom.friction;
+    }
+
+    if (getAttr(attrs, "rgba")) |v| {
+        geom.rgba = parseRgba(v) orelse geom.rgba;
     }
 
     if (getAttr(attrs, "contype")) |v| {
-        geom.contype = parseInt(v) orelse 1;
+        geom.contype = parseInt(v) orelse geom.contype;
     }
 
     if (getAttr(attrs, "conaffinity")) |v| {
-        geom.conaffinity = parseInt(v) orelse 1;
+        geom.conaffinity = parseInt(v) orelse geom.conaffinity;
     }
 
-    return geom;
+    if (getAttr(attrs, "mesh")) |v| {
+        geom.mesh = v;
+        geom.geom_type = .mesh; // Auto-set type when mesh is specified
+    }
+
+    if (getAttr(attrs, "material")) |v| {
+        geom.material = v;
+    }
+
+    return geom.*;
 }
 
 fn parseSite(attrs: []const u8) schema.MjcfSite {
@@ -309,12 +573,218 @@ fn parseSensors(tokenizer: *XmlTokenizer, allocator: std.mem.Allocator, sensor_l
     }
 }
 
-fn parseDefaults(tokenizer: *XmlTokenizer, _: std.mem.Allocator, _: *std.StringHashMapUnmanaged(schema.MjcfDefault)) !void {
-    // Skip defaults for now - just find the </default> end tag
-    // Note: We can't use depth tracking because self-closing tags only emit element_start
+fn parseTendons(tokenizer: *XmlTokenizer, allocator: std.mem.Allocator, tendon_list: *std.ArrayListUnmanaged(schema.MjcfTendon)) !void {
+    while (tokenizer.next()) |token| {
+        if (token.kind == .element_end and std.mem.eql(u8, token.name, "tendon")) {
+            break;
+        }
+
+        if (token.kind == .element_start) {
+            if (std.mem.eql(u8, token.name, "fixed") or std.mem.eql(u8, token.name, "spatial")) {
+                var tendon = schema.MjcfTendon{};
+                tendon.name = getAttr(token.attrs, "name") orelse "";
+                tendon.tendon_type = schema.TendonType.fromString(token.name) orelse .fixed;
+
+                if (getAttr(token.attrs, "stiffness")) |v| {
+                    tendon.stiffness = parseFloat(v) orelse 0;
+                }
+                if (getAttr(token.attrs, "damping")) |v| {
+                    tendon.damping = parseFloat(v) orelse 0;
+                }
+                if (getAttr(token.attrs, "range")) |v| {
+                    if (parseVec2(v)) |range| {
+                        tendon.range_lower = range[0];
+                        tendon.range_upper = range[1];
+                        tendon.limited = true;
+                    }
+                }
+                if (getAttr(token.attrs, "width")) |v| {
+                    tendon.width = parseFloat(v) orelse 0.003;
+                }
+                if (getAttr(token.attrs, "rgba")) |v| {
+                    tendon.rgba = parseRgba(v) orelse tendon.rgba;
+                }
+                if (getAttr(token.attrs, "margin")) |v| {
+                    tendon.margin = parseFloat(v) orelse 0;
+                }
+
+                // Parse path elements (joint or site references)
+                try parseTendonPath(tokenizer, allocator, &tendon, token.name);
+                try tendon_list.append(allocator, tendon);
+            }
+        }
+    }
+}
+
+fn parseTendonPath(tokenizer: *XmlTokenizer, allocator: std.mem.Allocator, tendon: *schema.MjcfTendon, end_tag: []const u8) !void {
+    while (tokenizer.next()) |token| {
+        if (token.kind == .element_end and std.mem.eql(u8, token.name, end_tag)) {
+            break;
+        }
+
+        if (token.kind == .element_start) {
+            if (std.mem.eql(u8, token.name, "joint")) {
+                var path_elem = schema.MjcfTendonPath{};
+                path_elem.joint = getAttr(token.attrs, "joint") orelse "";
+                if (getAttr(token.attrs, "coef")) |v| {
+                    path_elem.coef = parseFloat(v) orelse 1.0;
+                }
+                try tendon.path.append(allocator, path_elem);
+            } else if (std.mem.eql(u8, token.name, "site")) {
+                var path_elem = schema.MjcfTendonPath{};
+                path_elem.site = getAttr(token.attrs, "site") orelse "";
+                try tendon.path.append(allocator, path_elem);
+            } else if (std.mem.eql(u8, token.name, "geom")) {
+                // Wrapping object (for spatial tendons)
+                var path_elem = schema.MjcfTendonPath{};
+                path_elem.site = getAttr(token.attrs, "geom") orelse "";
+                try tendon.path.append(allocator, path_elem);
+            }
+        }
+    }
+}
+
+fn parseEqualities(tokenizer: *XmlTokenizer, allocator: std.mem.Allocator, equality_list: *std.ArrayListUnmanaged(schema.MjcfEquality)) !void {
+    while (tokenizer.next()) |token| {
+        if (token.kind == .element_end and std.mem.eql(u8, token.name, "equality")) {
+            break;
+        }
+
+        if (token.kind == .element_start) {
+            var equality = schema.MjcfEquality{};
+            equality.name = getAttr(token.attrs, "name") orelse "";
+            equality.equality_type = schema.EqualityType.fromString(token.name) orelse .connect;
+
+            // Body references
+            equality.body1 = getAttr(token.attrs, "body1") orelse "";
+            equality.body2 = getAttr(token.attrs, "body2") orelse "";
+
+            // Joint references
+            equality.joint1 = getAttr(token.attrs, "joint1") orelse "";
+            equality.joint2 = getAttr(token.attrs, "joint2") orelse "";
+
+            // Tendon reference
+            equality.tendon = getAttr(token.attrs, "tendon") orelse
+                getAttr(token.attrs, "tendon1") orelse "";
+
+            // Anchor point
+            if (getAttr(token.attrs, "anchor")) |v| {
+                equality.anchor = parseVec3(v) orelse .{ 0, 0, 0 };
+            }
+
+            // Relative pose (for weld)
+            if (getAttr(token.attrs, "relpose")) |v| {
+                equality.relpose = parseRelpose(v);
+            }
+
+            // Polynomial coefficients (for joint constraints)
+            if (getAttr(token.attrs, "polycoef")) |v| {
+                equality.polycoef = parsePolycoef(v);
+            }
+
+            // Active state
+            if (getAttr(token.attrs, "active")) |v| {
+                equality.active = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+            }
+
+            // Solver parameters
+            if (getAttr(token.attrs, "solimp")) |v| {
+                equality.solimp = parseSolimp(v);
+            }
+            if (getAttr(token.attrs, "solref")) |v| {
+                equality.solref = parseSolref(v);
+            }
+
+            try equality_list.append(allocator, equality);
+        }
+    }
+}
+
+fn parseRelpose(s: []const u8) [7]f32 {
+    var result: [7]f32 = .{ 0, 0, 0, 1, 0, 0, 0 };
+    var iter = std.mem.tokenizeAny(u8, s, " \t\n");
+    var i: usize = 0;
+    while (iter.next()) |tok| : (i += 1) {
+        if (i >= 7) break;
+        result[i] = parseFloat(tok) orelse result[i];
+    }
+    return result;
+}
+
+fn parsePolycoef(s: []const u8) [5]f32 {
+    var result: [5]f32 = .{ 0, 1, 0, 0, 0 };
+    var iter = std.mem.tokenizeAny(u8, s, " \t\n");
+    var i: usize = 0;
+    while (iter.next()) |tok| : (i += 1) {
+        if (i >= 5) break;
+        result[i] = parseFloat(tok) orelse result[i];
+    }
+    return result;
+}
+
+fn parseSolimp(s: []const u8) [5]f32 {
+    var result: [5]f32 = .{ 0.9, 0.95, 0.001, 0.5, 2 };
+    var iter = std.mem.tokenizeAny(u8, s, " \t\n");
+    var i: usize = 0;
+    while (iter.next()) |tok| : (i += 1) {
+        if (i >= 5) break;
+        result[i] = parseFloat(tok) orelse result[i];
+    }
+    return result;
+}
+
+fn parseSolref(s: []const u8) [2]f32 {
+    var result: [2]f32 = .{ 0.02, 1 };
+    var iter = std.mem.tokenizeAny(u8, s, " \t\n");
+    var i: usize = 0;
+    while (iter.next()) |tok| : (i += 1) {
+        if (i >= 2) break;
+        result[i] = parseFloat(tok) orelse result[i];
+    }
+    return result;
+}
+
+fn parseDefaults(tokenizer: *XmlTokenizer, allocator: std.mem.Allocator, defaults: *std.StringHashMapUnmanaged(schema.MjcfDefault)) !void {
+    // Parse the defaults section, supporting nested default classes
+    var current_class: []const u8 = "main";
+    var current_default = schema.MjcfDefault{ .class_name = current_class };
+
     while (tokenizer.next()) |token| {
         if (token.kind == .element_end and std.mem.eql(u8, token.name, "default")) {
+            // Save the current class before exiting
+            if (current_class.len > 0) {
+                try defaults.put(allocator, current_class, current_default);
+            }
             break;
+        }
+
+        if (token.kind == .element_start) {
+            if (std.mem.eql(u8, token.name, "default")) {
+                // Save current class and start new nested class
+                if (current_class.len > 0) {
+                    try defaults.put(allocator, current_class, current_default);
+                }
+                // Get class name from attribute
+                current_class = getAttr(token.attrs, "class") orelse "main";
+                // Inherit from current defaults or start fresh
+                current_default = schema.MjcfDefault{ .class_name = current_class };
+            } else if (std.mem.eql(u8, token.name, "geom")) {
+                // Parse geom defaults
+                current_default.geom = parseGeom(token.attrs);
+            } else if (std.mem.eql(u8, token.name, "joint")) {
+                // Parse joint defaults
+                current_default.joint = parseJoint(token.attrs);
+            } else if (std.mem.eql(u8, token.name, "site")) {
+                // Parse site defaults
+                current_default.site = parseSite(token.attrs);
+            } else if (std.mem.eql(u8, token.name, "motor") or
+                std.mem.eql(u8, token.name, "position") or
+                std.mem.eql(u8, token.name, "velocity") or
+                std.mem.eql(u8, token.name, "general"))
+            {
+                // Parse actuator defaults
+                current_default.motor = parseActuator(token.name, token.attrs);
+            }
         }
     }
 }
@@ -400,11 +870,11 @@ fn processBody(
         pos[1] += parent_pos[1];
         pos[2] += parent_pos[2];
 
-        // Handle euler angles if specified
-        var quat = child.quat;
-        if (child.euler) |euler| {
-            quat = eulerToQuat(euler);
-        }
+        // Handle orientation - euler angles return XYZW, quat from MJCF is WXYZ
+        const body_quat: [4]f32 = if (child.euler) |euler|
+            eulerToQuat(euler) // Already returns XYZW
+        else
+            mjcfQuatToZeno(child.quat); // Convert MJCF WXYZ to XYZW
 
         // Combine with parent quaternion (simplified - would need proper quat multiply)
         _ = parent_quat;
@@ -425,7 +895,7 @@ fn processBody(
         const current_body_id = try scene.addBody(.{
             .name = child.name,
             .position = pos,
-            .quaternion = quat,
+            .quaternion = body_quat,
             .parent_id = parent_id,
             .body_type = body_type,
         });
@@ -475,7 +945,7 @@ fn processBody(
         }
 
         // Process children recursively
-        try processBody(allocator, scene, child, @intCast(current_body_id), body_index, pos, quat);
+        try processBody(allocator, scene, child, @intCast(current_body_id), body_index, pos, body_quat);
     }
 }
 
@@ -828,4 +1298,13 @@ fn parseSize(s: []const u8) [3]f32 {
         i += 1;
     }
     return result;
+}
+
+fn parseRgba(s: []const u8) ?[4]f32 {
+    var iter = std.mem.splitScalar(u8, s, ' ');
+    const r = parseFloat(iter.next() orelse return null) orelse return null;
+    const g = parseFloat(iter.next() orelse return null) orelse return null;
+    const b = parseFloat(iter.next() orelse return null) orelse return null;
+    const a = parseFloat(iter.next() orelse "1") orelse 1;
+    return .{ r, g, b, a };
 }

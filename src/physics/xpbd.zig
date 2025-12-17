@@ -33,6 +33,14 @@ pub const ConstraintType = enum(u8) {
     angular_limit = 4,
     /// Linear limit (prismatic range)
     linear_limit = 5,
+    /// Tendon length constraint
+    tendon = 6,
+    /// Weld constraint (fixed relative pose)
+    weld = 7,
+    /// Connect constraint (distance between body points)
+    connect = 8,
+    /// Joint equality constraint
+    joint_equality = 9,
 };
 
 /// GPU-optimized XPBD constraint data.
@@ -252,6 +260,85 @@ pub fn createAngularLimitConstraint(
         .anchor_b = .{ 0, 0, 0, 0 },
         .axis_target = .{ 0, 0, 0, 0 },
         .limits = .{ lower, upper, 0, 0 },
+        .state = .{ 0, 0, 0, 0 },
+    };
+}
+
+/// Create a tendon length constraint.
+pub fn createTendonConstraint(
+    tendon_id: u32,
+    env_id: u32,
+    rest_length: f32,
+    stiffness: f32,
+    damping: f32,
+    lower: f32,
+    upper: f32,
+) XPBDConstraint {
+    const compliance = if (stiffness > 0) 1.0 / stiffness else 0.0;
+    return .{
+        .indices = .{ tendon_id, 0, env_id, @intFromEnum(ConstraintType.tendon) },
+        .anchor_a = .{ rest_length, 0, 0, compliance },
+        .anchor_b = .{ 0, 0, 0, damping },
+        .axis_target = .{ 0, 0, 0, 0 },
+        .limits = .{ lower, upper, 0, 0 },
+        .state = .{ 0, 0, 0, 0 },
+    };
+}
+
+/// Create a weld (fixed relative pose) constraint.
+pub fn createWeldConstraint(
+    body_a: u32,
+    body_b: u32,
+    env_id: u32,
+    local_a: [3]f32,
+    local_b: [3]f32,
+    rel_quat: [4]f32,
+    compliance: f32,
+) XPBDConstraint {
+    return .{
+        .indices = .{ body_a, body_b, env_id, @intFromEnum(ConstraintType.weld) },
+        .anchor_a = .{ local_a[0], local_a[1], local_a[2], compliance },
+        .anchor_b = .{ local_b[0], local_b[1], local_b[2], 0 },
+        .axis_target = rel_quat,
+        .limits = .{ 0, 0, 0, 0 },
+        .state = .{ 0, 0, 0, 0 },
+    };
+}
+
+/// Create a connect (distance between body points) constraint.
+pub fn createConnectConstraint(
+    body_a: u32,
+    body_b: u32,
+    env_id: u32,
+    local_a: [3]f32,
+    local_b: [3]f32,
+    target_distance: f32,
+    compliance: f32,
+) XPBDConstraint {
+    return .{
+        .indices = .{ body_a, body_b, env_id, @intFromEnum(ConstraintType.connect) },
+        .anchor_a = .{ local_a[0], local_a[1], local_a[2], compliance },
+        .anchor_b = .{ local_b[0], local_b[1], local_b[2], 0 },
+        .axis_target = .{ 0, 0, 0, target_distance },
+        .limits = .{ 0, 0, 0, 0 },
+        .state = .{ 0, 0, 0, 0 },
+    };
+}
+
+/// Create a joint equality constraint (coupled joints).
+pub fn createJointEqualityConstraint(
+    joint_a: u32,
+    joint_b: u32,
+    env_id: u32,
+    polycoef: [5]f32,
+    compliance: f32,
+) XPBDConstraint {
+    return .{
+        .indices = .{ joint_a, joint_b, env_id, @intFromEnum(ConstraintType.joint_equality) },
+        .anchor_a = .{ polycoef[0], polycoef[1], polycoef[2], compliance },
+        .anchor_b = .{ polycoef[3], polycoef[4], 0, 0 },
+        .axis_target = .{ 0, 0, 0, 0 },
+        .limits = .{ 0, 0, 0, 0 },
         .state = .{ 0, 0, 0, 0 },
     };
 }

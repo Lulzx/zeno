@@ -60,9 +60,9 @@ pub const State = struct {
         const opts = BufferOptions{ .storage_mode = .shared };
 
         const body_count = num_envs * num_bodies;
-        const joint_count = num_envs * num_joints;
-        const actuator_count = num_envs * num_actuators;
-        const obs_count = num_envs * obs_dim;
+        const joint_count = num_envs * @max(num_joints, 1);
+        const actuator_count = num_envs * @max(num_actuators, 1);
+        const obs_count = num_envs * @max(obs_dim, 1);
         const contact_count = num_envs * max_contacts;
 
         return State{
