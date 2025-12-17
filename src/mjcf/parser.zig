@@ -310,14 +310,11 @@ fn parseSensors(tokenizer: *XmlTokenizer, allocator: std.mem.Allocator, sensor_l
 }
 
 fn parseDefaults(tokenizer: *XmlTokenizer, _: std.mem.Allocator, _: *std.StringHashMapUnmanaged(schema.MjcfDefault)) !void {
-    // Skip defaults for now - consume until end tag
-    var depth: u32 = 1;
+    // Skip defaults for now - just find the </default> end tag
+    // Note: We can't use depth tracking because self-closing tags only emit element_start
     while (tokenizer.next()) |token| {
-        if (token.kind == .element_start) {
-            depth += 1;
-        } else if (token.kind == .element_end) {
-            depth -= 1;
-            if (depth == 0) break;
+        if (token.kind == .element_end and std.mem.eql(u8, token.name, "default")) {
+            break;
         }
     }
 }
