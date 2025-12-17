@@ -30,3 +30,6 @@ Thumbs.db
 # Metal compiled shaders
 *.air
 *.metallib
+
+# Generated trajectory data
+*_trajectory.csv
