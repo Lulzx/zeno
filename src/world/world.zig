@@ -78,6 +78,41 @@ pub const World = struct {
     // Allocator
     allocator: std.mem.Allocator,
 
+// Helper functions for quaternion math
+fn quatConjugate(q: [4]f32) [4]f32 {
+    return .{ -q[0], -q[1], -q[2], q[3] };
+}
+
+fn quatMultiply(a: [4]f32, b: [4]f32) [4]f32 {
+    return .{
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    };
+}
+
+/// Rotate a vector by a quaternion: v' = q * v * q^-1
+fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
+    // Optimized formula: v' = v + 2*q.w*(q.xyz × v) + 2*(q.xyz × (q.xyz × v))
+    const qv = [3]f32{ q[0], q[1], q[2] };
+    const qw = q[3];
+
+    // t = 2 * (qv × v)
+    const t = [3]f32{
+        2.0 * (qv[1] * v[2] - qv[2] * v[1]),
+        2.0 * (qv[2] * v[0] - qv[0] * v[2]),
+        2.0 * (qv[0] * v[1] - qv[1] * v[0]),
+    };
+
+    // v' = v + qw*t + (qv × t)
+    return .{
+        v[0] + qw * t[0] + (qv[1] * t[2] - qv[2] * t[1]),
+        v[1] + qw * t[1] + (qv[2] * t[0] - qv[0] * t[2]),
+        v[2] + qw * t[2] + (qv[0] * t[1] - qv[1] * t[0]),
+    };
+}
+
     /// Create a new simulation world.
     pub fn init(
         allocator: std.mem.Allocator,
@@ -98,12 +133,14 @@ pub const World = struct {
             "apply_actions",
             "apply_joint_forces",
             "forward_kinematics",
+            "update_kinematic",
             "compute_forces",
             "integrate",
             "broad_phase",
             "narrow_phase",
             "solve_contacts",
             "solve_joints",
+            "update_joint_states",
             "read_sensors",
             "reset_env",
         });
@@ -187,68 +224,112 @@ pub const World = struct {
                         try template_constraints.append(allocator, c);
                     },
                     .hinge => {
-                         const body_a = scene.bodies.items[jc.body_a];
-                         const body_b = scene.bodies.items[jc.body_b];
-                         
-                         // Rotate axis from A to World
-                         // q * v * q_inv
-                         const q_a = body_a.quaternion;
-                         const v = jc.axis;
-                         
-                         // q_a * (v, 0)
-                         
-                         // ... Wait, quaternion math is verbose inline.
-                         // Use approximate logic:
-                         // Hinge axis in B is derived from initial pose.
-                         // Assuming bodies are initially aligned such that axis_a_world == axis_b_world.
-                         // We can compute axis_b_local by transforming axis_a_local through initial relative transform.
-                         
-                         // Or just use the simple rotation helpers from `primitives` if I could import them.
-                         // Let's implement minimal rotate here.
-                         
-                         // v_world = rotate(v_a, q_a)
-                         // v_b = rotate(v_world, conjugate(q_b))
-                         
-                         // Inline rotate:
-                         // t = 2 * cross(q.xyz, v)
-                         // v' = v + q.w * t + cross(q.xyz, t)
-                         
-                         const q_xyz = [3]f32{q_a[0], q_a[1], q_a[2]};
-                         const t = [3]f32{
-                             2.0 * (q_xyz[1]*v[2] - q_xyz[2]*v[1]),
-                             2.0 * (q_xyz[2]*v[0] - q_xyz[0]*v[2]),
-                             2.0 * (q_xyz[0]*v[1] - q_xyz[1]*v[0])
-                         };
-                         const v_world = [3]f32{
-                             v[0] + q_a[3]*t[0] + (q_xyz[1]*t[2] - q_xyz[2]*t[1]),
-                             v[1] + q_a[3]*t[1] + (q_xyz[2]*t[0] - q_xyz[0]*t[2]),
-                             v[2] + q_a[3]*t[2] + (q_xyz[0]*t[1] - q_xyz[1]*t[0])
-                         };
-                         
-                         // Rotate inverse B
-                         const q_b = body_b.quaternion;
-                         const q_b_inv = [4]f32{-q_b[0], -q_b[1], -q_b[2], q_b[3]};
-                         const q_b_xyz = [3]f32{q_b_inv[0], q_b_inv[1], q_b_inv[2]};
-                         
-                         const t2 = [3]f32{
-                             2.0 * (q_b_xyz[1]*v_world[2] - q_b_xyz[2]*v_world[1]),
-                             2.0 * (q_b_xyz[2]*v_world[0] - q_b_xyz[0]*v_world[2]),
-                             2.0 * (q_b_xyz[0]*v_world[1] - q_b_xyz[1]*v_world[0])
-                         };
-                         const axis_b = [3]f32{
-                             v_world[0] + q_b_inv[3]*t2[0] + (q_b_xyz[1]*t2[2] - q_b_xyz[2]*t2[1]),
-                             v_world[1] + q_b_inv[3]*t2[1] + (q_b_xyz[2]*t2[0] - q_b_xyz[0]*t2[2]),
-                             v_world[2] + q_b_inv[3]*t2[2] + (q_b_xyz[0]*t2[1] - q_b_xyz[1]*t2[0])
-                         };
+                        const body_a = scene.bodies.items[jc.body_a];
+                        const body_b = scene.bodies.items[jc.body_b];
 
-                         c = xpbd_mod.createAngularConstraint(
-                            jc.body_a, jc.body_b, 0,
-                            jc.axis, axis_b,
-                            compliance, jc.params.damping
-                         );
-                         try template_constraints.append(allocator, c);
+                        // Rotate axis from A's local frame to world, then to B's local frame
+                        // axis_world = rotate(axis_a, q_a)
+                        // axis_b = rotate(axis_world, q_b^-1)
+                        const axis_world = rotateByQuat(jc.axis, body_a.quaternion);
+                        const q_b_inv = quatConjugate(body_b.quaternion);
+                        const axis_b = rotateByQuat(axis_world, q_b_inv);
+
+                        c = xpbd_mod.createAngularConstraint(
+                            jc.body_a,
+                            jc.body_b,
+                            0,
+                            jc.axis,
+                            axis_b,
+                            compliance,
+                            jc.params.damping,
+                        );
+                        try template_constraints.append(allocator, c);
                     },
-                    else => {},
+                    .weld => {
+                        const body_a = scene.bodies.items[jc.body_a];
+                        const body_b = scene.bodies.items[jc.body_b];
+
+                        // rel_quat = q_a^-1 * q_b
+                        const q_a_inv = quatConjugate(body_a.quaternion);
+                        const rel_quat = quatMultiply(q_a_inv, body_b.quaternion);
+
+                        c = xpbd_mod.createWeldConstraint(
+                            jc.body_a,
+                            jc.body_b,
+                            0,
+                            jc.local_anchor_a,
+                            jc.local_anchor_b,
+                            rel_quat,
+                            compliance,
+                        );
+                        try template_constraints.append(allocator, c);
+                    },
+                    .angular_limit => {
+                        // Angular limit - limits rotation around an axis between bounds
+                        c = xpbd_mod.createAngularLimitConstraint(
+                            jc.body_a,
+                            jc.body_b,
+                            0,
+                            jc.axis,
+                            jc.params.lower,
+                            jc.params.upper,
+                            compliance,
+                        );
+                        try template_constraints.append(allocator, c);
+                    },
+                    .linear_limit => {
+                        // Linear limit - limits translation along an axis
+                        c = .{
+                            .indices = .{ jc.body_a, jc.body_b, 0, @intFromEnum(xpbd_mod.ConstraintType.linear_limit) },
+                            .anchor_a = .{ jc.axis[0], jc.axis[1], jc.axis[2], compliance },
+                            .anchor_b = .{ jc.local_anchor_b[0], jc.local_anchor_b[1], jc.local_anchor_b[2], 0 },
+                            .axis_target = .{ 0, 0, 0, 0 },
+                            .limits = .{ jc.params.lower, jc.params.upper, 0, 0 },
+                            .state = .{ 0, 0, 0, 0 },
+                        };
+                        try template_constraints.append(allocator, c);
+                    },
+                    .slider => {
+                        // Slider constraint - allows only translation along axis
+                        // This needs both angular locking and linear DOF
+                        // For now, treat as a positional constraint with axis freedom
+                        c = xpbd_mod.createPositionalConstraint(
+                            jc.body_a,
+                            jc.body_b,
+                            0,
+                            jc.local_anchor_a,
+                            jc.local_anchor_b,
+                            compliance,
+                        );
+                        try template_constraints.append(allocator, c);
+                    },
+                    .cone_limit => {
+                        // Cone limit - limits rotation angle from reference axis
+                        // Use angular limit with symmetric bounds
+                        c = xpbd_mod.createAngularLimitConstraint(
+                            jc.body_a,
+                            jc.body_b,
+                            0,
+                            jc.axis,
+                            -jc.params.upper, // Symmetric cone
+                            jc.params.upper,
+                            compliance,
+                        );
+                        try template_constraints.append(allocator, c);
+                    },
+                    .distance => {
+                        // Distance constraint - keeps points at fixed distance
+                        c = xpbd_mod.createConnectConstraint(
+                            jc.body_a,
+                            jc.body_b,
+                            0,
+                            jc.local_anchor_a,
+                            jc.local_anchor_b,
+                            jc.params.target, // target distance
+                            compliance,
+                        );
+                        try template_constraints.append(allocator, c);
+                    },
                 }
             }
         }
@@ -444,8 +525,23 @@ pub const World = struct {
 
         // Stage 2: Forward kinematics
         // Disabled: We use maximal coordinates + constraints
-        // TODO: Bodies marked as 'kinematic' (fixed children) are now static unless
-        // converted to dynamic bodies with Fixed/Weld constraints in Scene/Parser.
+
+        // Stage 2.5: Update kinematic bodies
+        // Kinematic bodies follow their velocities but aren't affected by forces
+        {
+            var encoder = try cmd.computeEncoder();
+            defer encoder.endEncoding();
+
+            const pipeline = try self.pipelines.getPipeline("update_kinematic");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.positions_buffer, 0, 0);
+            encoder.setBuffer(&self.state.velocities_buffer, 0, 1);
+            encoder.setBuffer(&self.state.quaternions_buffer, 0, 2);
+            encoder.setBuffer(&self.state.angular_velocities_buffer, 0, 3);
+            encoder.setBuffer(&self.body_data_buffer, 0, 4);
+            encoder.setBuffer(&self.params_buffer, 0, 5);
+            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
+        }
 
         // Stage 3: Compute forces
         {
@@ -549,6 +645,24 @@ pub const World = struct {
             encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 6);
             encoder.setBuffer(&self.params_buffer, 0, 7);
             encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
+        }
+
+        // Stage 7.5: Update joint states (Inverse Kinematics for observations)
+        if (self.params.num_joints > 0) {
+            var encoder = try cmd.computeEncoder();
+            defer encoder.endEncoding();
+
+            const pipeline = try self.pipelines.getPipeline("update_joint_states");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.positions_buffer, 0, 0);
+            encoder.setBuffer(&self.state.quaternions_buffer, 0, 1);
+            encoder.setBuffer(&self.state.velocities_buffer, 0, 2);
+            encoder.setBuffer(&self.state.angular_velocities_buffer, 0, 3);
+            encoder.setBuffer(&self.joint_data_buffer, 0, 4);
+            encoder.setBuffer(&self.state.joint_positions_buffer, 0, 5);
+            encoder.setBuffer(&self.state.joint_velocities_buffer, 0, 6);
+            encoder.setBuffer(&self.params_buffer, 0, 7);
+            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_joints);
         }
 
         // Stage 8: Read sensors

@@ -274,6 +274,50 @@ kernel void forward_kinematics(
 }
 
 // ============================================================================
+// Update Kinematic Bodies Kernel
+// ============================================================================
+// Kinematic bodies follow their specified velocities but aren't affected by forces.
+// They have infinite mass (inv_mass = 0) so the integrate kernel skips them.
+// This kernel updates their positions from their velocities.
+
+kernel void update_kinematic(
+    device float4* positions [[buffer(0)]],
+    device const float4* velocities [[buffer(1)]],
+    device float4* quaternions [[buffer(2)]],
+    device const float4* angular_velocities [[buffer(3)]],
+    device const BodyData* bodies [[buffer(4)]],
+    constant SimParams& params [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint env_id = gid / params.num_bodies;
+    uint body_id = gid % params.num_bodies;
+
+    if (env_id >= params.num_envs) return;
+
+    BodyData body = bodies[body_id];
+    uint body_type = uint(body.params.y);
+
+    // Only process kinematic bodies (type 1)
+    if (body_type != 1) return;
+
+    float dt = params.dt;
+
+    // Linear position update: p = p + v * dt
+    float3 vel = velocities[gid].xyz;
+    float3 pos = positions[gid].xyz;
+    pos += vel * dt;
+    positions[gid] = float4(pos, 0);
+
+    // Angular position update: q = q + 0.5 * ω_quat * q * dt
+    float3 omega = angular_velocities[gid].xyz;
+    float4 quat = quaternions[gid];
+
+    float4 omega_quat = float4(omega * dt * 0.5, 0);
+    float4 dq = quat_multiply(omega_quat, quat);
+    quaternions[gid] = quat_normalize(quat + dq);
+}
+
+// ============================================================================
 // Compute Forces Kernel
 // ============================================================================
 
@@ -700,8 +744,363 @@ kernel void solve_joints(
              }
         }
     }
-    // TODO: Implement other constraint types (hinge, etc.)
-    // For now, this is enough to stop bodies falling apart if they are ball/fixed joints.
+    // --- Weld Constraint (Positional + Angular) ---
+    else if (type == 7) { // weld
+        // 1. Positional part
+        float3 r_a = rotate_by_quat(c.anchor_a.xyz, quat_a);
+        float3 r_b = rotate_by_quat(c.anchor_b.xyz, quat_b);
+        float3 diff = (pos_a + r_a) - (pos_b + r_b);
+        C = length(diff);
+        
+        if (C > 1e-6) {
+             float3 n = diff / C;
+             float3 rn_a = cross(r_a, n);
+             float3 rn_b = cross(r_b, n);
+             float w_a = inv_mass_a + dot(rn_a * inv_mi_a.yzw, rn_a);
+             float w_b = inv_mass_b + dot(rn_b * inv_mi_b.yzw, rn_b);
+             float w = w_a + w_b;
+             
+             float d_lambda = (-C) / (w + alpha_tilde); // Simplified (no accumulation for now)
+             float3 impulse = d_lambda * n;
+             
+             if (inv_mass_a > 0) {
+                 positions[idx_a].xyz += impulse * inv_mass_a;
+                 float3 ang_impulse = cross(r_a, impulse);
+                 float3 d_omega = ang_impulse * inv_mi_a.yzw;
+                 float4 dq = quat_multiply(float4(d_omega, 0), quat_a) * 0.5;
+                 quaternions[idx_a] = quat_normalize(quat_a + dq);
+             }
+             if (inv_mass_b > 0) {
+                 positions[idx_b].xyz -= impulse * inv_mass_b;
+                 float3 ang_impulse = cross(r_b, impulse);
+                 float3 d_omega = ang_impulse * inv_mi_b.yzw;
+                 float4 dq = quat_multiply(float4(d_omega, 0), quat_b) * 0.5;
+                 quaternions[idx_b] = quat_normalize(quat_b - dq);
+             }
+        }
+        
+        // 2. Angular part (lock relative orientation)
+        // Target rel_quat stored in axis_target (q_a^-1 * q_b at rest)
+        float4 q_rel_target = c.axis_target;
+
+        // Get updated quaternions after positional correction
+        float4 quat_a_upd = quaternions[idx_a];
+        float4 quat_b_upd = quaternions[idx_b];
+
+        // Current relative quaternion: q_rel = q_a^-1 * q_b
+        float4 q_a_inv = quat_conjugate(quat_a_upd);
+        float4 q_rel = quat_multiply(q_a_inv, quat_b_upd);
+
+        // Error quaternion: q_err = q_rel * q_target^-1
+        // If q_rel == q_target, q_err = identity (0,0,0,1)
+        float4 q_target_inv = quat_conjugate(q_rel_target);
+        float4 q_err = quat_multiply(q_rel, q_target_inv);
+
+        // Ensure quaternion is in positive hemisphere for consistent error direction
+        if (q_err.w < 0) {
+            q_err = -q_err;
+        }
+
+        // Compute rotation angle and axis from error quaternion
+        // q_err = (sin(θ/2) * axis, cos(θ/2))
+        float3 q_err_xyz = float3(q_err.x, q_err.y, q_err.z);
+        float sin_half_angle = length(q_err_xyz);
+
+        if (sin_half_angle > 1e-6) {
+            // Rotation axis (normalized)
+            float3 axis_rel = q_err_xyz / sin_half_angle;
+
+            // Full rotation angle using atan2 for numerical stability
+            // This works correctly for angles up to 2π
+            float angle = 2.0 * atan2(sin_half_angle, q_err.w);
+
+            // Transform axis from body A frame to world frame
+            float3 axis_world = rotate_by_quat(axis_rel, quat_a_upd);
+
+            // Generalized inverse mass for angular constraint
+            float w_a = dot(axis_world * inv_mi_a.yzw, axis_world);
+            float w_b = dot(axis_world * inv_mi_b.yzw, axis_world);
+            float w = w_a + w_b;
+
+            if (w > 1e-8) {
+                // XPBD angular correction
+                float d_lambda_ang = (-angle) / (w + alpha_tilde);
+                float3 ang_impulse = d_lambda_ang * axis_world;
+
+                // Apply equal and opposite angular corrections
+                if (inv_mass_a > 0) {
+                    float3 d_omega = ang_impulse * inv_mi_a.yzw;
+                    float4 dq = quat_multiply(float4(d_omega, 0), quat_a_upd) * 0.5;
+                    quaternions[idx_a] = quat_normalize(quat_a_upd + dq);
+                }
+                if (inv_mass_b > 0) {
+                    float3 d_omega = ang_impulse * inv_mi_b.yzw;
+                    float4 dq = quat_multiply(float4(d_omega, 0), quat_b_upd) * 0.5;
+                    quaternions[idx_b] = quat_normalize(quat_b_upd - dq);
+                }
+            }
+        }
+    }
+
+    // --- Angular Constraint (Hinge alignment) ---
+    else if (type == 3) { // angular
+        // Ensure two axes (one in each body) remain aligned
+        // axis_a is in anchor_a.xyz (in body A local frame)
+        // axis_b is in anchor_b.xyz (in body B local frame)
+        float3 axis_a_local = c.anchor_a.xyz;
+        float3 axis_b_local = c.anchor_b.xyz;
+
+        // Transform axes to world space
+        float4 quat_a_curr = quaternions[idx_a];
+        float4 quat_b_curr = quaternions[idx_b];
+
+        float3 axis_a_world = rotate_by_quat(axis_a_local, quat_a_curr);
+        float3 axis_b_world = rotate_by_quat(axis_b_local, quat_b_curr);
+
+        // Constraint: axis_a_world × axis_b_world should be zero (parallel)
+        // The cross product gives us the rotation axis needed to align them
+        float3 cross_ab = cross(axis_a_world, axis_b_world);
+        float sin_angle = length(cross_ab);
+
+        if (sin_angle > 1e-6) {
+            // Rotation error direction (normalized)
+            float3 n = cross_ab / sin_angle;
+
+            // For small angles, sin_angle ≈ angle, so C = sin_angle
+            // For larger angles, use asin but clamp for safety
+            float ang_C = asin(clamp(sin_angle, -1.0f, 1.0f));
+
+            // Generalized inverse mass for angular constraint
+            // w = n^T I_a^-1 n + n^T I_b^-1 n
+            float w_a = dot(n * inv_mi_a.yzw, n);
+            float w_b = dot(n * inv_mi_b.yzw, n);
+            float w = w_a + w_b;
+
+            if (w > 1e-8) {
+                float d_lambda = (-ang_C) / (w + alpha_tilde);
+                float3 ang_impulse = d_lambda * n;
+
+                // Apply angular corrections
+                if (inv_mass_a > 0) {
+                    float3 d_omega = ang_impulse * inv_mi_a.yzw;
+                    float4 dq = quat_multiply(float4(d_omega, 0), quat_a_curr) * 0.5;
+                    quaternions[idx_a] = quat_normalize(quat_a_curr + dq);
+                }
+
+                if (inv_mass_b > 0) {
+                    float3 d_omega = ang_impulse * inv_mi_b.yzw;
+                    float4 dq = quat_multiply(float4(d_omega, 0), quat_b_curr) * 0.5;
+                    quaternions[idx_b] = quat_normalize(quat_b_curr - dq);
+                }
+            }
+        }
+    }
+    // --- Angular Limit Constraint ---
+    else if (type == 4) { // angular_limit
+        // Limit rotation around an axis between lower and upper bounds
+        float3 axis_local = c.anchor_a.xyz;
+        float lower = c.limits.x;
+        float upper = c.limits.y;
+
+        // Get current rotation angle around the axis
+        float4 quat_a_curr = quaternions[idx_a];
+        float4 quat_b_curr = quaternions[idx_b];
+
+        // Relative rotation: q_rel = q_a^-1 * q_b
+        float4 q_a_inv = quat_conjugate(quat_a_curr);
+        float4 q_rel = quat_multiply(q_a_inv, quat_b_curr);
+
+        // Project onto axis to get rotation angle
+        float3 q_vec = float3(q_rel.x, q_rel.y, q_rel.z);
+        float sin_half = dot(q_vec, axis_local);
+        float cos_half = q_rel.w;
+        float angle = 2.0 * atan2(sin_half, cos_half);
+
+        // Check if limit is violated
+        float violation = 0.0;
+        if (angle < lower) {
+            violation = lower - angle;
+        } else if (angle > upper) {
+            violation = upper - angle;
+        }
+
+        if (abs(violation) > 1e-6) {
+            // World-space axis
+            float3 axis_world = rotate_by_quat(axis_local, quat_a_curr);
+
+            // Generalized inverse mass
+            float w_a = dot(axis_world * inv_mi_a.yzw, axis_world);
+            float w_b = dot(axis_world * inv_mi_b.yzw, axis_world);
+            float w = w_a + w_b;
+
+            if (w > 1e-8) {
+                float d_lambda = violation / (w + alpha_tilde);
+                float3 ang_impulse = d_lambda * axis_world;
+
+                if (inv_mass_a > 0) {
+                    float3 d_omega = ang_impulse * inv_mi_a.yzw;
+                    float4 dq = quat_multiply(float4(d_omega, 0), quat_a_curr) * 0.5;
+                    quaternions[idx_a] = quat_normalize(quat_a_curr + dq);
+                }
+
+                if (inv_mass_b > 0) {
+                    float3 d_omega = ang_impulse * inv_mi_b.yzw;
+                    float4 dq = quat_multiply(float4(d_omega, 0), quat_b_curr) * 0.5;
+                    quaternions[idx_b] = quat_normalize(quat_b_curr - dq);
+                }
+            }
+        }
+    }
+    // --- Linear Limit Constraint (Prismatic) ---
+    else if (type == 5) { // linear_limit
+        // Limit translation along an axis
+        float3 axis_local = c.anchor_a.xyz;
+        float lower = c.limits.x;
+        float upper = c.limits.y;
+
+        float4 quat_a_curr = quaternions[idx_a];
+        float4 quat_b_curr = quaternions[idx_b];
+
+        // Transform anchors and axis to world space
+        float3 r_a = rotate_by_quat(float3(0, 0, 0), quat_a_curr); // Anchor at origin for simplicity
+        float3 r_b = rotate_by_quat(c.anchor_b.xyz, quat_b_curr);
+        float3 axis_world = rotate_by_quat(axis_local, quat_a_curr);
+
+        // Current distance along axis
+        float3 diff = (pos_b + r_b) - (pos_a + r_a);
+        float dist = dot(diff, axis_world);
+
+        // Check limit violation
+        float violation = 0.0;
+        if (dist < lower) {
+            violation = lower - dist;
+        } else if (dist > upper) {
+            violation = upper - dist;
+        }
+
+        if (abs(violation) > 1e-6) {
+            // Use axis as gradient direction
+            float3 n = violation > 0 ? axis_world : -axis_world;
+            float abs_violation = abs(violation);
+
+            float3 rn_a = cross(r_a, n);
+            float3 rn_b = cross(r_b, n);
+
+            float w_a = inv_mass_a + dot(rn_a * inv_mi_a.yzw, rn_a);
+            float w_b = inv_mass_b + dot(rn_b * inv_mi_b.yzw, rn_b);
+            float w = w_a + w_b;
+
+            if (w > 1e-8) {
+                float d_lambda = abs_violation / (w + alpha_tilde);
+                float3 impulse = d_lambda * n;
+
+                if (inv_mass_a > 0) {
+                    positions[idx_a].xyz -= impulse * inv_mass_a;
+                }
+
+                if (inv_mass_b > 0) {
+                    positions[idx_b].xyz += impulse * inv_mass_b;
+                }
+            }
+        }
+    }
+
+    // Store updated constraint state
+    constraints[gid] = c;
+}
+
+// ============================================================================
+// Update Joint States Kernel (Inverse Kinematics / Feedback)
+// ============================================================================
+
+kernel void update_joint_states(
+    device const float4* positions [[buffer(0)]],
+    device const float4* quaternions [[buffer(1)]],
+    device const float4* velocities [[buffer(2)]],
+    device const float4* angular_velocities [[buffer(3)]],
+    device const JointData* joints [[buffer(4)]],
+    device float* joint_positions [[buffer(5)]],
+    device float* joint_velocities [[buffer(6)]],
+    constant SimParams& params [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint env_id = gid / params.num_joints;
+    uint joint_id = gid % params.num_joints;
+    
+    if (env_id >= params.num_envs) return;
+    
+    uint joint_idx = gid;
+    JointData joint = joints[joint_id];
+    uint type = uint(joint.params.x);
+    
+    // Default to 0
+    joint_positions[joint_idx] = 0;
+    joint_velocities[joint_idx] = 0;
+    
+    uint body_a = uint(joint.params.y);
+    uint body_b = uint(joint.params.z);
+    
+    uint idx_a = env_id * params.num_bodies + body_a;
+    uint idx_b = env_id * params.num_bodies + body_b;
+    
+    float4 q_a = quaternions[idx_a];
+    float4 q_b = quaternions[idx_b];
+    float3 p_a = positions[idx_a].xyz;
+    float3 p_b = positions[idx_b].xyz;
+    
+    float3 v_a = velocities[idx_a].xyz;
+    float3 v_b = velocities[idx_b].xyz;
+    float3 w_a = angular_velocities[idx_a].xyz;
+    float3 w_b = angular_velocities[idx_b].xyz;
+    
+    // Revolute/Hinge
+    if (type == 1) {
+        // Axis in A frame
+        float3 axis_local = joint.axis.xyz;
+        float3 axis_world_a = rotate_by_quat(axis_local, q_a);
+        
+        // Relative rotation q_rel = q_a^-1 * q_b
+        float4 q_a_inv = quat_conjugate(q_a);
+        float4 q_rel = quat_multiply(q_a_inv, q_b);
+        
+        // Extract angle around axis
+        // q_rel = [sin(theta/2)*axis, cos(theta/2)]
+        // We project imaginary part onto axis
+        float3 q_vec = float3(q_rel.x, q_rel.y, q_rel.z);
+        float sin_half = dot(q_vec, axis_local);
+        float cos_half = q_rel.w;
+        float angle = 2.0 * atan2(sin_half, cos_half);
+        
+        joint_positions[joint_idx] = angle;
+        
+        // Velocity: (w_b - w_a) . axis_world
+        float3 rel_omega = w_b - w_a;
+        joint_velocities[joint_idx] = dot(rel_omega, axis_world_a);
+    }
+    // Prismatic/Slide
+    else if (type == 2) {
+        float3 axis_local = joint.axis.xyz;
+        float3 axis_world_a = rotate_by_quat(axis_local, q_a);
+        
+        float3 r_a = rotate_by_quat(joint.anchor_parent.xyz, q_a);
+        float3 r_b = rotate_by_quat(joint.anchor_child.xyz, q_b);
+        
+        float3 anchor_a_world = p_a + r_a;
+        float3 anchor_b_world = p_b + r_b;
+        
+        float3 diff = anchor_b_world - anchor_a_world;
+        float dist = dot(diff, axis_world_a);
+        
+        joint_positions[joint_idx] = dist;
+        
+        // Velocity
+        // v_point_b - v_point_a
+        float3 v_pt_a = v_a + cross(w_a, r_a);
+        float3 v_pt_b = v_b + cross(w_b, r_b);
+        float3 rel_vel = v_pt_b - v_pt_a;
+        
+        joint_velocities[joint_idx] = dot(rel_vel, axis_world_a);
+    }
 }
 
 // ============================================================================
@@ -751,58 +1150,108 @@ kernel void solve_contacts(
     float3 normal = c.normal_friction.xyz;
     float penetration = c.position_pen.w;
     float friction = c.normal_friction.w;
+    float3 contact_point = c.position_pen.xyz;
 
-    // Position correction (Baumgarte stabilization)
+    // Get current state
+    float3 pos_a = positions[idx_a].xyz;
+    float3 pos_b = positions[idx_b].xyz;
+    float4 quat_a = quaternions[idx_a];
+    float4 quat_b = quaternions[idx_b];
+
+    // Compute contact point relative to body centers
+    float3 r_a = contact_point - pos_a;
+    float3 r_b = contact_point - pos_b;
+
+    // Get angular velocities
+    float3 omega_a = angular_velocities[idx_a].xyz;
+    float3 omega_b = angular_velocities[idx_b].xyz;
+
+    // Compute full contact velocity including rotation: v = v_cm + ω × r
+    float3 vel_a = velocities[idx_a].xyz + cross(omega_a, r_a);
+    float3 vel_b = velocities[idx_b].xyz + cross(omega_b, r_b);
+    float3 rel_vel = vel_a - vel_b;
+
+    // Normal and tangential components
+    float vel_normal = dot(rel_vel, normal);
+    float3 vel_tangent = rel_vel - vel_normal * normal;
+    float tangent_speed = length(vel_tangent);
+
+    // Compute generalized inverse mass for normal direction
+    float3 rn_a = cross(r_a, normal);
+    float3 rn_b = cross(r_b, normal);
+    float w_n_a = inv_mass_a + dot(rn_a * inv_mi_a.yzw, rn_a);
+    float w_n_b = inv_mass_b + dot(rn_b * inv_mi_b.yzw, rn_b);
+    float w_normal = w_n_a + w_n_b;
+
+    if (w_normal < 1e-8) return;
+
+    // Baumgarte stabilization
     float bias = params.baumgarte * max(penetration - params.slop, 0.0f) / params.dt;
 
-    // Relative velocity
-    float3 vel_a = velocities[idx_a].xyz;
-    float3 vel_b = velocities[idx_b].xyz;
-    float3 rel_vel = vel_a - vel_b;
-    float vel_normal = dot(rel_vel, normal);
-
-    // Normal impulse
+    // Restitution (only applied for separating velocity)
     float restitution = c.impulses.w;
-    float j = -(1.0 + restitution) * vel_normal + bias;
-    j /= inv_mass_sum;
-    j = max(j, 0.0f); // Only push apart
+    float vel_restitution = vel_normal < -0.5 ? restitution * vel_normal : 0.0;
 
-    // Apply impulse
+    // Normal impulse magnitude
+    float j_n = (-(vel_normal + vel_restitution) + bias) / w_normal;
+    j_n = max(j_n, 0.0f); // Only push apart (unilateral constraint)
+
+    // Apply normal impulse
+    float3 impulse_n = j_n * normal;
+
     if (inv_mass_a > 1e-8) {
-        velocities[idx_a] = float4(vel_a + j * inv_mass_a * normal, 0);
+        velocities[idx_a].xyz += impulse_n * inv_mass_a;
+        angular_velocities[idx_a].xyz += cross(r_a, impulse_n) * inv_mi_a.yzw;
 
         // Position correction
-        float3 pos_a = positions[idx_a].xyz;
-        pos_a += penetration * inv_mass_a / inv_mass_sum * normal;
-        positions[idx_a] = float4(pos_a, 0);
+        float mass_ratio_a = inv_mass_a / inv_mass_sum;
+        positions[idx_a].xyz += penetration * mass_ratio_a * normal;
     }
 
     if (inv_mass_b > 1e-8) {
-        velocities[idx_b] = float4(vel_b - j * inv_mass_b * normal, 0);
+        velocities[idx_b].xyz -= impulse_n * inv_mass_b;
+        angular_velocities[idx_b].xyz -= cross(r_b, impulse_n) * inv_mi_b.yzw;
 
         // Position correction
-        float3 pos_b = positions[idx_b].xyz;
-        pos_b -= penetration * inv_mass_b / inv_mass_sum * normal;
-        positions[idx_b] = float4(pos_b, 0);
+        float mass_ratio_b = inv_mass_b / inv_mass_sum;
+        positions[idx_b].xyz -= penetration * mass_ratio_b * normal;
     }
 
-    // Friction
-    float3 tangent_vel = rel_vel - vel_normal * normal;
-    float tangent_speed = length(tangent_vel);
+    // Friction (Coulomb friction cone)
+    if (tangent_speed > 1e-6 && j_n > 0) {
+        float3 tangent = vel_tangent / tangent_speed;
 
-    if (tangent_speed > 1e-6) {
-        float3 tangent = tangent_vel / tangent_speed;
-        float friction_impulse = min(friction * abs(j), tangent_speed / inv_mass_sum);
+        // Compute generalized inverse mass for tangent direction
+        float3 rt_a = cross(r_a, tangent);
+        float3 rt_b = cross(r_b, tangent);
+        float w_t_a = inv_mass_a + dot(rt_a * inv_mi_a.yzw, rt_a);
+        float w_t_b = inv_mass_b + dot(rt_b * inv_mi_b.yzw, rt_b);
+        float w_tangent = w_t_a + w_t_b;
 
-        if (inv_mass_a > 1e-8) {
-            float3 v = velocities[idx_a].xyz;
-            velocities[idx_a] = float4(v - friction_impulse * inv_mass_a * tangent, 0);
-        }
-        if (inv_mass_b > 1e-8) {
-            float3 v = velocities[idx_b].xyz;
-            velocities[idx_b] = float4(v + friction_impulse * inv_mass_b * tangent, 0);
+        if (w_tangent > 1e-8) {
+            // Desired friction impulse to stop tangential motion
+            float j_t_desired = tangent_speed / w_tangent;
+
+            // Friction cone limit: |j_t| ≤ μ * j_n
+            float j_t_max = friction * j_n;
+            float j_t = min(j_t_desired, j_t_max);
+
+            // Apply friction impulse
+            float3 impulse_t = j_t * tangent;
+
+            if (inv_mass_a > 1e-8) {
+                velocities[idx_a].xyz -= impulse_t * inv_mass_a;
+                angular_velocities[idx_a].xyz -= cross(r_a, impulse_t) * inv_mi_a.yzw;
+            }
+            if (inv_mass_b > 1e-8) {
+                velocities[idx_b].xyz += impulse_t * inv_mass_b;
+                angular_velocities[idx_b].xyz += cross(r_b, impulse_t) * inv_mi_b.yzw;
+            }
         }
     }
+
+    // Store accumulated normal impulse for warm starting
+    contacts[contact_idx].impulses.x = j_n;
 }
 
 // ============================================================================

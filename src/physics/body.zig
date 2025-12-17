@@ -47,16 +47,18 @@ pub const BodyDef = struct {
     collision_mask: u32 = 0xFFFFFFFF,
 
     /// Calculate inverse mass.
+    /// Static and kinematic bodies have infinite mass (inv_mass = 0) so forces don't affect them.
     pub fn invMass(self: *const BodyDef) f32 {
-        if (self.body_type == .static or self.mass <= 0.0) {
+        if (self.body_type == .static or self.body_type == .kinematic or self.mass <= 0.0) {
             return 0.0;
         }
         return 1.0 / self.mass;
     }
 
     /// Calculate inverse inertia tensor diagonal.
+    /// Static and kinematic bodies have infinite inertia so torques don't affect them.
     pub fn invInertia(self: *const BodyDef) [3]f32 {
-        if (self.body_type == .static) {
+        if (self.body_type == .static or self.body_type == .kinematic) {
             return .{ 0, 0, 0 };
         }
         var inv: [3]f32 = undefined;

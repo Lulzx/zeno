@@ -181,6 +181,8 @@ pub const ConstraintType = enum(u8) {
     angular_limit = 5,
     /// Linear limit (limit translation along axis).
     linear_limit = 6,
+    /// Weld constraint (lock relative position and orientation).
+    weld = 7,
 };
 
 pub const ConstraintParams = struct {
@@ -203,10 +205,9 @@ pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]J
 
     switch (joint.joint_type) {
         .fixed => {
-            // Fixed joint = 3 point constraints + 3 angular constraints
-            // For simplicity, use a single rigid constraint
+            // Fixed joint = Weld constraint
             try constraints.append(allocator, .{
-                .constraint_type = .point,
+                .constraint_type = .weld,
                 .body_a = joint.parent_body,
                 .body_b = joint.child_body,
                 .local_anchor_a = joint.anchor_parent,

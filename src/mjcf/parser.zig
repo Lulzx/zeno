@@ -894,32 +894,66 @@ fn processBody(
 
         // Determine body type
         var body_type: body_mod.BodyType = .dynamic;
+        var has_joints = false;
+        
         for (child.joints.items) |_| {
-            // Has joints, so it's dynamic
+            has_joints = true;
             break;
-        } else {
-            // No joints and has parent = fixed to parent
-            if (parent_id >= 0) {
-                body_type = .kinematic;
-            }
+        } 
+        
+        // If no joints and has parent, it's effectively fixed to parent.
+        // In maximal coordinates, we treat this as a separate dynamic body with a fixed joint.
+        // Unless it has no mass/geom, in which case it might be a marker... but MJCF defaults to dynamic.
+        if (!has_joints and parent_id >= 0) {
+            // Check if we should treat as kinematic or fixed dynamic
+            // For now, assume dynamic with fixed joint
+            body_type = .dynamic;
         }
 
-        // Add body
-        const current_body_id = try scene.addBody(.{
+        // Add body to scene
+        const body_id = try scene.addBody(.{
             .name = child.name,
-            .position = pos,
-            .quaternion = body_quat,
             .parent_id = parent_id,
             .body_type = body_type,
+            .position = pos,
+            .quaternion = body_quat,
+            // TODO: parse mass/inertia
         });
-        body_index.* += 1;
-
-        // Add joints
+        
+        // If implicit fixed joint needed
+        if (!has_joints and parent_id >= 0) {
+             _ = try scene.addJoint(.{
+                 .name = "fixed_link",
+                 .joint_type = .fixed,
+                 .parent_body = @intCast(parent_id),
+                 .child_body = body_id,
+                 // Anchors are 0 in local space because 'pos' above accumulates world pos?
+                 // Wait, 'pos' calculated above is world pos (summing parent).
+                 // Bodies are stored in world space in initial state.
+                 // Joint anchors are local.
+                 // If child is at 'pos' and parent at 'parent_pos',
+                 // anchor_parent = local pos of child in parent frame
+                 // anchor_child = 0
+                 
+                 // However, MJCF structure usually implies:
+                 // <body> (pos relative to parent) 
+                 //   <joint> (pos relative to body)
+                 
+                 // Since we don't have the explicit joint tag, the "joint" is implicitly at the body origin.
+                 // So anchor_child = (0,0,0).
+                 // anchor_parent = child.pos (the relative pos from MJCF).
+                 
+                 .anchor_parent = child.pos,
+                 .anchor_child = .{ 0, 0, 0 },
+             });
+        }
+        
+        // Process joints
         for (child.joints.items) |mjcf_joint| {
             var joint_def = joint_mod.JointDef{
                 .name = mjcf_joint.name,
                 .parent_body = if (parent_id >= 0) @intCast(parent_id) else 0,
-                .child_body = current_body_id,
+                .child_body = body_id,
                 .anchor_parent = mjcf_joint.pos,
                 .anchor_child = .{ 0, 0, 0 },
                 .axis = mjcf_joint.axis,
@@ -945,20 +979,15 @@ fn processBody(
             _ = try scene.addJoint(joint_def);
         }
 
-        // Add geoms
+        // Process geoms
         for (child.geoms.items) |mjcf_geom| {
             var geom = convertGeom(&mjcf_geom);
-            geom.body_id = current_body_id;
+            geom.body_id = body_id;
             _ = try scene.addNamedGeom(mjcf_geom.name, geom);
-
-            // Update body mass from geom
-            if (mjcf_geom.mass) |mass| {
-                scene.bodies.items[current_body_id].mass += mass;
-            }
         }
 
-        // Process children recursively
-        try processBody(allocator, scene, child, @intCast(current_body_id), body_index, pos, body_quat);
+        // Recursively process children
+        try processBody(allocator, scene, child, @intCast(body_id), body_index, pos, body_quat);
     }
 }
 
