@@ -31,5 +31,7 @@ Thumbs.db
 *.air
 *.metallib
 
-# Generated trajectory data
-*_trajectory.csv
+# Generated data and visualizations
+*.csv
+*.png
+!docs/**/*.png

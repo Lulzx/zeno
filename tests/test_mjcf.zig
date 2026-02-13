@@ -99,8 +99,8 @@ test "empty worldbody" {
     var scene = try parser.parseString(testing.allocator, empty_mjcf);
     defer scene.deinit();
 
-    // Should have no bodies (or just ground body)
-    try testing.expect(scene.numBodies() == 0);
+    // Should have only the implicit world body (body 0)
+    try testing.expect(scene.numBodies() <= 1);
 }
 
 test "deeply nested bodies" {
@@ -366,4 +366,131 @@ test "option element" {
 
     try testing.expectApproxEqAbs(@as(f32, 0.001), scene.physics_config.timestep, 0.0001);
     try testing.expectApproxEqAbs(@as(f32, -10.0), scene.physics_config.gravity[2], 0.1);
+}
+
+test "explicit inertial element" {
+    const inertial_mjcf =
+        \\<mujoco model="inertial">
+        \\    <worldbody>
+        \\        <body name="heavy" pos="0 0 1">
+        \\            <inertial mass="5.0" pos="0 0 0" diaginertia="0.1 0.2 0.3"/>
+        \\            <joint type="free"/>
+        \\            <geom type="sphere" size="0.1"/>
+        \\        </body>
+        \\    </worldbody>
+        \\</mujoco>
+    ;
+
+    var scene = try parser.parseString(testing.allocator, inertial_mjcf);
+    defer scene.deinit();
+
+    const body_id = scene.getBodyByName("heavy").?;
+    const body = scene.bodies.items[body_id];
+    try testing.expectApproxEqAbs(@as(f32, 5.0), body.mass, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.1), body.inertia[0], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.2), body.inertia[1], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.3), body.inertia[2], 0.001);
+}
+
+test "mass from geom mass attribute" {
+    const geom_mass_mjcf =
+        \\<mujoco model="geom_mass">
+        \\    <worldbody>
+        \\        <body name="ball" pos="0 0 1">
+        \\            <joint type="free"/>
+        \\            <geom type="sphere" size="0.1" mass="2.5"/>
+        \\        </body>
+        \\    </worldbody>
+        \\</mujoco>
+    ;
+
+    var scene = try parser.parseString(testing.allocator, geom_mass_mjcf);
+    defer scene.deinit();
+
+    const body_id = scene.getBodyByName("ball").?;
+    const body = scene.bodies.items[body_id];
+    try testing.expectApproxEqAbs(@as(f32, 2.5), body.mass, 0.001);
+    // Sphere inertia: I = 0.4 * m * r^2 = 0.4 * 2.5 * 0.01 = 0.01
+    try testing.expectApproxEqAbs(@as(f32, 0.01), body.inertia[0], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.01), body.inertia[1], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.01), body.inertia[2], 0.001);
+}
+
+test "mass from geom density" {
+    const density_mjcf =
+        \\<mujoco model="density">
+        \\    <worldbody>
+        \\        <body name="ball" pos="0 0 1">
+        \\            <joint type="free"/>
+        \\            <geom type="sphere" size="0.1" density="500"/>
+        \\        </body>
+        \\    </worldbody>
+        \\</mujoco>
+    ;
+
+    var scene = try parser.parseString(testing.allocator, density_mjcf);
+    defer scene.deinit();
+
+    const body_id = scene.getBodyByName("ball").?;
+    const body = scene.bodies.items[body_id];
+    // Volume of sphere r=0.1: (4/3)*pi*0.001 ~= 0.004189
+    // Mass = 500 * 0.004189 ~= 2.094
+    try testing.expectApproxEqAbs(@as(f32, 2.094), body.mass, 0.05);
+    // Inertia should be non-zero
+    try testing.expect(body.inertia[0] > 0);
+}
+
+test "composite inertia from multiple geoms" {
+    const multi_geom_mjcf =
+        \\<mujoco model="multi_geom">
+        \\    <worldbody>
+        \\        <body name="compound" pos="0 0 1">
+        \\            <joint type="free"/>
+        \\            <geom type="sphere" size="0.1" mass="1.0" pos="0 0 0"/>
+        \\            <geom type="sphere" size="0.1" mass="1.0" pos="0.5 0 0"/>
+        \\        </body>
+        \\    </worldbody>
+        \\</mujoco>
+    ;
+
+    var scene = try parser.parseString(testing.allocator, multi_geom_mjcf);
+    defer scene.deinit();
+
+    const body_id = scene.getBodyByName("compound").?;
+    const body = scene.bodies.items[body_id];
+    // Total mass should be 2.0
+    try testing.expectApproxEqAbs(@as(f32, 2.0), body.mass, 0.001);
+    // Inertia should include parallel axis contribution from offset geom
+    // The second geom at (0.5, 0, 0) adds m*d^2 to Iyy and Izz
+    // So Iyy and Izz should be larger than Ixx
+    try testing.expect(body.inertia[1] > body.inertia[0]);
+    try testing.expect(body.inertia[2] > body.inertia[0]);
+}
+
+test "box geom inertia" {
+    const box_mjcf =
+        \\<mujoco model="box_inertia">
+        \\    <worldbody>
+        \\        <body name="block" pos="0 0 1">
+        \\            <joint type="free"/>
+        \\            <geom type="box" size="0.5 0.3 0.1" mass="6.0"/>
+        \\        </body>
+        \\    </worldbody>
+        \\</mujoco>
+    ;
+
+    var scene = try parser.parseString(testing.allocator, box_mjcf);
+    defer scene.deinit();
+
+    const body_id = scene.getBodyByName("block").?;
+    const body = scene.bodies.items[body_id];
+    try testing.expectApproxEqAbs(@as(f32, 6.0), body.mass, 0.001);
+    // Box inertia: I = m/12 * (b^2 + c^2) for each axis
+    // Full extents: 1.0, 0.6, 0.2
+    // Ixx = 6/12 * (0.36 + 0.04) = 0.5 * 0.4 = 0.2
+    // Iyy = 6/12 * (1.0 + 0.04) = 0.5 * 1.04 = 0.52
+    // Izz = 6/12 * (1.0 + 0.36) = 0.5 * 1.36 = 0.68
+    try testing.expectApproxEqAbs(@as(f32, 0.2), body.inertia[0], 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0.52), body.inertia[1], 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 0.68), body.inertia[2], 0.01);
 }

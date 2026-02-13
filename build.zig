@@ -58,27 +58,6 @@ pub fn build(b: *std.Build) void {
     const bandwidth_step = b.step("bandwidth", "Run memory bandwidth benchmark");
     bandwidth_step.dependOn(&run_bandwidth.step);
 
-    // Example executable
-    const example = b.addExecutable(.{
-        .name = "zeno_example",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/basic.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zeno", .module = lib.root_module },
-            },
-        }),
-    });
-    example.linkFramework("Metal");
-    example.linkFramework("Foundation");
-    example.linkFramework("QuartzCore");
-    example.linkLibC();
-
-    const run_example = b.addRunArtifact(example);
-    const example_step = b.step("example", "Run the basic example");
-    example_step.dependOn(&run_example.step);
-
     // Tests
     const test_step = b.step("test", "Run unit tests");
 
@@ -148,24 +127,8 @@ pub fn build(b: *std.Build) void {
         bench_step.dependOn(&run_bench.step);
     }
 
-    // Compile Metal shaders
-    const shader_step = b.step("shaders", "Compile Metal shaders");
-    const compile_shaders = b.addSystemCommand(&.{
-        "xcrun",
-        "-sdk",
-        "macosx",
-        "metal",
-        "-c",
-        "src/shaders/common.metal",
-        "src/shaders/integrate.metal",
-        "src/shaders/kinematics.metal",
-        "src/shaders/forces.metal",
-        "src/shaders/broad_phase.metal",
-        "src/shaders/narrow_phase.metal",
-        "src/shaders/contacts.metal",
-        "src/shaders/sensors.metal",
-        "-o",
-        "zig-out/shaders.air",
-    });
-    shader_step.dependOn(&compile_shaders.step);
+    // Note: Metal shaders are embedded at compile time via @embedFile in
+    // src/world/world.zig. No separate shader compilation step is needed.
+    // The shaders are loaded from source at runtime using Metal's
+    // newLibraryWithSource API.
 }

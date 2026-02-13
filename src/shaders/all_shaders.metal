@@ -357,7 +357,8 @@ kernel void compute_forces(
     float3 force = gravity * mass;
 
     forces[gid] = float4(force, 0);
-    torques[gid] = float4(0);
+    // Note: torques buffer already contains actuator torques from apply_joint_forces.
+    // Do not zero it here — the buffer is cleared at the end of each step.
 }
 
 // ============================================================================
@@ -417,7 +418,18 @@ kernel void integrate(
     // Quaternion integration: q(t+dt) = q(t) + 0.5 * ω_quat * q(t) * dt
     float4 omega_quat = float4(omega * dt * 0.5, 0);
     float4 dq = quat_multiply(omega_quat, quat);
-    quat = quat_normalize(quat + dq);
+    quat = quat + dq;
+
+    // Explicit quaternion renormalization to prevent drift accumulation.
+    // This is critical for long simulations where floating-point errors
+    // in the quaternion can compound, causing non-unit quaternions that
+    // distort rotations and destabilize the simulation.
+    float qlen = length(quat);
+    if (qlen > 1e-8) {
+        quat = quat / qlen;
+    } else {
+        quat = float4(0, 0, 0, 1); // Reset to identity on degenerate quaternion
+    }
 
     angular_velocities[gid] = float4(omega, 0);
     quaternions[gid] = quat;
@@ -1034,7 +1046,152 @@ kernel void solve_joints(
     }
 
     // Store updated constraint state
-    constraints[gid] = c;
+    constraints[constraint_idx] = c;
+}
+
+// ============================================================================
+// Warm Start Constraints Kernel
+// ============================================================================
+// At the start of each timestep, initialize lambda from lambda_prev
+// (scaled by a warm start factor) for faster convergence.
+// At the end of each timestep, copy lambda to lambda_prev.
+
+kernel void warm_start_constraints(
+    device XPBDConstraint* constraints [[buffer(0)]],
+    constant SimParams& params [[buffer(1)]],
+    constant float& warm_start_factor [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint constraints_per_env = params.target_color; // Repurposed field
+    if (constraints_per_env == 0) return;
+
+    uint env_id = gid / constraints_per_env;
+    uint local_idx = gid % constraints_per_env;
+
+    if (env_id >= params.num_envs) return;
+
+    uint idx = env_id * constraints_per_env + local_idx;
+    // state.x = lambda, state.y = lambda_prev
+    // Initialize lambda from previous frame's lambda (warm start)
+    constraints[idx].state.x = warm_start_factor * constraints[idx].state.y;
+}
+
+kernel void store_lambda_prev(
+    device XPBDConstraint* constraints [[buffer(0)]],
+    constant SimParams& params [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint constraints_per_env = params.target_color; // Repurposed field
+    if (constraints_per_env == 0) return;
+
+    uint env_id = gid / constraints_per_env;
+    uint local_idx = gid % constraints_per_env;
+
+    if (env_id >= params.num_envs) return;
+
+    uint idx = env_id * constraints_per_env + local_idx;
+    // Copy current lambda to lambda_prev for next frame's warm starting
+    constraints[idx].state.y = constraints[idx].state.x;
+}
+
+// ============================================================================
+// Contact Caching - Persist contacts across frames for temporal coherence
+// ============================================================================
+
+// Cache current contacts to previous-frame buffer for reuse next frame.
+// Contacts that persist between frames retain their accumulated impulses,
+// improving convergence and reducing jitter.
+
+kernel void cache_contacts(
+    device const Contact* contacts [[buffer(0)]],
+    device Contact* prev_contacts [[buffer(1)]],
+    device const uint* contact_counts [[buffer(2)]],
+    device uint* prev_contact_counts [[buffer(3)]],
+    constant SimParams& params [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint env_id = gid / params.max_contacts;
+    uint contact_id = gid % params.max_contacts;
+
+    if (env_id >= params.num_envs) return;
+
+    uint count = contact_counts[env_id];
+
+    // Copy count for first thread of each env
+    if (contact_id == 0) {
+        prev_contact_counts[env_id] = count;
+    }
+
+    if (contact_id >= count) return;
+
+    uint idx = env_id * params.max_contacts + contact_id;
+    prev_contacts[idx] = contacts[idx];
+}
+
+// Match new contacts against cached contacts from the previous frame.
+// If a matching contact is found (same body pair, nearby position),
+// copy the accumulated impulse for warm starting the contact solver.
+kernel void match_cached_contacts(
+    device Contact* contacts [[buffer(0)]],
+    device const Contact* prev_contacts [[buffer(1)]],
+    device const uint* contact_counts [[buffer(2)]],
+    device const uint* prev_contact_counts [[buffer(3)]],
+    constant SimParams& params [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint env_id = gid / params.max_contacts;
+    uint contact_id = gid % params.max_contacts;
+
+    if (env_id >= params.num_envs) return;
+
+    uint count = contact_counts[env_id];
+    if (contact_id >= count) return;
+
+    uint idx = env_id * params.max_contacts + contact_id;
+    Contact c = contacts[idx];
+
+    // Skip invalid contacts
+    if (c.position_pen.w < 0) return;
+
+    uint prev_count = prev_contact_counts[env_id];
+    uint body_a = c.indices.x;
+    uint body_b = c.indices.y;
+    float3 pos = c.position_pen.xyz;
+
+    // Search for matching contact in previous frame
+    float best_dist_sq = 0.04; // 0.2^2 position match threshold
+    int best_match = -1;
+
+    for (uint i = 0; i < prev_count && i < params.max_contacts; i++) {
+        uint prev_idx = env_id * params.max_contacts + i;
+        Contact prev = prev_contacts[prev_idx];
+
+        // Skip invalid previous contacts
+        if (prev.position_pen.w < 0) continue;
+
+        // Match by body pair (order-independent)
+        bool same_pair = (prev.indices.x == body_a && prev.indices.y == body_b) ||
+                         (prev.indices.x == body_b && prev.indices.y == body_a);
+
+        if (!same_pair) continue;
+
+        // Check position proximity
+        float3 diff = prev.position_pen.xyz - pos;
+        float dist_sq = dot(diff, diff);
+
+        if (dist_sq < best_dist_sq) {
+            best_dist_sq = dist_sq;
+            best_match = int(i);
+        }
+    }
+
+    // If a match was found, transfer accumulated impulse for warm starting
+    if (best_match >= 0) {
+        uint prev_idx = env_id * params.max_contacts + uint(best_match);
+        contacts[idx].impulses.x = prev_contacts[prev_idx].impulses.x * 0.8;
+        contacts[idx].impulses.y = prev_contacts[prev_idx].impulses.y * 0.8;
+        contacts[idx].impulses.z = prev_contacts[prev_idx].impulses.z * 0.8;
+    }
 }
 
 // ============================================================================

@@ -599,3 +599,31 @@ test "actuator control input clamping" {
     const torque = act.controlToTorque(5.0, 0, 0);
     try testing.expectApproxEqAbs(@as(f32, 10.0), torque, 0.1);
 }
+
+// Regression test for motor actuator bug where compute_forces kernel zeroed
+// the body torques buffer, erasing actuator torques applied by apply_joint_forces.
+// See: src/shaders/all_shaders.metal compute_forces kernel.
+test "motor actuator with high gear produces nonzero torque" {
+    const act = joint.ActuatorDef{
+        .actuator_type = .motor,
+        .gear = 100.0,
+        .ctrl_min = -1.0,
+        .ctrl_max = 1.0,
+        .force_min = -std.math.inf(f32),
+        .force_max = std.math.inf(f32),
+    };
+
+    // With ctrl=1.0, gear=100: torque should be 100
+    const torque = act.controlToTorque(1.0, 0, 0);
+    try testing.expectApproxEqAbs(@as(f32, 100.0), torque, 0.01);
+    try testing.expect(torque > 0.0); // Must be nonzero
+
+    // With ctrl=0.5: torque should be 50
+    const torque2 = act.controlToTorque(0.5, 0, 0);
+    try testing.expectApproxEqAbs(@as(f32, 50.0), torque2, 0.01);
+
+    // Negative control should produce negative torque
+    const torque3 = act.controlToTorque(-1.0, 0, 0);
+    try testing.expectApproxEqAbs(@as(f32, -100.0), torque3, 0.01);
+    try testing.expect(torque3 < 0.0);
+}

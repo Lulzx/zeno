@@ -26,6 +26,7 @@ pub const collision = struct {
     pub const primitives = @import("collision/primitives.zig");
     pub const broad_phase = @import("collision/broad_phase.zig");
     pub const narrow_phase = @import("collision/narrow_phase.zig");
+    pub const gjk = @import("collision/gjk.zig");
 };
 pub const world = struct {
     pub const scene = @import("world/scene.zig");

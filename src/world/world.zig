@@ -83,6 +83,18 @@ pub const World = struct {
     num_colors: u8,
     color_ranges: ?[][2]u32, // [color] = (start_offset, count)
 
+    // Contact caching buffers for temporal coherence
+    prev_contacts_buffer: Buffer,
+    prev_contact_counts_buffer: Buffer,
+
+    // Warm start factor buffer (single float passed to GPU)
+    warm_start_factor_buffer: Buffer,
+
+    // Adaptive substeps state
+    adaptive_substeps: u32,
+    max_adaptive_substeps: u32,
+    violation_threshold: f32,
+
     // Allocator
     allocator: std.mem.Allocator,
 
@@ -151,6 +163,10 @@ fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
             "update_joint_states",
             "read_sensors",
             "reset_env",
+            "warm_start_constraints",
+            "store_lambda_prev",
+            "cache_contacts",
+            "match_cached_contacts",
         });
 
         // Calculate dimensions
@@ -351,6 +367,30 @@ fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
             opts,
         );
 
+        // Contact caching buffers: mirror the contacts buffer for previous frame
+        const contact_count = config.num_envs * config.max_contacts_per_env;
+        var prev_contacts_buffer = try Buffer.init(
+            device.device,
+            contact_count * @sizeOf(contact.ContactGPU),
+            opts,
+        );
+        var prev_contact_counts_buffer = try Buffer.init(
+            device.device,
+            config.num_envs * 4,
+            opts,
+        );
+        try prev_contacts_buffer.zero();
+        try prev_contact_counts_buffer.zero();
+
+        // Warm start factor buffer (single float)
+        const warm_start_factor_buffer = try Buffer.init(
+            device.device,
+            @sizeOf(f32),
+            opts,
+        );
+        const ws_ptr = warm_start_factor_buffer.getSlice(f32);
+        ws_ptr[0] = 0.8; // Default warm start factor
+
         // Apply graph coloring to template constraints to avoid race conditions
         // Constraints sharing bodies get different colors, allowing parallel solving per color
         var num_colors: u8 = 0;
@@ -422,6 +462,12 @@ fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
             .num_constraints_per_env = num_constraints_per_env,
             .num_colors = num_colors,
             .color_ranges = color_ranges,
+            .prev_contacts_buffer = prev_contacts_buffer,
+            .prev_contact_counts_buffer = prev_contact_counts_buffer,
+            .warm_start_factor_buffer = warm_start_factor_buffer,
+            .adaptive_substeps = config.substeps,
+            .max_adaptive_substeps = @max(config.substeps * 4, 8),
+            .violation_threshold = 0.01,
             .allocator = allocator,
         };
 
@@ -503,21 +549,67 @@ fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
         try self.state.joint_velocities_buffer.zero();
     }
 
-    /// Step the simulation.
+    /// Step the simulation with adaptive substeps.
     pub fn step(self: *World, actions: []const f32, substeps: u32) !void {
         // Copy actions to GPU buffer
         try self.state.setActions(actions);
 
-        const actual_substeps = if (substeps == 0) self.config.substeps else substeps;
+        // Use adaptive substep count if no explicit override
+        const actual_substeps = if (substeps == 0) self.adaptive_substeps else substeps;
 
         for (0..actual_substeps) |_| {
             try self.stepOnce();
+        }
+
+        // Adaptive substep detection: check max constraint violation after solving.
+        // If violations exceed threshold, increase substeps for next frame.
+        // If violations are well below threshold, decrease substeps to save compute.
+        if (self.num_constraints_per_env > 0) {
+            const constraints_slice = self.constraints_buffer.getSlice(XPBDConstraint);
+            var max_violation: f32 = 0.0;
+
+            // Sample a subset of constraints to detect violation level
+            // (checking all would be expensive; sample from env 0 only)
+            for (0..self.num_constraints_per_env) |ci| {
+                const violation = @abs(constraints_slice[ci].state[2]);
+                if (violation > max_violation) {
+                    max_violation = violation;
+                }
+            }
+
+            if (max_violation > self.violation_threshold) {
+                // Increase substeps (up to max) when constraints are violated
+                if (self.adaptive_substeps < self.max_adaptive_substeps) {
+                    self.adaptive_substeps += 1;
+                }
+            } else if (max_violation < self.violation_threshold * 0.25) {
+                // Decrease substeps when well within tolerance
+                if (self.adaptive_substeps > self.config.substeps) {
+                    self.adaptive_substeps -= 1;
+                }
+            }
         }
     }
 
     /// Execute one physics substep.
     fn stepOnce(self: *World) !void {
         var cmd = try CommandBuffer.init(self.device.command_queue);
+
+        // Stage 0a: Warm start constraints from previous frame's lambda values
+        if (self.num_constraints_per_env > 0) {
+            const params_ptr = self.params_buffer.getSlice(SimParams);
+            params_ptr[0].target_color = self.num_constraints_per_env;
+
+            var encoder = try cmd.computeEncoder();
+            defer encoder.endEncoding();
+
+            const pipeline = try self.pipelines.getPipeline("warm_start_constraints");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.constraints_buffer, 0, 0);
+            encoder.setBuffer(&self.params_buffer, 0, 1);
+            encoder.setBuffer(&self.warm_start_factor_buffer, 0, 2);
+            encoder.dispatch1D(pipeline, self.config.num_envs * self.num_constraints_per_env);
+        }
 
         // Stage 1: Apply actions to joint torques
         {
@@ -635,6 +727,22 @@ fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
         }
 
+        // Stage 6.5: Match new contacts against cached contacts from previous frame
+        // Transfer accumulated impulses for temporal coherence
+        {
+            var encoder = try cmd.computeEncoder();
+            defer encoder.endEncoding();
+
+            const pipeline = try self.pipelines.getPipeline("match_cached_contacts");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.contacts_buffer, 0, 0);
+            encoder.setBuffer(&self.prev_contacts_buffer, 0, 1);
+            encoder.setBuffer(&self.state.contact_counts_buffer, 0, 2);
+            encoder.setBuffer(&self.prev_contact_counts_buffer, 0, 3);
+            encoder.setBuffer(&self.params_buffer, 0, 4);
+            encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
+        }
+
         // Stage 7: Joint solver (XPBD iterations with graph coloring)
         // Process constraints by color to avoid race conditions when constraints share bodies
         if (self.num_constraints_per_env > 0 and self.color_ranges != null) {
@@ -727,6 +835,36 @@ fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
             encoder.setBuffer(&self.state.observations_buffer, 0, 7);
             encoder.setBuffer(&self.params_buffer, 0, 8);
             encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_sensors);
+        }
+
+        // Stage 9: Cache contacts for next frame's temporal coherence
+        {
+            var encoder = try cmd.computeEncoder();
+            defer encoder.endEncoding();
+
+            const pipeline = try self.pipelines.getPipeline("cache_contacts");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.contacts_buffer, 0, 0);
+            encoder.setBuffer(&self.prev_contacts_buffer, 0, 1);
+            encoder.setBuffer(&self.state.contact_counts_buffer, 0, 2);
+            encoder.setBuffer(&self.prev_contact_counts_buffer, 0, 3);
+            encoder.setBuffer(&self.params_buffer, 0, 4);
+            encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
+        }
+
+        // Stage 10: Store lambda_prev for next frame's warm starting
+        if (self.num_constraints_per_env > 0) {
+            const params_ptr = self.params_buffer.getSlice(SimParams);
+            params_ptr[0].target_color = self.num_constraints_per_env;
+
+            var encoder = try cmd.computeEncoder();
+            defer encoder.endEncoding();
+
+            const pipeline = try self.pipelines.getPipeline("store_lambda_prev");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.constraints_buffer, 0, 0);
+            encoder.setBuffer(&self.params_buffer, 0, 1);
+            encoder.dispatch1D(pipeline, self.config.num_envs * self.num_constraints_per_env);
         }
 
         // Execute and wait
@@ -916,6 +1054,9 @@ fn rotateByQuat(v: [3]f32, q: [4]f32) [3]f32 {
         self.sensor_data_buffer.deinit();
         self.params_buffer.deinit();
         self.constraints_buffer.deinit();
+        self.prev_contacts_buffer.deinit();
+        self.prev_contact_counts_buffer.deinit();
+        self.warm_start_factor_buffer.deinit();
 
         self.state.deinit();
         self.pipelines.deinit();

@@ -2,6 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/platform-macOS-blue.svg)](https://www.apple.com/macos/)
+[![CI](https://github.com/lulzx/zeno/actions/workflows/ci.yml/badge.svg)](https://github.com/lulzx/zeno/actions/workflows/ci.yml)
 
 **Zeno** is a GPU-accelerated rigid body physics simulation engine optimized for reinforcement learning and robot policy training. It is designed from first principles to exploit Apple Silicon's unified memory architecture, achieving 10-100x throughput improvements over existing solutions for batched parallel environments.
 
@@ -16,20 +17,23 @@ The name references Zeno of Elea, whose paradoxes on motion and infinity are fou
 - **SoA Memory Layout** — float4-aligned, coalesced GPU access
 
 ### Physics
-- **Rigid Body Dynamics** — Semi-implicit Euler integration, quaternion rotations
-- **Joint Constraints** — Fixed, revolute, prismatic, ball, free (PBD solver)
-- **Collision Detection** — Spatial hashing broad phase, sphere/capsule/box/plane/mesh/heightfield primitives
-- **Contact Resolution** — Position-Based Dynamics with Coulomb friction
+- **Rigid Body Dynamics** — Semi-implicit Euler integration, quaternion rotations with renormalization
+- **XPBD Constraint Solver** — Extended Position-Based Dynamics with graph coloring for race-free parallel solving
+- **Joint Constraints** — Fixed, revolute, prismatic, ball, free, universal joints
+- **Collision Detection** — Spatial hashing broad phase, GJK+EPA for convex hulls, sphere/capsule/box/plane/mesh/heightfield primitives
+- **Contact Resolution** — XPBD contact solver with warm starting and contact caching for temporal coherence
+- **Adaptive Substeps** — Dynamic substep adjustment based on constraint violation
 - **Soft Bodies** — PBD deformable cloth and volumetric bodies
 - **Fluids** — SPH fluid simulation with spatial hashing
 - **Materials** — PBR materials with texture support
 
 ### Integration
-- **MJCF Parser** — Bodies, joints, geoms, actuators, sensors, defaults
+- **MJCF Parser** — Bodies, joints, geoms, actuators, sensors, defaults, inertia (explicit and shape-based)
 - **Python Bindings** — cffi-based, zero-copy numpy arrays via unified memory
 - **Gymnasium API** — Full API compliance with vectorized environment support
 - **Stable-Baselines3** — Direct integration with SB3 and other RL libraries
 - **C ABI** — Full FFI for custom language bindings
+- **CI/CD** — GitHub Actions with Zig build, tests, and Python integration tests
 
 ### Environments
 - **Pendulum** — 3 bodies, 1 joint, 1 actuator
@@ -91,8 +95,18 @@ zig build test
 ### Python Installation
 
 ```bash
-cd python
-pip install -e .
+pip install -e python/
+```
+
+### Running Tests
+
+```bash
+# Zig unit tests (12 test suites)
+zig build test
+
+# Python integration tests
+pip install pytest numpy
+python -m pytest tests/test_python_integration.py -v
 ```
 
 ### Basic Usage (Python)
@@ -238,7 +252,7 @@ Zeno includes 10 standard robotics environments:
 │               (MTLBuffer, storageModeShared)                    │
 ├─────────────────────────────────────────────────────────────────┤
 │                    Compute Pipeline                             │
-│   Apply Actions → FK → Forces → Integrate → Collision → Solve  │
+│  Actions → Forces → Integrate → Collision → XPBD Solve → Obs   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -285,19 +299,20 @@ uint8_t* zeno_world_get_dones(ZenoWorldHandle world);
 ```
 zeno/
 ├── build.zig                 # Build configuration
+├── .github/workflows/        # CI pipeline (GitHub Actions)
 ├── src/
 │   ├── main.zig              # C ABI exports
 │   ├── metal/                # Metal infrastructure
-│   ├── physics/              # Physics core (rigid bodies, soft bodies, fluids)
-│   ├── collision/            # Collision detection
+│   ├── physics/              # Physics core (rigid bodies, XPBD, soft bodies, fluids)
+│   ├── collision/            # Collision detection (GJK+EPA, spatial hashing)
 │   ├── world/                # World management
-│   ├── mjcf/                 # MJCF parser
+│   ├── mjcf/                 # MJCF parser (with inertia computation)
 │   ├── render/               # Rendering (materials, textures)
-│   └── shaders/              # Metal compute shaders
+│   └── shaders/              # Metal compute shaders (embedded at compile time)
 ├── python/
 │   └── zeno/                 # Python bindings
 ├── assets/                   # MJCF model files
-├── tests/                    # Zig tests
+├── tests/                    # Zig + Python tests
 ├── benchmarks/               # Performance benchmarks
 └── docs/                     # Documentation
 ```
@@ -312,6 +327,7 @@ Zeno supports a subset of the MuJoCo XML format:
 - `<body>`: name, pos, quat, euler
 - `<joint>`: type (hinge, slide, ball, free), axis, range, damping, stiffness, armature
 - `<geom>`: type (sphere, capsule, box, cylinder, plane, mesh, hfield), size, fromto, mass, density, friction
+- `<inertial>`: mass, diaginertia, fullinertia, pos, quat (with automatic shape-based fallback)
 - `<actuator>`: motor, position, velocity, ctrlrange, forcerange, gear, kp, kv
 - `<sensor>`: jointpos, jointvel, framepos, framequat, framelinvel, frameangvel, accelerometer, gyro
 - `<tendon>`: fixed and spatial tendons with spring behavior, wrapping objects

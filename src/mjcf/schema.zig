@@ -109,6 +109,15 @@ pub const MjcfOption = struct {
     tolerance: f32 = 1e-8,
 };
 
+/// Parsed MJCF inertial element (explicit mass/inertia for a body).
+pub const MjcfInertial = struct {
+    mass: f32 = 1.0,
+    pos: [3]f32 = .{ 0, 0, 0 },
+    quat: [4]f32 = .{ 1, 0, 0, 0 },
+    diaginertia: ?[3]f32 = null,
+    fullinertia: ?[6]f32 = null,
+};
+
 /// Parsed MJCF body element.
 pub const MjcfBody = struct {
     name: []const u8 = "",
@@ -117,6 +126,7 @@ pub const MjcfBody = struct {
     euler: ?[3]f32 = null,
     childclass: []const u8 = "",
     mocap: bool = false,
+    inertial: ?MjcfInertial = null,
 
     joints: std.ArrayListUnmanaged(MjcfJoint) = .{},
     geoms: std.ArrayListUnmanaged(MjcfGeom) = .{},

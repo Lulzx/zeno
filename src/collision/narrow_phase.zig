@@ -6,6 +6,7 @@ const primitives = @import("primitives.zig");
 const contact = @import("../physics/contact.zig");
 const body = @import("../physics/body.zig");
 const constants = @import("../physics/constants.zig");
+const gjk_mod = @import("gjk.zig");
 
 /// Contact result from narrow phase.
 pub const ContactResult = struct {
@@ -42,6 +43,7 @@ pub fn detectCollision(
             .box => sphereBox(pos_a, geom_a.getRadius(), pos_b, geom_b, transform_b),
             .plane => spherePlane(pos_a, geom_a.getRadius(), geom_b, transform_b),
             .heightfield => sphereHeightfield(pos_a, geom_a.getRadius(), geom_b, transform_b),
+            .mesh => meshPrimitiveCollision(geom_b, transform_b, geom_a, transform_a, true),
             else => null,
         },
         .capsule => switch (geom_b.geom_type) {
@@ -54,6 +56,7 @@ pub fn detectCollision(
             .capsule => capsuleCapsule(pos_a, geom_a, transform_a, pos_b, geom_b, transform_b),
             .plane => capsulePlane(pos_a, geom_a, transform_a, geom_b, transform_b),
             .heightfield => capsuleHeightfield(pos_a, geom_a, transform_a, geom_b, transform_b),
+            .mesh => meshPrimitiveCollision(geom_b, transform_b, geom_a, transform_a, true),
             else => null,
         },
         .box => switch (geom_b.geom_type) {
@@ -66,6 +69,7 @@ pub fn detectCollision(
             .plane => boxPlane(pos_a, geom_a, transform_a, geom_b, transform_b),
             .box => boxBox(pos_a, geom_a, transform_a, pos_b, geom_b, transform_b),
             .heightfield => boxHeightfield(pos_a, geom_a, transform_a, geom_b, transform_b),
+            .mesh => meshPrimitiveCollision(geom_b, transform_b, geom_a, transform_a, true),
             else => null,
         },
         .plane => switch (geom_b.geom_type) {
@@ -108,6 +112,11 @@ pub fn detectCollision(
                 }
                 break :blk null;
             },
+            else => null,
+        },
+        .mesh => switch (geom_b.geom_type) {
+            .sphere, .capsule, .box => meshPrimitiveCollision(geom_a, transform_a, geom_b, transform_b, false),
+            .mesh => meshMeshCollision(geom_a, transform_a, geom_b, transform_b),
             else => null,
         },
         else => null,
@@ -677,6 +686,100 @@ fn boxHeightfield(
         .penetration = max_pen,
         .local_a = deepest_corner,
         .local_b = deepest_local_hf,
+    };
+}
+
+/// Mesh vs primitive collision using GJK+EPA.
+/// When flipped=true, the result normal is flipped (primitive was geom_a in the caller).
+fn meshPrimitiveCollision(
+    mesh_geom: *const primitives.Geom,
+    mesh_transform: *const body.Transform,
+    prim_geom: *const primitives.Geom,
+    prim_transform: *const body.Transform,
+    flipped: bool,
+) ?ContactResult {
+    if (mesh_geom.mesh_ptr == null) return null;
+
+    const shape_a = gjk_mod.ConvexShape{
+        .shape_type = .mesh,
+        .geom = mesh_geom,
+        .transform = mesh_transform,
+    };
+
+    const prim_type: gjk_mod.ConvexShape.ShapeType = switch (prim_geom.geom_type) {
+        .sphere => .sphere,
+        .capsule => .capsule,
+        .box => .box_shape,
+        else => return null,
+    };
+
+    const shape_b = gjk_mod.ConvexShape{
+        .shape_type = prim_type,
+        .geom = prim_geom,
+        .transform = prim_transform,
+    };
+
+    const gjk_result = gjk_mod.gjk(&shape_a, &shape_b);
+    if (!gjk_result.intersect) return null;
+
+    const epa_result = gjk_mod.epa(&shape_a, &shape_b, &gjk_result) orelse return null;
+
+    const contact_point = scale(add(epa_result.point_a, epa_result.point_b), 0.5);
+
+    if (flipped) {
+        // Caller had primitive as geom_a and mesh as geom_b, so flip
+        return ContactResult{
+            .point = contact_point,
+            .normal = scale(epa_result.normal, -1),
+            .penetration = epa_result.depth,
+            .local_a = sub(epa_result.point_b, prim_transform.transformPoint(prim_geom.local_pos)),
+            .local_b = sub(epa_result.point_a, mesh_transform.transformPoint(mesh_geom.local_pos)),
+        };
+    }
+
+    return ContactResult{
+        .point = contact_point,
+        .normal = epa_result.normal,
+        .penetration = epa_result.depth,
+        .local_a = sub(epa_result.point_a, mesh_transform.transformPoint(mesh_geom.local_pos)),
+        .local_b = sub(epa_result.point_b, prim_transform.transformPoint(prim_geom.local_pos)),
+    };
+}
+
+/// Mesh vs mesh collision using GJK+EPA on convex hulls.
+fn meshMeshCollision(
+    geom_a: *const primitives.Geom,
+    transform_a: *const body.Transform,
+    geom_b: *const primitives.Geom,
+    transform_b: *const body.Transform,
+) ?ContactResult {
+    if (geom_a.mesh_ptr == null or geom_b.mesh_ptr == null) return null;
+
+    const shape_a = gjk_mod.ConvexShape{
+        .shape_type = .mesh,
+        .geom = geom_a,
+        .transform = transform_a,
+    };
+
+    const shape_b = gjk_mod.ConvexShape{
+        .shape_type = .mesh,
+        .geom = geom_b,
+        .transform = transform_b,
+    };
+
+    const gjk_result = gjk_mod.gjk(&shape_a, &shape_b);
+    if (!gjk_result.intersect) return null;
+
+    const epa_result = gjk_mod.epa(&shape_a, &shape_b, &gjk_result) orelse return null;
+
+    const contact_point = scale(add(epa_result.point_a, epa_result.point_b), 0.5);
+
+    return ContactResult{
+        .point = contact_point,
+        .normal = epa_result.normal,
+        .penetration = epa_result.depth,
+        .local_a = sub(epa_result.point_a, transform_a.transformPoint(geom_a.local_pos)),
+        .local_b = sub(epa_result.point_b, transform_b.transformPoint(geom_b.local_pos)),
     };
 }
 

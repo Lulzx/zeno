@@ -362,9 +362,37 @@ fn parseBodyContent(
             } else if (std.mem.eql(u8, token.name, "site")) {
                 const site = parseSite(token.attrs);
                 try body.sites.append(allocator, site);
+            } else if (std.mem.eql(u8, token.name, "inertial")) {
+                body.inertial = parseInertial(token.attrs);
             }
         }
     }
+}
+
+fn parseInertial(attrs: []const u8) schema.MjcfInertial {
+    var inertial = schema.MjcfInertial{};
+
+    if (getAttr(attrs, "mass")) |v| {
+        inertial.mass = parseFloat(v) orelse 1.0;
+    }
+
+    if (getAttr(attrs, "pos")) |v| {
+        inertial.pos = parseVec3(v) orelse .{ 0, 0, 0 };
+    }
+
+    if (getAttr(attrs, "quat")) |v| {
+        inertial.quat = parseQuat(v) orelse .{ 1, 0, 0, 0 };
+    }
+
+    if (getAttr(attrs, "diaginertia")) |v| {
+        inertial.diaginertia = parseVec3(v);
+    }
+
+    if (getAttr(attrs, "fullinertia")) |v| {
+        inertial.fullinertia = parseVec6(v);
+    }
+
+    return inertial;
 }
 
 fn parseJoint(attrs: []const u8) schema.MjcfJoint {
@@ -911,6 +939,9 @@ fn processBody(
             body_type = .dynamic;
         }
 
+        // Compute mass and inertia
+        const mass_inertia = computeBodyMassInertia(child);
+
         // Add body to scene
         const body_id = try scene.addBody(.{
             .name = child.name,
@@ -918,13 +949,14 @@ fn processBody(
             .body_type = body_type,
             .position = pos,
             .quaternion = body_quat,
-            // TODO: parse mass/inertia
+            .mass = mass_inertia.mass,
+            .inertia = mass_inertia.inertia,
         });
         
         // If implicit fixed joint needed
         if (!has_joints and parent_id >= 0) {
              _ = try scene.addJoint(.{
-                 .name = "fixed_link",
+                 .name = "",
                  .joint_type = .fixed,
                  .parent_body = @intCast(parent_id),
                  .child_body = body_id,
@@ -990,6 +1022,194 @@ fn processBody(
         // Recursively process children
         try processBody(allocator, scene, child, @intCast(body_id), body_index, pos, body_quat);
     }
+}
+
+const MassInertia = struct {
+    mass: f32,
+    inertia: [3]f32,
+};
+
+/// Compute the mass and inertia tensor for a body.
+/// If an explicit <inertial> element is present, use that.
+/// Otherwise, compute composite inertia from attached geoms using
+/// the parallel axis theorem.
+fn computeBodyMassInertia(body: *const schema.MjcfBody) MassInertia {
+    // Case 1: Explicit inertial element
+    if (body.inertial) |inertial| {
+        const diag = inertial.diaginertia orelse blk: {
+            // If fullinertia is specified, extract diagonal
+            if (inertial.fullinertia) |full| {
+                break :blk [3]f32{ full[0], full[1], full[2] };
+            }
+            // No inertia specified; estimate from mass as a small sphere
+            const r: f32 = 0.05;
+            const i = 0.4 * inertial.mass * r * r;
+            break :blk [3]f32{ i, i, i };
+        };
+        return .{ .mass = inertial.mass, .inertia = diag };
+    }
+
+    // Case 2: No geoms - return default
+    if (body.geoms.items.len == 0) {
+        return .{ .mass = 1.0, .inertia = .{ 0, 0, 0 } };
+    }
+
+    // Case 3: Compute composite inertia from geoms
+    var total_mass: f32 = 0;
+    var total_inertia: [3]f32 = .{ 0, 0, 0 };
+
+    for (body.geoms.items) |geom| {
+        const geom_mass = geomMass(&geom);
+        const geom_inertia = geomInertia(&geom, geom_mass);
+
+        // Parallel axis theorem: I_total = I_cm + m * d^2
+        // where d is the distance from the body origin to the geom center
+        const d = geom.pos;
+        const d_sq: [3]f32 = .{ d[0] * d[0], d[1] * d[1], d[2] * d[2] };
+        // For diagonal inertia with parallel axis theorem:
+        // Ixx += Ixx_cm + m*(dy^2 + dz^2)
+        // Iyy += Iyy_cm + m*(dx^2 + dz^2)
+        // Izz += Izz_cm + m*(dx^2 + dy^2)
+        total_inertia[0] += geom_inertia[0] + geom_mass * (d_sq[1] + d_sq[2]);
+        total_inertia[1] += geom_inertia[1] + geom_mass * (d_sq[0] + d_sq[2]);
+        total_inertia[2] += geom_inertia[2] + geom_mass * (d_sq[0] + d_sq[1]);
+
+        total_mass += geom_mass;
+    }
+
+    if (total_mass <= 0) {
+        total_mass = 1.0;
+    }
+
+    return .{ .mass = total_mass, .inertia = total_inertia };
+}
+
+/// Compute the mass of a single geom from its mass attribute or density * volume.
+fn geomMass(geom: *const schema.MjcfGeom) f32 {
+    // Explicit mass takes priority
+    if (geom.mass) |m| return m;
+
+    // Otherwise compute from density * volume
+    const volume = geomVolume(geom);
+    return geom.density * volume;
+}
+
+/// Compute the volume of a geom based on its type and size.
+fn geomVolume(geom: *const schema.MjcfGeom) f32 {
+    const pi: f32 = std.math.pi;
+
+    return switch (geom.geom_type) {
+        .sphere => (4.0 / 3.0) * pi * geom.size[0] * geom.size[0] * geom.size[0],
+        .box => 8.0 * geom.size[0] * geom.size[1] * geom.size[2],
+        .capsule => blk: {
+            const r = geom.size[0];
+            var half_len = geom.size[1];
+            if (geom.fromto) |fromto| {
+                const dx = fromto[3] - fromto[0];
+                const dy = fromto[4] - fromto[1];
+                const dz = fromto[5] - fromto[2];
+                half_len = @sqrt(dx * dx + dy * dy + dz * dz) * 0.5;
+            }
+            // Cylinder part + two hemisphere caps (= one full sphere)
+            const cyl_vol = pi * r * r * (2.0 * half_len);
+            const sphere_vol = (4.0 / 3.0) * pi * r * r * r;
+            break :blk cyl_vol + sphere_vol;
+        },
+        .cylinder => blk: {
+            const r = geom.size[0];
+            var half_len = geom.size[1];
+            if (geom.fromto) |fromto| {
+                const dx = fromto[3] - fromto[0];
+                const dy = fromto[4] - fromto[1];
+                const dz = fromto[5] - fromto[2];
+                half_len = @sqrt(dx * dx + dy * dy + dz * dz) * 0.5;
+            }
+            break :blk pi * r * r * (2.0 * half_len);
+        },
+        .plane => 1.0, // Planes have no meaningful volume; use density as mass
+        .mesh => blk: {
+            // Approximate mesh volume as a sphere with radius from size
+            const r = geom.size[0];
+            break :blk (4.0 / 3.0) * pi * r * r * r;
+        },
+        .hfield => 1.0,
+    };
+}
+
+/// Compute the diagonal inertia tensor of a geom about its own center of mass.
+fn geomInertia(geom: *const schema.MjcfGeom, mass: f32) [3]f32 {
+    return switch (geom.geom_type) {
+        .sphere => blk: {
+            const r = geom.size[0];
+            const i = 0.4 * mass * r * r;
+            break :blk .{ i, i, i };
+        },
+        .box => blk: {
+            const m12 = mass / 12.0;
+            const sx = geom.size[0] * 2.0;
+            const sy = geom.size[1] * 2.0;
+            const sz = geom.size[2] * 2.0;
+            break :blk .{
+                m12 * (sy * sy + sz * sz),
+                m12 * (sx * sx + sz * sz),
+                m12 * (sx * sx + sy * sy),
+            };
+        },
+        .capsule => blk: {
+            const r = geom.size[0];
+            var half_len = geom.size[1];
+            if (geom.fromto) |fromto| {
+                const dx = fromto[3] - fromto[0];
+                const dy = fromto[4] - fromto[1];
+                const dz = fromto[5] - fromto[2];
+                half_len = @sqrt(dx * dx + dy * dy + dz * dz) * 0.5;
+            }
+            const r2 = r * r;
+            const h = 2.0 * half_len;
+            const h2 = h * h;
+            // Distribute mass between cylinder and hemisphere caps
+            const total_h = h + (4.0 / 3.0) * r;
+            const m_cyl = if (total_h > 0) mass * h / total_h else mass;
+            const m_hem = (mass - m_cyl) * 0.5;
+            // Cylinder inertia
+            const i_cyl_axial = 0.5 * m_cyl * r2;
+            const i_cyl_trans = m_cyl * (3.0 * r2 + h2) / 12.0;
+            // Hemisphere inertia + parallel axis
+            const i_hem = 0.4 * m_hem * r2;
+            const offset = h * 0.5 + 3.0 / 8.0 * r;
+            const i_hem_trans = i_hem + m_hem * offset * offset;
+            break :blk .{
+                i_cyl_trans + 2.0 * i_hem_trans,
+                i_cyl_trans + 2.0 * i_hem_trans,
+                i_cyl_axial + 2.0 * i_hem,
+            };
+        },
+        .cylinder => blk: {
+            const r = geom.size[0];
+            var half_len = geom.size[1];
+            if (geom.fromto) |fromto| {
+                const dx = fromto[3] - fromto[0];
+                const dy = fromto[4] - fromto[1];
+                const dz = fromto[5] - fromto[2];
+                half_len = @sqrt(dx * dx + dy * dy + dz * dz) * 0.5;
+            }
+            const r2 = r * r;
+            const h = 2.0 * half_len;
+            break :blk .{
+                mass * (3.0 * r2 + h * h) / 12.0,
+                mass * (3.0 * r2 + h * h) / 12.0,
+                0.5 * mass * r2,
+            };
+        },
+        .plane => .{ 0, 0, 0 },
+        .mesh => blk: {
+            // Approximate as sphere
+            const r = geom.size[0];
+            const i = 0.4 * mass * r * r;
+            break :blk .{ i, i, i };
+        },
+        .hfield => .{ 0, 0, 0 },
+    };
 }
 
 fn convertGeom(mjcf_geom: *const schema.MjcfGeom) primitives.Geom {
