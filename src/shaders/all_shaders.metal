@@ -375,7 +375,7 @@ kernel void compute_forces(
     float3 gravity = float3(params.gravity_x, params.gravity_y, params.gravity_z);
     float3 force = gravity * mass;
 
-    forces[gid] = float4(forces[gid].xyz + force, 0);
+    forces[gid] = float4(force, 0);
 
     // Gravitational torque from COM offset.
     // When the body frame origin differs from the center of mass,
@@ -384,7 +384,7 @@ kernel void compute_forces(
     float3 com_local = body_data[body_id].com_offset.xyz;
     float3 com_world = rotate_by_quat(com_local, quaternions[gid]);
     float3 grav_torque = cross(com_world, force);
-    torques[gid] = float4(torques[gid].xyz + grav_torque, 0);
+    torques[gid] = float4(grav_torque, 0);
 }
 
 // ============================================================================

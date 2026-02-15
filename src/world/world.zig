@@ -613,32 +613,22 @@ pub const World = struct {
         const dt = self.config.timestep / @as(f32, @floatFromInt(@max(actual_substeps, 1)));
         self.params.dt = dt;
         self.params_buffer.getSlice(SimParams)[0] = self.params;
-        const inv_dt: f32 = if (dt > 0) 1.0 / dt else 0.0;
 
         var step_profile: ProfilingDataRaw = .{};
         const profile_enabled = self.config.enable_profiling;
         const step_start = if (profile_enabled) nowNanos() else 0;
 
+        // Snapshot pre-step velocities ONCE for acceleration computation over the full step.
+        const prev_vel = self.state.prev_velocities_buffer.getAlignedSlice([4]f32, 16);
+        const vel_before = self.state.getVelocities();
+        @memcpy(prev_vel, vel_before);
+
+        // ONE command buffer for ALL substeps — single GPU submission.
+        var cmd = try CommandBuffer.init(self.device.command_queue);
+
         for (0..actual_substeps) |_| {
-            // Snapshot pre-step velocities for acceleration computation.
-            const prev_vel = self.state.prev_velocities_buffer.getAlignedSlice([4]f32, 16);
-            const vel_before = self.state.getVelocities();
-            @memcpy(prev_vel, vel_before);
-
             var substep_profile: ProfilingDataRaw = .{};
-            try self.stepOnce(if (profile_enabled) &substep_profile else null);
-
-            // a = (v_t - v_{t-1}) / dt
-            const vel_after = self.state.getVelocities();
-            const acc = self.state.getAccelerations();
-            for (0..vel_after.len) |i| {
-                acc[i] = .{
-                    (vel_after[i][0] - prev_vel[i][0]) * inv_dt,
-                    (vel_after[i][1] - prev_vel[i][1]) * inv_dt,
-                    (vel_after[i][2] - prev_vel[i][2]) * inv_dt,
-                    0,
-                };
-            }
+            try self.stepOnce(&cmd, if (profile_enabled) &substep_profile else null);
 
             if (profile_enabled) {
                 step_profile.integrate_ns += substep_profile.integrate_ns;
@@ -646,6 +636,21 @@ pub const World = struct {
                 step_profile.collision_narrow_ns += substep_profile.collision_narrow_ns;
                 step_profile.constraint_solve_ns += substep_profile.constraint_solve_ns;
             }
+        }
+
+        cmd.commitAndWait(); // Single GPU-CPU round-trip for all substeps
+
+        // Compute acceleration ONCE from total velocity change over the full step.
+        const inv_step: f32 = if (self.config.timestep > 0) 1.0 / self.config.timestep else 0.0;
+        const vel_after = self.state.getVelocities();
+        const acc = self.state.getAccelerations();
+        for (0..vel_after.len) |i| {
+            acc[i] = .{
+                (vel_after[i][0] - prev_vel[i][0]) * inv_step,
+                (vel_after[i][1] - prev_vel[i][1]) * inv_step,
+                (vel_after[i][2] - prev_vel[i][2]) * inv_step,
+                0,
+            };
         }
 
         if (profile_enabled) {
@@ -807,8 +812,8 @@ pub const World = struct {
     }
 
     /// Execute one physics substep.
-    fn stepOnce(self: *World, profile: ?*ProfilingDataRaw) !void {
-        var cmd = try CommandBuffer.init(self.device.command_queue);
+    /// Encodes all GPU work into the provided command buffer without committing.
+    fn stepOnce(self: *World, cmd: *CommandBuffer, profile: ?*ProfilingDataRaw) !void {
 
         // Stage 0a: Warm start constraints from previous frame's lambda values
         if (self.num_constraints_per_env > 0) {
@@ -840,43 +845,9 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_actuators);
         }
 
-        // Stage 1.5: Apply joint forces (convert joint torques to body torques)
-        if (self.params.num_joints > 0) {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
-
-            const pipeline = try self.pipelines.getPipeline("apply_joint_forces");
-            encoder.setPipeline(pipeline);
-            encoder.setBuffer(&self.state.torques_buffer, 0, 0);
-            encoder.setBuffer(&self.state.joint_torques_buffer, 0, 1);
-            encoder.setBuffer(&self.joint_data_buffer, 0, 2);
-            encoder.setBuffer(&self.state.quaternions_buffer, 0, 3);
-            encoder.setBuffer(&self.params_buffer, 0, 4);
-            encoder.setBuffer(&self.state.forces_buffer, 0, 5);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_joints);
-        }
-
-        // Stage 2: Forward kinematics
-        // Disabled: We use maximal coordinates + constraints
-
-        // Stage 2.5: Update kinematic bodies
-        // Kinematic bodies follow their velocities but aren't affected by forces
-        {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
-
-            const pipeline = try self.pipelines.getPipeline("update_kinematic");
-            encoder.setPipeline(pipeline);
-            encoder.setBuffer(&self.state.positions_buffer, 0, 0);
-            encoder.setBuffer(&self.state.velocities_buffer, 0, 1);
-            encoder.setBuffer(&self.state.quaternions_buffer, 0, 2);
-            encoder.setBuffer(&self.state.angular_velocities_buffer, 0, 3);
-            encoder.setBuffer(&self.body_data_buffer, 0, 4);
-            encoder.setBuffer(&self.params_buffer, 0, 5);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
-        }
-
-        // Stage 3: Compute forces
+        // Stage 2: Compute forces (overwrites forces/torques with gravity)
+        // Runs before apply_joint_forces so it can overwrite instead of accumulate,
+        // eliminating the need to zero buffers between substeps.
         {
             var encoder = try cmd.computeEncoder();
             defer encoder.endEncoding();
@@ -892,6 +863,40 @@ pub const World = struct {
             encoder.setBuffer(&self.params_buffer, 0, 6);
             encoder.setBuffer(&self.state.quaternions_buffer, 0, 7);
             encoder.setBuffer(&self.body_data_buffer, 0, 8);
+            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
+        }
+
+        // Stage 2.5: Apply joint forces (convert joint torques to body forces/torques)
+        // Accumulates on top of gravity forces written by compute_forces via atomic_add_float.
+        if (self.params.num_joints > 0) {
+            var encoder = try cmd.computeEncoder();
+            defer encoder.endEncoding();
+
+            const pipeline = try self.pipelines.getPipeline("apply_joint_forces");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.torques_buffer, 0, 0);
+            encoder.setBuffer(&self.state.joint_torques_buffer, 0, 1);
+            encoder.setBuffer(&self.joint_data_buffer, 0, 2);
+            encoder.setBuffer(&self.state.quaternions_buffer, 0, 3);
+            encoder.setBuffer(&self.params_buffer, 0, 4);
+            encoder.setBuffer(&self.state.forces_buffer, 0, 5);
+            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_joints);
+        }
+
+        // Stage 2.7: Update kinematic bodies
+        // Kinematic bodies follow their velocities but aren't affected by forces
+        {
+            var encoder = try cmd.computeEncoder();
+            defer encoder.endEncoding();
+
+            const pipeline = try self.pipelines.getPipeline("update_kinematic");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.positions_buffer, 0, 0);
+            encoder.setBuffer(&self.state.velocities_buffer, 0, 1);
+            encoder.setBuffer(&self.state.quaternions_buffer, 0, 2);
+            encoder.setBuffer(&self.state.angular_velocities_buffer, 0, 3);
+            encoder.setBuffer(&self.body_data_buffer, 0, 4);
+            encoder.setBuffer(&self.params_buffer, 0, 5);
             encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
         }
 
@@ -1138,12 +1143,6 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.num_constraints_per_env);
         }
 
-        // Execute and wait
-        cmd.commitAndWait();
-
-        // Clear forces for next step
-        try self.state.forces_buffer.zero();
-        try self.state.torques_buffer.zero();
     }
 
     /// Reset specific environments.
