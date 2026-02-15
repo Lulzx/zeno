@@ -661,7 +661,7 @@ kernel void broad_phase_detect(
 
                 uint ncid = uint(nc.x) + uint(nc.y) * grid.grid_dim_x + uint(nc.z) * grid.grid_dim_x * grid.grid_dim_y;
                 uint start = cell_offsets[env_cell_base + ncid];
-                uint end = start + cell_counts[env_cell_base + ncid];
+                uint end = start + atomic_load_explicit(&cell_counts[env_cell_base + ncid], memory_order_relaxed);
 
                 for (uint s = start; s < end; s++) {
                     uint other = sorted_geoms[env_geom_base + s];
