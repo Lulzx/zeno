@@ -1,0 +1,21 @@
+{
+  "name": "formation_circle",
+  "description": "64 agents form a circle formation with radius 10m",
+  "num_agents": 64,
+  "config": {
+    "communication_range": 5.0,
+    "max_neighbors": 32,
+    "max_messages_per_step": 4,
+    "max_message_bytes": 48,
+    "grid_cell_size": 5.0,
+    "latency_ticks": 0,
+    "drop_prob": 0.0
+  },
+  "layout": "grid",
+  "spacing": 0.5,
+  "task": {
+    "type": "formation",
+    "params": [0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  },
+  "attack": null
+}

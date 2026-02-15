@@ -217,7 +217,12 @@ ffi.cdef("""
         float grid_cell_size;
         uint64_t seed;
         bool enable_physics;
-        uint8_t _pad[7];
+        uint32_t latency_ticks;
+        float drop_prob;
+        uint32_t max_broadcast_recipients;
+        uint32_t max_inbox_per_agent;
+        bool strict_determinism;
+        uint8_t _pad[2];
     } ZenoSwarmConfig;
 
     typedef struct {
@@ -228,6 +233,10 @@ ffi.cdef("""
         uint32_t bytes_sent;
         uint32_t total_edges;
         float avg_neighbors;
+        uint32_t messages_dropped;
+        float convergence_time_ms;
+        uint32_t near_miss_count;
+        float task_success;
         uint32_t _pad;
     } ZenoSwarmMetrics;
 
@@ -239,6 +248,29 @@ ffi.cdef("""
         float local_state[4];
     } ZenoAgentState;
 
+    typedef struct {
+        float score;
+        bool complete;
+        uint8_t _pad1[3];
+        float detail[4];
+    } ZenoTaskResult;
+
+    typedef struct {
+        uint32_t attack_type;
+        float intensity;
+        uint32_t target_agents[16];
+        uint32_t num_targets;
+        uint32_t seed;
+        uint32_t _pad[2];
+    } ZenoAttackConfig;
+
+    typedef struct {
+        uint64_t frame_count;
+        uint64_t total_bytes;
+        bool recording;
+        uint8_t _pad[7];
+    } ZenoReplayStats;
+
     // Swarm lifecycle
     ZenoSwarmHandle zeno_swarm_create(ZenoWorldHandle world, const ZenoSwarmConfig* config);
     void zeno_swarm_destroy(ZenoSwarmHandle swarm);
@@ -249,6 +281,23 @@ ffi.cdef("""
     ZenoAgentState* zeno_swarm_get_agent_states(ZenoSwarmHandle swarm);
     int zeno_swarm_get_neighbor_counts(ZenoSwarmHandle swarm, uint32_t* out, uint32_t count);
     void zeno_swarm_set_body_offset(ZenoSwarmHandle swarm, uint32_t offset);
+
+    // Task evaluation
+    int zeno_swarm_evaluate_task(ZenoSwarmHandle swarm, void* world,
+                                 uint32_t task_type, const float params[8],
+                                 ZenoTaskResult* result);
+
+    // Attack simulation
+    int zeno_swarm_apply_attack(ZenoSwarmHandle swarm, const ZenoAttackConfig* config);
+
+    // Graph access (zero-copy)
+    uint32_t* zeno_swarm_get_neighbor_index_ptr(ZenoSwarmHandle swarm);
+    uint32_t* zeno_swarm_get_neighbor_row_ptr(ZenoSwarmHandle swarm);
+
+    // Replay recording
+    int zeno_swarm_start_recording(ZenoSwarmHandle swarm);
+    int zeno_swarm_stop_recording(ZenoSwarmHandle swarm);
+    int zeno_swarm_get_replay_stats(ZenoSwarmHandle swarm, ZenoReplayStats* stats);
 """)
 
 

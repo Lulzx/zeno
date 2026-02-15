@@ -45,6 +45,10 @@ pub const swarm = struct {
     pub const policy_mod = @import("swarm/policy.zig");
     pub const dispatcher = @import("swarm/dispatcher.zig");
     pub const swarm_mod = @import("swarm/swarm.zig");
+    pub const metrics = @import("swarm/metrics.zig");
+    pub const tasks = @import("swarm/tasks.zig");
+    pub const attacks = @import("swarm/attacks.zig");
+    pub const replay = @import("swarm/replay.zig");
 };
 
 // Re-exports for convenience
@@ -56,6 +60,9 @@ pub const Swarm = swarm.swarm_mod.Swarm;
 pub const SwarmConfig = swarm.types.SwarmConfig;
 pub const SwarmMetrics = swarm.types.SwarmMetrics;
 pub const AgentState = swarm.types.AgentState;
+pub const TaskResult = swarm.types.TaskResult;
+pub const AttackConfig = swarm.types.AttackConfig;
+pub const ReplayStats = swarm.types.ReplayStats;
 
 // ============================================================================
 // C ABI Types
@@ -737,6 +744,9 @@ pub const ZenoSwarmHandle = ?*anyopaque;
 pub const ZenoSwarmConfig = swarm.types.SwarmConfig;
 pub const ZenoSwarmMetrics = swarm.types.SwarmMetrics;
 pub const ZenoAgentState = swarm.types.AgentState;
+pub const ZenoTaskResult = swarm.types.TaskResult;
+pub const ZenoAttackConfig = swarm.types.AttackConfig;
+pub const ZenoReplayStats = swarm.types.ReplayStats;
 
 // ============================================================================
 // Swarm C ABI Functions
@@ -825,6 +835,78 @@ export fn zeno_swarm_set_body_offset(handle: ZenoSwarmHandle, offset: u32) void 
     if (handle == null) return;
     const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
     swarm_ptr.setBodyOffset(offset);
+}
+
+/// Evaluate a task objective.
+export fn zeno_swarm_evaluate_task(
+    handle: ZenoSwarmHandle,
+    world_handle: ZenoWorldHandle,
+    task_type: u32,
+    params: *const [8]f32,
+    result: *ZenoTaskResult,
+) ZenoError {
+    if (handle == null or world_handle == null) return .invalid_handle;
+
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    const world_ptr: *World = @ptrCast(@alignCast(world_handle));
+
+    const positions = world_ptr.state.getPositions();
+    const velocities = world_ptr.state.getVelocities();
+
+    const tt = std.meta.intToEnum(swarm.tasks.TaskType, task_type) catch return .invalid_argument;
+    result.* = swarm_ptr.evaluateTask(tt, positions, velocities, params.*);
+    return .success;
+}
+
+/// Apply an adversarial attack to the swarm.
+export fn zeno_swarm_apply_attack(
+    handle: ZenoSwarmHandle,
+    config: *const ZenoAttackConfig,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    swarm_ptr.setAttack(config.*);
+    return .success;
+}
+
+/// Get raw pointer to CSR neighbor_ids for zero-copy Python access.
+export fn zeno_swarm_get_neighbor_index_ptr(handle: ZenoSwarmHandle) ?[*]u32 {
+    if (handle == null) return null;
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    if (swarm_ptr.graph.neighbor_ids.len == 0) return null;
+    return swarm_ptr.graph.neighbor_ids.ptr;
+}
+
+/// Get raw pointer to CSR row_ptr for zero-copy Python access.
+export fn zeno_swarm_get_neighbor_row_ptr(handle: ZenoSwarmHandle) ?[*]u32 {
+    if (handle == null) return null;
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    if (swarm_ptr.graph.row_ptr.len == 0) return null;
+    return swarm_ptr.graph.row_ptr.ptr;
+}
+
+/// Start recording replay frames.
+export fn zeno_swarm_start_recording(handle: ZenoSwarmHandle) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    swarm_ptr.startRecording();
+    return .success;
+}
+
+/// Stop recording replay frames.
+export fn zeno_swarm_stop_recording(handle: ZenoSwarmHandle) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    swarm_ptr.stopRecording();
+    return .success;
+}
+
+/// Get replay statistics.
+export fn zeno_swarm_get_replay_stats(handle: ZenoSwarmHandle, out: *ZenoReplayStats) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    out.* = swarm_ptr.getReplayStats();
+    return .success;
 }
 
 // ============================================================================

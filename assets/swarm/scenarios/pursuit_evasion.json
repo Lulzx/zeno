@@ -1,0 +1,21 @@
+{
+  "name": "pursuit_evasion",
+  "description": "32 pursuers chase 8 evaders with 1.5m capture radius",
+  "num_agents": 40,
+  "config": {
+    "communication_range": 8.0,
+    "max_neighbors": 32,
+    "max_messages_per_step": 4,
+    "max_message_bytes": 48,
+    "grid_cell_size": 8.0,
+    "latency_ticks": 0,
+    "drop_prob": 0.0
+  },
+  "layout": "grid",
+  "spacing": 1.0,
+  "task": {
+    "type": "pursuit",
+    "params": [32.0, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  },
+  "attack": null
+}

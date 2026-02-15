@@ -1,0 +1,27 @@
+{
+  "name": "byzantine_resilience",
+  "description": "100 agents with 10% Byzantine adversaries corrupting messages",
+  "num_agents": 100,
+  "config": {
+    "communication_range": 5.0,
+    "max_neighbors": 32,
+    "max_messages_per_step": 4,
+    "max_message_bytes": 48,
+    "grid_cell_size": 5.0,
+    "latency_ticks": 1,
+    "drop_prob": 0.02
+  },
+  "layout": "grid",
+  "spacing": 0.4,
+  "task": {
+    "type": "formation",
+    "params": [0.0, 0.0, 15.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  },
+  "attack": {
+    "type": "byzantine",
+    "intensity": 0.1,
+    "target_agents": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    "num_targets": 10,
+    "seed": 42
+  }
+}

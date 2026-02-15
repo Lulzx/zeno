@@ -19,8 +19,18 @@ pub const SwarmConfig = extern struct {
     seed: u64 = 42,
     /// Whether to run physics (disable for pure communication tests).
     enable_physics: bool = true,
-    /// Padding for alignment.
-    _pad: [7]u8 = .{0} ** 7,
+    /// Messages delayed N steps before delivery (0 = instant).
+    latency_ticks: u32 = 0,
+    /// Probability [0,1] of dropping a message.
+    drop_prob: f32 = 0.0,
+    /// Cap on broadcast fan-out (0xFFFFFFFF = unlimited).
+    max_broadcast_recipients: u32 = 0xFFFFFFFF,
+    /// Per-agent inbox limit (0 = use max_messages_per_step).
+    max_inbox_per_agent: u32 = 0,
+    /// If true, use step_count as RNG seed for dropout determinism.
+    strict_determinism: bool = true,
+    /// Padding for C ABI alignment.
+    _pad: [2]u8 = .{0} ** 2,
 };
 
 /// Per-agent state (extern, GPU-compatible, 32 bytes).
@@ -69,6 +79,57 @@ pub const SwarmMetrics = extern struct {
     total_edges: u32 = 0,
     /// Average neighbors per agent.
     avg_neighbors: f32 = 0,
+    /// Messages lost to dropout/jamming.
+    messages_dropped: u32 = 0,
+    /// Time to reach task objective (ms).
+    convergence_time_ms: f32 = 0,
+    /// Agents within 2x collision radius but not colliding.
+    near_miss_count: u32 = 0,
+    /// Latest task score.
+    task_success: f32 = 0,
     /// Padding.
     _pad: u32 = 0,
+};
+
+/// Task evaluation result.
+pub const TaskResult = extern struct {
+    /// Normalized success score [0, 1].
+    score: f32 = 0,
+    /// Whether the task objective is met.
+    complete: bool = false,
+    /// Padding for alignment after bool.
+    _pad1: [3]u8 = .{0} ** 3,
+    /// Task-specific detail values.
+    detail: [4]f32 = .{0} ** 4,
+};
+
+/// Attack type for adversarial perturbations.
+pub const AttackType = enum(u32) {
+    none = 0,
+    jamming = 1,
+    dropout = 2,
+    byzantine = 3,
+    partition = 4,
+};
+
+/// Configuration for attack simulation.
+pub const AttackConfig = extern struct {
+    attack_type: AttackType = .none,
+    /// Severity [0, 1].
+    intensity: f32 = 0.0,
+    /// Affected agent IDs.
+    target_agents: [16]u32 = .{0} ** 16,
+    /// Number of targeted agents.
+    num_targets: u32 = 0,
+    /// Random seed for deterministic attacks.
+    seed: u32 = 0,
+    _pad: [2]u32 = .{0} ** 2,
+};
+
+/// Stats returned from replay recorder.
+pub const ReplayStats = extern struct {
+    frame_count: u64 = 0,
+    total_bytes: u64 = 0,
+    recording: bool = false,
+    _pad: [7]u8 = .{0} ** 7,
 };

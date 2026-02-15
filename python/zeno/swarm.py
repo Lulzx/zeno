@@ -7,7 +7,7 @@ enabling multi-agent simulations with communication and neighbor detection.
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 
 import numpy as np
 
@@ -25,6 +25,11 @@ class SwarmConfig:
     grid_cell_size: float = 10.0
     seed: int = 42
     enable_physics: bool = True
+    latency_ticks: int = 0
+    drop_prob: float = 0.0
+    max_broadcast_recipients: int = 0xFFFFFFFF
+    max_inbox_per_agent: int = 0
+    strict_determinism: bool = True
 
 
 @dataclass
@@ -37,6 +42,42 @@ class SwarmMetrics:
     bytes_sent: int = 0
     total_edges: int = 0
     avg_neighbors: float = 0.0
+    messages_dropped: int = 0
+    convergence_time_ms: float = 0.0
+    near_miss_count: int = 0
+    task_success: float = 0.0
+
+
+@dataclass
+class TaskResult:
+    """Result from a task evaluation."""
+    score: float = 0.0
+    complete: bool = False
+    detail: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+
+
+@dataclass
+class ReplayStats:
+    """Statistics from the replay recorder."""
+    frame_count: int = 0
+    total_bytes: int = 0
+    recording: bool = False
+
+
+TASK_TYPES = {
+    "formation": 0,
+    "coverage": 1,
+    "pursuit": 2,
+    "tracking": 3,
+}
+
+ATTACK_TYPES = {
+    "none": 0,
+    "jamming": 1,
+    "dropout": 2,
+    "byzantine": 3,
+    "partition": 4,
+}
 
 
 class ZenoSwarm:
@@ -72,6 +113,11 @@ class ZenoSwarm:
         c_config.grid_cell_size = config.grid_cell_size
         c_config.seed = config.seed
         c_config.enable_physics = config.enable_physics
+        c_config.latency_ticks = config.latency_ticks
+        c_config.drop_prob = config.drop_prob
+        c_config.max_broadcast_recipients = config.max_broadcast_recipients
+        c_config.max_inbox_per_agent = config.max_inbox_per_agent
+        c_config.strict_determinism = config.strict_determinism
 
         self._handle = _lib.zeno_swarm_create(world._handle, c_config)
         if self._handle == ffi.NULL:
@@ -118,6 +164,10 @@ class ZenoSwarm:
             bytes_sent=c_metrics.bytes_sent,
             total_edges=c_metrics.total_edges,
             avg_neighbors=c_metrics.avg_neighbors,
+            messages_dropped=c_metrics.messages_dropped,
+            convergence_time_ms=c_metrics.convergence_time_ms,
+            near_miss_count=c_metrics.near_miss_count,
+            task_success=c_metrics.task_success,
         )
 
     def get_neighbor_counts(self) -> np.ndarray:
@@ -130,6 +180,117 @@ class ZenoSwarm:
     def set_body_offset(self, offset: int) -> None:
         """Set the body offset for agent bodies."""
         _lib.zeno_swarm_set_body_offset(self._handle, offset)
+
+    def evaluate_task(self, task_type: str, **params) -> TaskResult:
+        """
+        Evaluate a cooperative task objective.
+
+        Parameters
+        ----------
+        task_type : str
+            One of: "formation", "coverage", "pursuit", "tracking".
+        **params : float
+            Task-specific parameters. See docs for each task type.
+
+        Returns
+        -------
+        TaskResult
+            Score and completion status.
+        """
+        if task_type not in TASK_TYPES:
+            raise ValueError(f"Unknown task type: {task_type}. Must be one of {list(TASK_TYPES)}")
+
+        # Build params array from kwargs
+        param_names = {
+            "formation": ["center_x", "center_y", "target_radius", "formation_type"],
+            "coverage": ["x_min", "y_min", "x_max", "y_max", "cell_size"],
+            "pursuit": ["num_pursuers", "capture_radius"],
+            "tracking": ["target_x", "target_y", "target_z", "track_radius"],
+        }
+
+        param_arr = [0.0] * 8
+        for i, name in enumerate(param_names.get(task_type, [])):
+            if name in params:
+                param_arr[i] = float(params[name])
+
+        c_params = ffi.new("float[8]", param_arr)
+        c_result = ffi.new("ZenoTaskResult*")
+
+        result = _lib.zeno_swarm_evaluate_task(
+            self._handle, self._world._handle,
+            TASK_TYPES[task_type], c_params, c_result
+        )
+        if result != 0:
+            raise RuntimeError(f"Task evaluation failed with error code {result}")
+
+        return TaskResult(
+            score=c_result.score,
+            complete=bool(c_result.complete),
+            detail=(c_result.detail[0], c_result.detail[1],
+                    c_result.detail[2], c_result.detail[3]),
+        )
+
+    def apply_attack(
+        self,
+        attack_type: str,
+        intensity: float = 0.0,
+        target_agents: Optional[list] = None,
+        seed: int = 0,
+    ) -> None:
+        """
+        Apply an adversarial attack to the swarm.
+
+        Parameters
+        ----------
+        attack_type : str
+            One of: "none", "jamming", "dropout", "byzantine", "partition".
+        intensity : float
+            Attack severity [0, 1].
+        target_agents : list[int], optional
+            Agent IDs to target (max 16).
+        seed : int
+            Random seed for deterministic attacks.
+        """
+        if attack_type not in ATTACK_TYPES:
+            raise ValueError(f"Unknown attack type: {attack_type}. Must be one of {list(ATTACK_TYPES)}")
+
+        c_config = ffi.new("ZenoAttackConfig*")
+        c_config.attack_type = ATTACK_TYPES[attack_type]
+        c_config.intensity = intensity
+        c_config.seed = seed
+
+        if target_agents:
+            c_config.num_targets = min(len(target_agents), 16)
+            for i in range(c_config.num_targets):
+                c_config.target_agents[i] = target_agents[i]
+
+        result = _lib.zeno_swarm_apply_attack(self._handle, c_config)
+        if result != 0:
+            raise RuntimeError(f"Attack application failed with error code {result}")
+
+    def start_recording(self) -> None:
+        """Start recording replay frames."""
+        result = _lib.zeno_swarm_start_recording(self._handle)
+        if result != 0:
+            raise RuntimeError(f"Start recording failed with error code {result}")
+
+    def stop_recording(self) -> None:
+        """Stop recording replay frames."""
+        result = _lib.zeno_swarm_stop_recording(self._handle)
+        if result != 0:
+            raise RuntimeError(f"Stop recording failed with error code {result}")
+
+    def get_replay_stats(self) -> ReplayStats:
+        """Get replay recorder statistics."""
+        c_stats = ffi.new("ZenoReplayStats*")
+        result = _lib.zeno_swarm_get_replay_stats(self._handle, c_stats)
+        if result != 0:
+            raise RuntimeError(f"Get replay stats failed with error code {result}")
+        return ReplayStats(
+            frame_count=c_stats.frame_count,
+            total_bytes=c_stats.total_bytes,
+            recording=bool(c_stats.recording),
+        )
 
 
 def create_swarm_world(
