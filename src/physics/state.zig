@@ -14,6 +14,7 @@ pub const State = struct {
     // Buffer handles
     positions_buffer: Buffer,
     velocities_buffer: Buffer,
+    accelerations_buffer: Buffer,
     angular_velocities_buffer: Buffer,
     quaternions_buffer: Buffer,
     forces_buffer: Buffer,
@@ -33,6 +34,11 @@ pub const State = struct {
     contact_counts_buffer: Buffer,
 
     rng_state_buffer: Buffer,
+
+    // XPBD previous state (for velocity update after constraint solving)
+    prev_positions_buffer: Buffer,
+    prev_quaternions_buffer: Buffer,
+    prev_velocities_buffer: Buffer,
 
     // Dimensions
     num_envs: u32,
@@ -69,6 +75,7 @@ pub const State = struct {
             // Body state (float4 aligned)
             .positions_buffer = try Buffer.init(device, body_count * 16, opts),
             .velocities_buffer = try Buffer.init(device, body_count * 16, opts),
+            .accelerations_buffer = try Buffer.init(device, body_count * 16, opts),
             .angular_velocities_buffer = try Buffer.init(device, body_count * 16, opts),
             .quaternions_buffer = try Buffer.init(device, body_count * 16, opts),
             .forces_buffer = try Buffer.init(device, body_count * 16, opts),
@@ -92,6 +99,11 @@ pub const State = struct {
 
             // RNG state (xoroshiro128+)
             .rng_state_buffer = try Buffer.init(device, num_envs * 16, opts),
+
+            // XPBD previous state
+            .prev_positions_buffer = try Buffer.init(device, body_count * 16, opts),
+            .prev_quaternions_buffer = try Buffer.init(device, body_count * 16, opts),
+            .prev_velocities_buffer = try Buffer.init(device, body_count * 16, opts),
 
             .num_envs = num_envs,
             .num_bodies = num_bodies,
@@ -117,6 +129,11 @@ pub const State = struct {
     /// Get velocities as a slice (zero-copy).
     pub fn getVelocities(self: *State) [][4]f32 {
         return self.velocities_buffer.getAlignedSlice([4]f32, 16);
+    }
+
+    /// Get linear accelerations as a slice (zero-copy).
+    pub fn getAccelerations(self: *State) [][4]f32 {
+        return self.accelerations_buffer.getAlignedSlice([4]f32, 16);
     }
 
     /// Get angular velocities as a slice (zero-copy).
@@ -226,6 +243,7 @@ pub const State = struct {
     pub fn zero(self: *State) !void {
         try self.positions_buffer.zero();
         try self.velocities_buffer.zero();
+        try self.accelerations_buffer.zero();
         try self.angular_velocities_buffer.zero();
         try self.quaternions_buffer.zero();
         try self.forces_buffer.zero();
@@ -242,6 +260,7 @@ pub const State = struct {
 
         try self.contacts_buffer.zero();
         try self.contact_counts_buffer.zero();
+        try self.prev_velocities_buffer.zero();
     }
 
     /// Copy state from one environment to another.
@@ -274,6 +293,7 @@ pub const State = struct {
     pub fn memoryUsage(self: *const State) usize {
         return self.positions_buffer.size +
             self.velocities_buffer.size +
+            self.accelerations_buffer.size +
             self.angular_velocities_buffer.size +
             self.quaternions_buffer.size +
             self.forces_buffer.size +
@@ -288,13 +308,17 @@ pub const State = struct {
             self.dones_buffer.size +
             self.contacts_buffer.size +
             self.contact_counts_buffer.size +
-            self.rng_state_buffer.size;
+            self.rng_state_buffer.size +
+            self.prev_positions_buffer.size +
+            self.prev_quaternions_buffer.size +
+            self.prev_velocities_buffer.size;
     }
 
     /// Release all buffers.
     pub fn deinit(self: *State) void {
         self.positions_buffer.deinit();
         self.velocities_buffer.deinit();
+        self.accelerations_buffer.deinit();
         self.angular_velocities_buffer.deinit();
         self.quaternions_buffer.deinit();
         self.forces_buffer.deinit();
@@ -314,6 +338,10 @@ pub const State = struct {
         self.contact_counts_buffer.deinit();
 
         self.rng_state_buffer.deinit();
+
+        self.prev_positions_buffer.deinit();
+        self.prev_quaternions_buffer.deinit();
+        self.prev_velocities_buffer.deinit();
     }
 };
 

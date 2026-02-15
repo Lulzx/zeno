@@ -446,7 +446,40 @@ class TestMultiEnvBatching:
 
 
 # ===================================================================
-# 5. Reset Masking
+# 5.5 Subset Stepping
+# ===================================================================
+
+class TestSubsetStepping:
+    """Step only selected environments."""
+
+    def test_step_subset_only_updates_masked_envs(self):
+        _skip_if_no_lib()
+        from zeno._ffi import ZenoWorld
+
+        num_envs = 4
+        world = ZenoWorld(mjcf_string=PENDULUM_MJCF, num_envs=num_envs)
+        world.reset()
+
+        state_before = world.get_body_positions(zero_copy=False)
+        actions = np.ones((num_envs, world.action_dim), dtype=np.float32)
+        mask = np.array([1, 0, 1, 0], dtype=np.uint8)
+
+        for _ in range(20):
+            world.step_subset(actions, mask)
+
+        state_after = world.get_body_positions(zero_copy=False)
+
+        # Masked envs should evolve.
+        assert not np.array_equal(state_before[0], state_after[0])
+        assert not np.array_equal(state_before[2], state_after[2])
+
+        # Unmasked envs should remain exactly unchanged.
+        np.testing.assert_array_equal(state_before[1], state_after[1])
+        np.testing.assert_array_equal(state_before[3], state_after[3])
+
+
+# ===================================================================
+# 6. Reset Masking
 # ===================================================================
 
 class TestResetMasking:
@@ -533,7 +566,7 @@ class TestResetMasking:
 
 
 # ===================================================================
-# 6. Action Clamping
+# 7. Action Clamping
 # ===================================================================
 
 class TestActionClamping:
@@ -619,7 +652,7 @@ class TestActionClamping:
 
 
 # ===================================================================
-# 7. All Environments
+# 8. All Environments
 # ===================================================================
 
 class TestAllEnvironments:
@@ -669,7 +702,7 @@ class TestAllEnvironments:
 
 
 # ===================================================================
-# 8. State Checkpointing
+# 9. State Checkpointing
 # ===================================================================
 
 class TestStateCheckpointing:
@@ -709,7 +742,7 @@ class TestStateCheckpointing:
 
 
 # ===================================================================
-# 9. Gravity and Timestep Mutation
+# 10. Gravity and Timestep Mutation
 # ===================================================================
 
 class TestWorldMutation:
@@ -755,7 +788,39 @@ class TestWorldMutation:
 
 
 # ===================================================================
-# 10. Profiling API
+# 11. Acceleration and Sensor API
+# ===================================================================
+
+class TestAdditionalStateAPI:
+    """Validate acceleration and sensor data accessors."""
+
+    def test_body_accelerations_shape(self):
+        _skip_if_no_lib()
+        from zeno._ffi import ZenoWorld
+
+        world = ZenoWorld(mjcf_string=PENDULUM_MJCF, num_envs=2)
+        world.reset()
+
+        actions = np.ones((2, world.action_dim), dtype=np.float32)
+        world.step(actions)
+
+        acc = world.get_body_accelerations()
+        assert acc.shape == (2, world.num_bodies, 4)
+        assert np.all(np.isfinite(acc))
+
+    def test_sensor_data_shape_matches_observation_dim(self):
+        _skip_if_no_lib()
+        from zeno._ffi import ZenoWorld
+
+        world = ZenoWorld(mjcf_string=PENDULUM_MJCF, num_envs=3)
+        world.reset()
+
+        sensor_data = world.get_sensor_data()
+        assert sensor_data.shape == (3, world.obs_dim)
+
+
+# ===================================================================
+# 12. Profiling API
 # ===================================================================
 
 class TestProfilingAPI:

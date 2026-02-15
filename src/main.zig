@@ -54,11 +54,15 @@ pub const ZenoWorldHandle = ?*anyopaque;
 /// Configuration for world creation.
 pub const ZenoConfig = extern struct {
     num_envs: u32 = 1,
-    timestep: f32 = 0.002,
+    timestep: f32 = 0, // 0 = use MJCF timestep
     contact_iterations: u32 = 4,
     max_contacts_per_env: u32 = 64,
     seed: u64 = 42,
     substeps: u32 = 1,
+    enable_profiling: bool = false,
+    max_bodies_per_env: u32 = 0,
+    max_joints_per_env: u32 = 0,
+    max_geoms_per_env: u32 = 0,
 };
 
 /// World information.
@@ -67,10 +71,25 @@ pub const ZenoInfo = extern struct {
     num_bodies: u32,
     num_joints: u32,
     num_actuators: u32,
+    num_sensors: u32,
+    num_geoms: u32,
     obs_dim: u32,
     action_dim: u32,
     timestep: f32,
     memory_usage: u64,
+    gpu_memory_usage: u64,
+    metal_available: bool,
+};
+
+/// Per-step profiling data.
+pub const ZenoProfilingData = extern struct {
+    integrate_ns: f32 = 0,
+    collision_broad_ns: f32 = 0,
+    collision_narrow_ns: f32 = 0,
+    constraint_solve_ns: f32 = 0,
+    total_step_ns: f32 = 0,
+    num_contacts: u32 = 0,
+    num_active_constraints: u32 = 0,
 };
 
 /// Error codes.
@@ -82,10 +101,15 @@ pub const ZenoError = enum(i32) {
     metal_error = -4,
     out_of_memory = -5,
     invalid_argument = -6,
+    not_implemented = -7,
 };
 
 // Global allocator for C API
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+
+fn uploadParams(world_ptr: *World) void {
+    world_ptr.params_buffer.getSlice(world.world_mod.SimParams)[0] = world_ptr.params;
+}
 
 // ============================================================================
 // C ABI Functions
@@ -105,14 +129,18 @@ export fn zeno_world_create(
         return null;
     };
 
+    // Resolve timestep: use MJCF value if config doesn't specify one
+    const timestep = if (config.timestep > 0) config.timestep else scene.physics_config.timestep;
+
     // Create world config
     const world_config = WorldConfig{
         .num_envs = config.num_envs,
-        .timestep = config.timestep,
+        .timestep = timestep,
         .contact_iterations = config.contact_iterations,
         .max_contacts_per_env = config.max_contacts_per_env,
         .seed = config.seed,
         .substeps = config.substeps,
+        .enable_profiling = config.enable_profiling,
     };
 
     // Create world
@@ -141,13 +169,17 @@ export fn zeno_world_create_from_string(
         return null;
     };
 
+    // Resolve timestep: use MJCF value if config doesn't specify one
+    const timestep = if (config.timestep > 0) config.timestep else scene.physics_config.timestep;
+
     const world_config = WorldConfig{
         .num_envs = config.num_envs,
-        .timestep = config.timestep,
+        .timestep = timestep,
         .contact_iterations = config.contact_iterations,
         .max_contacts_per_env = config.max_contacts_per_env,
         .seed = config.seed,
         .substeps = config.substeps,
+        .enable_profiling = config.enable_profiling,
     };
 
     const world_ptr = allocator.create(World) catch {
@@ -191,6 +223,30 @@ export fn zeno_world_step(
     return .success;
 }
 
+/// Step only a subset of environments.
+export fn zeno_world_step_subset(
+    handle: ZenoWorldHandle,
+    actions: [*]const f32,
+    env_mask: [*]const u8,
+    substeps: u32,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    const action_count = world_ptr.config.num_envs * world_ptr.params.num_actuators;
+    const actions_slice = actions[0..action_count];
+    const mask_slice = env_mask[0..world_ptr.config.num_envs];
+
+    world_ptr.stepSubset(actions_slice, mask_slice, substeps) catch |err| {
+        return switch (err) {
+            error.InvalidSize => .invalid_argument,
+            else => .metal_error,
+        };
+    };
+
+    return .success;
+}
+
 /// Reset environments.
 export fn zeno_world_reset(
     handle: ZenoWorldHandle,
@@ -207,6 +263,104 @@ export fn zeno_world_reset(
         world_ptr.reset(null);
     }
 
+    return .success;
+}
+
+/// Reset environments to externally provided state.
+export fn zeno_world_reset_to_state(
+    handle: ZenoWorldHandle,
+    positions: [*]const f32,
+    quaternions: [*]const f32,
+    velocities: ?[*]const f32,
+    angular_velocities: ?[*]const f32,
+    env_mask: ?[*]const u8,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    const num_envs: usize = @intCast(world_ptr.config.num_envs);
+    const num_bodies: usize = @intCast(world_ptr.params.num_bodies);
+    const total_floats = num_envs * num_bodies * 4;
+
+    const pos_slice = positions[0..total_floats];
+    var mask_slice: ?[]const u8 = null;
+    if (env_mask) |m| {
+        mask_slice = m[0..num_envs];
+    }
+
+    world_ptr.setBodyPositions(pos_slice, mask_slice) catch {
+        return .invalid_argument;
+    };
+
+    const quat_slice = quaternions[0..total_floats];
+    const quat_dest = world_ptr.state.getQuaternions();
+    if (mask_slice) |mask| {
+        for (mask, 0..) |should_set, env_id| {
+            if (should_set != 0) {
+                for (0..num_bodies) |b| {
+                    const idx = env_id * num_bodies + b;
+                    const base = idx * 4;
+                    quat_dest[idx] = .{
+                        quat_slice[base + 0],
+                        quat_slice[base + 1],
+                        quat_slice[base + 2],
+                        quat_slice[base + 3],
+                    };
+                }
+            }
+        }
+    } else {
+        for (0..quat_dest.len) |idx| {
+            const base = idx * 4;
+            quat_dest[idx] = .{
+                quat_slice[base + 0],
+                quat_slice[base + 1],
+                quat_slice[base + 2],
+                quat_slice[base + 3],
+            };
+        }
+    }
+
+    if (velocities) |vel_ptr| {
+        const vel_slice = vel_ptr[0..total_floats];
+        world_ptr.setBodyVelocities(vel_slice, mask_slice) catch {
+            return .invalid_argument;
+        };
+    }
+
+    if (angular_velocities) |ang_ptr| {
+        const ang_slice = ang_ptr[0..total_floats];
+        const ang_dest = world_ptr.state.getAngularVelocities();
+
+        if (mask_slice) |mask| {
+            for (mask, 0..) |should_set, env_id| {
+                if (should_set != 0) {
+                    for (0..num_bodies) |b| {
+                        const idx = env_id * num_bodies + b;
+                        const base = idx * 4;
+                        ang_dest[idx] = .{
+                            ang_slice[base + 0],
+                            ang_slice[base + 1],
+                            ang_slice[base + 2],
+                            ang_slice[base + 3],
+                        };
+                    }
+                }
+            }
+        } else {
+            for (0..ang_dest.len) |idx| {
+                const base = idx * 4;
+                ang_dest[idx] = .{
+                    ang_slice[base + 0],
+                    ang_slice[base + 1],
+                    ang_slice[base + 2],
+                    ang_slice[base + 3],
+                };
+            }
+        }
+    }
+
+    world_ptr.state.contact_counts_buffer.zero() catch {};
     return .success;
 }
 
@@ -242,6 +396,30 @@ export fn zeno_world_num_envs(handle: ZenoWorldHandle) u32 {
     return world_ptr.config.num_envs;
 }
 
+/// Get number of bodies per environment.
+export fn zeno_world_num_bodies(handle: ZenoWorldHandle) u32 {
+    if (handle == null) return 0;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.params.num_bodies;
+}
+
+/// Get number of joints per environment.
+export fn zeno_world_num_joints(handle: ZenoWorldHandle) u32 {
+    if (handle == null) return 0;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.params.num_joints;
+}
+
+/// Get number of sensors per environment.
+export fn zeno_world_num_sensors(handle: ZenoWorldHandle) u32 {
+    if (handle == null) return 0;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.params.num_sensors;
+}
+
 /// Get observation dimension.
 export fn zeno_world_obs_dim(handle: ZenoWorldHandle) u32 {
     if (handle == null) return 0;
@@ -270,10 +448,14 @@ export fn zeno_world_get_info(handle: ZenoWorldHandle, info: *ZenoInfo) ZenoErro
         .num_bodies = world_info.num_bodies,
         .num_joints = world_info.num_joints,
         .num_actuators = world_info.num_actuators,
+        .num_sensors = world_info.num_sensors,
+        .num_geoms = world_info.num_geoms,
         .obs_dim = world_info.obs_dim,
         .action_dim = world_info.action_dim,
         .timestep = world_info.timestep,
         .memory_usage = @intCast(world_info.memory_usage),
+        .gpu_memory_usage = @intCast(world_info.memory_usage),
+        .metal_available = true,
     };
 
     return .success;
@@ -317,6 +499,14 @@ export fn zeno_world_get_body_angular_velocities(handle: ZenoWorldHandle) ?[*]f3
     return world_ptr.getBodyAngularVelocitiesPtr();
 }
 
+/// Get body accelerations.
+export fn zeno_world_get_body_accelerations(handle: ZenoWorldHandle) ?[*]f32 {
+    if (handle == null) return null;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.getBodyAccelerationsPtr();
+}
+
 /// Get joint positions.
 export fn zeno_world_get_joint_positions(handle: ZenoWorldHandle) ?[*]f32 {
     if (handle == null) return null;
@@ -331,6 +521,16 @@ export fn zeno_world_get_joint_velocities(handle: ZenoWorldHandle) ?[*]f32 {
 
     const world_ptr: *World = @ptrCast(@alignCast(handle));
     return world_ptr.getJointVelocitiesPtr();
+}
+
+/// Get joint forces/torques.
+export fn zeno_world_get_joint_forces(handle: ZenoWorldHandle) ?[*]f32 {
+    if (handle == null) return null;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    const slice = world_ptr.state.joint_torques_buffer.getSlice(f32);
+    if (slice.len == 0) return null;
+    return slice.ptr;
 }
 
 /// Get contact counts.
@@ -367,10 +567,10 @@ export fn zeno_world_set_body_positions(
 
     const world_ptr: *World = @ptrCast(@alignCast(handle));
     const total_floats = world_ptr.config.num_envs * world_ptr.params.num_bodies * 4;
-    
+
     // Create slice from pointer
     const pos_slice = positions[0..total_floats];
-    
+
     // Create mask slice if present
     var mask_slice: ?[]const u8 = null;
     if (env_mask) |m| {
@@ -394,9 +594,9 @@ export fn zeno_world_set_body_velocities(
 
     const world_ptr: *World = @ptrCast(@alignCast(handle));
     const total_floats = world_ptr.config.num_envs * world_ptr.params.num_bodies * 4;
-    
+
     const vel_slice = velocities[0..total_floats];
-    
+
     var mask_slice: ?[]const u8 = null;
     if (env_mask) |m| {
         mask_slice = m[0..world_ptr.config.num_envs];
@@ -407,6 +607,94 @@ export fn zeno_world_set_body_velocities(
     };
 
     return .success;
+}
+
+/// Set gravity vector at runtime.
+export fn zeno_world_set_gravity(
+    handle: ZenoWorldHandle,
+    gx: f32,
+    gy: f32,
+    gz: f32,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    world_ptr.params.gravity_x = gx;
+    world_ptr.params.gravity_y = gy;
+    world_ptr.params.gravity_z = gz;
+    uploadParams(world_ptr);
+    return .success;
+}
+
+/// Set world timestep at runtime.
+export fn zeno_world_set_timestep(
+    handle: ZenoWorldHandle,
+    timestep: f32,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+    if (timestep <= 0) return .invalid_argument;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    world_ptr.config.timestep = timestep;
+    const substeps = @max(world_ptr.config.substeps, 1);
+    world_ptr.params.dt = timestep / @as(f32, @floatFromInt(substeps));
+    uploadParams(world_ptr);
+    return .success;
+}
+
+/// Get profiling data for the most recent step.
+export fn zeno_world_get_profiling(
+    handle: ZenoWorldHandle,
+    data: *ZenoProfilingData,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    const profiling = world_ptr.getProfilingData();
+    data.* = .{
+        .integrate_ns = profiling.integrate_ns,
+        .collision_broad_ns = profiling.collision_broad_ns,
+        .collision_narrow_ns = profiling.collision_narrow_ns,
+        .constraint_solve_ns = profiling.constraint_solve_ns,
+        .total_step_ns = profiling.total_step_ns,
+        .num_contacts = profiling.num_contacts,
+        .num_active_constraints = profiling.num_active_constraints,
+    };
+    return .success;
+}
+
+/// Reset profiling counters.
+export fn zeno_world_reset_profiling(handle: ZenoWorldHandle) void {
+    if (handle == null) return;
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    world_ptr.resetProfiling();
+}
+
+/// Get approximate memory usage in bytes.
+export fn zeno_world_memory_usage(handle: ZenoWorldHandle) u64 {
+    if (handle == null) return 0;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return @intCast(world_ptr.state.memoryUsage());
+}
+
+/// Hint memory compaction (currently no-op).
+export fn zeno_world_compact_memory(handle: ZenoWorldHandle) void {
+    _ = handle;
+}
+
+/// Convert error code to human-readable string.
+export fn zeno_error_string(error_code: i32) [*:0]const u8 {
+    return switch (error_code) {
+        0 => "success",
+        -1 => "invalid handle",
+        -2 => "file not found",
+        -3 => "parse error",
+        -4 => "metal error",
+        -5 => "out of memory",
+        -6 => "invalid argument",
+        -7 => "not implemented",
+        else => "unknown error",
+    };
 }
 
 /// Get library version.

@@ -41,6 +41,8 @@ pub const ConstraintType = enum(u8) {
     connect = 8,
     /// Joint equality constraint
     joint_equality = 9,
+    /// Slider constraint (prismatic: constrain perpendicular translation, free along axis)
+    slider = 10,
 };
 
 /// GPU-optimized XPBD constraint data.

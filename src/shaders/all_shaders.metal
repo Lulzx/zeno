@@ -30,7 +30,7 @@ struct SimParams {
     uint target_color;      // For constraint graph coloring (solve_joints)
     uint num_constraints;   // Total constraints to process
     uint constraint_offset; // Offset into constraint buffer for current color
-    uint _padding;          // Alignment padding
+    uint obs_dim;           // Observation dimension per environment
 };
 
 struct BodyData {
@@ -38,6 +38,7 @@ struct BodyData {
     float4 quaternion;
     float4 inv_mass_inertia;
     float4 params;
+    float4 com_offset;   // center of mass offset from body frame origin (local coords)
 };
 
 struct JointData {
@@ -124,51 +125,67 @@ kernel void apply_joint_forces(
     device const JointData* joints [[buffer(2)]],
     device const float4* quaternions [[buffer(3)]],
     constant SimParams& params [[buffer(4)]],
+    device float4* forces [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint env_id = gid / params.num_joints;
     uint joint_id = gid % params.num_joints;
-    
+
     if (env_id >= params.num_envs) return;
-    
+
     uint joint_idx = gid;
     JointData joint = joints[joint_id];
-    
-    float applied_torque = joint_torques[joint_idx];
-    
-    // Add damping? (Missing joint_velocities input here, skip for now or add later)
-    
-    if (abs(applied_torque) < 1e-6) return;
-    
+
+    float applied_force = joint_torques[joint_idx];
+
+    if (abs(applied_force) < 1e-6) return;
+
+    uint joint_type = uint(joint.params.x);
     uint body_a = uint(joint.params.y);
     uint body_b = uint(joint.params.z);
-    
+
     uint idx_a = env_id * params.num_bodies + body_a;
     uint idx_b = env_id * params.num_bodies + body_b;
-    
+
     float4 q_a = quaternions[idx_a];
-    
-    // Joint axis is in parent frame?
-    // JointData.axis
+
     float3 axis_local = joint.axis.xyz;
     float3 axis_world = rotate_by_quat(axis_local, q_a);
-    
-    float3 torque_world = axis_world * applied_torque;
-    
-    // Apply to parent (Reaction)
-    if (body_a > 0) { // Skip world
-         device float* ptr = (device float*)&torques[idx_a];
-         atomic_add_float(ptr + 0, -torque_world.x);
-         atomic_add_float(ptr + 1, -torque_world.y);
-         atomic_add_float(ptr + 2, -torque_world.z);
-    }
-    
-    // Apply to child (Action)
-    if (body_b > 0) {
-         device float* ptr = (device float*)&torques[idx_b];
-         atomic_add_float(ptr + 0, torque_world.x);
-         atomic_add_float(ptr + 1, torque_world.y);
-         atomic_add_float(ptr + 2, torque_world.z);
+
+    if (joint_type == 2) {
+        // Prismatic/slide joint: apply linear force along axis
+        float3 force_world = axis_world * applied_force;
+
+        if (body_a > 0) {
+            device float* ptr = (device float*)&forces[idx_a];
+            atomic_add_float(ptr + 0, -force_world.x);
+            atomic_add_float(ptr + 1, -force_world.y);
+            atomic_add_float(ptr + 2, -force_world.z);
+        }
+
+        if (body_b > 0) {
+            device float* ptr = (device float*)&forces[idx_b];
+            atomic_add_float(ptr + 0, force_world.x);
+            atomic_add_float(ptr + 1, force_world.y);
+            atomic_add_float(ptr + 2, force_world.z);
+        }
+    } else {
+        // Revolute/hinge and other joints: apply torque
+        float3 torque_world = axis_world * applied_force;
+
+        if (body_a > 0) {
+            device float* ptr = (device float*)&torques[idx_a];
+            atomic_add_float(ptr + 0, -torque_world.x);
+            atomic_add_float(ptr + 1, -torque_world.y);
+            atomic_add_float(ptr + 2, -torque_world.z);
+        }
+
+        if (body_b > 0) {
+            device float* ptr = (device float*)&torques[idx_b];
+            atomic_add_float(ptr + 0, torque_world.x);
+            atomic_add_float(ptr + 1, torque_world.y);
+            atomic_add_float(ptr + 2, torque_world.z);
+        }
     }
 }
 
@@ -333,6 +350,8 @@ kernel void compute_forces(
     device const float* joint_torques [[buffer(4)]],
     device const float4* inv_mass_inertia [[buffer(5)]],
     constant SimParams& params [[buffer(6)]],
+    device const float4* quaternions [[buffer(7)]],
+    device const BodyData* body_data [[buffer(8)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint env_id = gid / params.num_bodies;
@@ -352,13 +371,20 @@ kernel void compute_forces(
 
     float mass = 1.0 / inv_mass;
 
-    // Gravity
+    // Gravity (add to existing forces from apply_joint_forces for prismatic joints)
     float3 gravity = float3(params.gravity_x, params.gravity_y, params.gravity_z);
     float3 force = gravity * mass;
 
-    forces[gid] = float4(force, 0);
-    // Note: torques buffer already contains actuator torques from apply_joint_forces.
-    // Do not zero it here — the buffer is cleared at the end of each step.
+    forces[gid] = float4(forces[gid].xyz + force, 0);
+
+    // Gravitational torque from COM offset.
+    // When the body frame origin differs from the center of mass,
+    // gravity acting at the COM creates a torque about the body origin:
+    // τ = r_com_world × (m * g)
+    float3 com_local = body_data[body_id].com_offset.xyz;
+    float3 com_world = rotate_by_quat(com_local, quaternions[gid]);
+    float3 grav_torque = cross(com_world, force);
+    torques[gid] = float4(torques[gid].xyz + grav_torque, 0);
 }
 
 // ============================================================================
@@ -660,6 +686,7 @@ kernel void solve_joints(
     device XPBDConstraint* constraints [[buffer(4)]],
     device const float4* inv_mass_inertia [[buffer(5)]],
     constant SimParams& params [[buffer(6)]],
+    device const BodyData* body_data [[buffer(7)]],
     uint gid [[thread_position_in_grid]]
 ) {
     // Graph coloring dispatch: each color group is dispatched separately
@@ -694,7 +721,7 @@ kernel void solve_joints(
     uint type = type_and_color & 0xFF;  // Lower 8 bits = type
 
     // Skip if invalid/padding
-    if (type > 9) return;
+    if (type > 10) return;
 
     uint body_a = c.indices.x;
     uint body_b = c.indices.y;
@@ -730,46 +757,49 @@ kernel void solve_joints(
     if (type == 2) { // positional
         float3 r_a = rotate_by_quat(c.anchor_a.xyz, quat_a);
         float3 r_b = rotate_by_quat(c.anchor_b.xyz, quat_b);
-        
+
         float3 diff = (pos_a + r_a) - (pos_b + r_b);
         C = length(diff);
-        
+
         if (C > 1e-6) {
              float3 n = diff / C;
-             // For positional, gradient is n
-             // We implement simple PBD position update for now (ignoring rotation effect on mass for simplicity first, 
-             // but XPBD requires generalized inverse mass w).
-             // w = inv_mass_a + inv_mass_b + (r_a x n) I_a^-1 (r_a x n) ...
-             
-             // Compute generalized inverse mass
+
+             // Generalized inverse mass uses body-origin offsets (r_a, r_b)
+             // because these determine how rotation affects the constraint point.
              float3 rn_a = cross(r_a, n);
              float3 rn_b = cross(r_b, n);
-             
+
              float w_a = inv_mass_a + dot(rn_a * inv_mi_a.yzw, rn_a);
              float w_b = inv_mass_b + dot(rn_b * inv_mi_b.yzw, rn_b);
              float w = w_a + w_b;
-             
+
              // XPBD Update
              float lambda_prev = c.state.x;
              float d_lambda = (-C - alpha_tilde * lambda_prev) / (w + alpha_tilde);
-             
+
              c.state.x = lambda_prev + d_lambda; // Update accumulated lambda
-             
+
              float3 impulse = d_lambda * n;
-             
+
+             // Angular corrections use COM-relative offsets (rc_a, rc_b)
+             // to create the correct inertial torque about the COM.
+             // This is needed when body origin != COM.
+             float3 com_a = body_data[body_a].com_offset.xyz;
+             float3 com_b = body_data[body_b].com_offset.xyz;
+             float3 rc_a = r_a - rotate_by_quat(com_a, quat_a);
+             float3 rc_b = r_b - rotate_by_quat(com_b, quat_b);
+
              if (inv_mass_a > 0) {
                  positions[idx_a].xyz += impulse * inv_mass_a;
-                 // Orientation update: dq = 0.5 * (r x p) * q
-                 // p is impulse. Torque-like term is r x p.
-                 float3 ang_impulse = cross(r_a, impulse);
+                 float3 ang_impulse = cross(rc_a, impulse);
                  float3 d_omega = ang_impulse * inv_mi_a.yzw;
                  float4 dq = quat_multiply(float4(d_omega, 0), quat_a) * 0.5;
                  quaternions[idx_a] = quat_normalize(quat_a + dq);
              }
-             
+
              if (inv_mass_b > 0) {
                  positions[idx_b].xyz -= impulse * inv_mass_b;
-                 float3 ang_impulse = cross(r_b, impulse);
+                 float3 ang_impulse = cross(rc_b, impulse);
                  float3 d_omega = ang_impulse * inv_mi_b.yzw;
                  float4 dq = quat_multiply(float4(d_omega, 0), quat_b) * 0.5;
                  quaternions[idx_b] = quat_normalize(quat_b - dq);
@@ -778,31 +808,27 @@ kernel void solve_joints(
     }
     // --- Weld Constraint (Positional + Angular) ---
     else if (type == 7) { // weld
-        // 1. Positional part
+        // Weld corrections are applied only to body_b (child).
+        // Correcting body_a (parent) causes instability when body_a has other
+        // constraints (e.g., hinge): the weld and hinge corrections fight each
+        // other, injecting energy through the XPBD velocity update.
+        // body_b passively follows body_a's motion.
+
+        // 1. Positional part: keep body_b's anchor at body_a's anchor
         float3 r_a = rotate_by_quat(c.anchor_a.xyz, quat_a);
         float3 r_b = rotate_by_quat(c.anchor_b.xyz, quat_b);
         float3 diff = (pos_a + r_a) - (pos_b + r_b);
         C = length(diff);
-        
+
         if (C > 1e-6) {
              float3 n = diff / C;
-             float3 rn_a = cross(r_a, n);
              float3 rn_b = cross(r_b, n);
-             float w_a = inv_mass_a + dot(rn_a * inv_mi_a.yzw, rn_a);
              float w_b = inv_mass_b + dot(rn_b * inv_mi_b.yzw, rn_b);
-             float w = w_a + w_b;
-             
-             float d_lambda = (-C) / (w + alpha_tilde); // Simplified (no accumulation for now)
-             float3 impulse = d_lambda * n;
-             
-             if (inv_mass_a > 0) {
-                 positions[idx_a].xyz += impulse * inv_mass_a;
-                 float3 ang_impulse = cross(r_a, impulse);
-                 float3 d_omega = ang_impulse * inv_mi_a.yzw;
-                 float4 dq = quat_multiply(float4(d_omega, 0), quat_a) * 0.5;
-                 quaternions[idx_a] = quat_normalize(quat_a + dq);
-             }
-             if (inv_mass_b > 0) {
+
+             if (w_b > 1e-8) {
+                 float d_lambda = (-C) / (w_b + alpha_tilde);
+                 float3 impulse = d_lambda * n;
+
                  positions[idx_b].xyz -= impulse * inv_mass_b;
                  float3 ang_impulse = cross(r_b, impulse);
                  float3 d_omega = ang_impulse * inv_mi_b.yzw;
@@ -850,21 +876,21 @@ kernel void solve_joints(
             float3 axis_world = rotate_by_quat(axis_rel, quat_a_upd);
 
             // Generalized inverse mass for angular constraint
-            float w_a = dot(axis_world * inv_mi_a.yzw, axis_world);
+            // Only body_b contributes — body_a's quaternion is left untouched
+            // to prevent angular corrections from contaminating the parent body's
+            // free DOFs (e.g., hinge axis rotation).
             float w_b = dot(axis_world * inv_mi_b.yzw, axis_world);
-            float w = w_a + w_b;
 
-            if (w > 1e-8) {
-                // XPBD angular correction
-                float d_lambda_ang = (-angle) / (w + alpha_tilde);
+            if (w_b > 1e-8) {
+                // XPBD angular correction (applied only to body_b)
+                // Sign: +angle (not -angle) because q_err axis points in the
+                // direction of body_b's excess rotation. The body_b update uses
+                // (q_b - dq), so a positive d_lambda produces a positive d_omega
+                // along the axis, and subtracting the resulting dq rotates body_b
+                // in the -axis direction (i.e., back toward the target).
+                float d_lambda_ang = (angle) / (w_b + alpha_tilde);
                 float3 ang_impulse = d_lambda_ang * axis_world;
 
-                // Apply equal and opposite angular corrections
-                if (inv_mass_a > 0) {
-                    float3 d_omega = ang_impulse * inv_mi_a.yzw;
-                    float4 dq = quat_multiply(float4(d_omega, 0), quat_a_upd) * 0.5;
-                    quaternions[idx_a] = quat_normalize(quat_a_upd + dq);
-                }
                 if (inv_mass_b > 0) {
                     float3 d_omega = ang_impulse * inv_mi_b.yzw;
                     float4 dq = quat_multiply(float4(d_omega, 0), quat_b_upd) * 0.5;
@@ -909,26 +935,22 @@ kernel void solve_joints(
             float w = w_a + w_b;
 
             if (w > 1e-8) {
-                // XPBD correction: λ = -C / (w + α)
-                // We want to rotate A toward B and B toward A
-                // n = cross(axis_a, axis_b) points such that rotating a around n moves it toward b
+                // Standard XPBD angular correction:
+                //   λ = -C / (w + α̃)
+                //   Δθ_a = +λ * I_a⁻¹ * n  (rotate A toward alignment)
+                //   Δθ_b = -λ * I_b⁻¹ * n  (rotate B toward alignment)
+                // The generalized inverse mass w already distributes corrections
+                // proportionally to each body's inverse inertia.
                 float d_lambda = -ang_C / (w + alpha_tilde);
 
-                // Split correction between bodies based on inverse inertia ratio
-                float ratio_a = w_a / w;
-                float ratio_b = w_b / w;
-
-                // Apply angular corrections
-                // Body A rotates in +n direction (toward B's axis)
                 if (inv_mass_a > 0) {
-                    float3 d_omega_a = (-d_lambda * ratio_b) * n * inv_mi_a.yzw;
+                    float3 d_omega_a = d_lambda * n * inv_mi_a.yzw;
                     float4 dq = quat_multiply(float4(d_omega_a, 0), quat_a_curr) * 0.5;
                     quaternions[idx_a] = quat_normalize(quat_a_curr + dq);
                 }
 
-                // Body B rotates in -n direction (toward A's axis)
                 if (inv_mass_b > 0) {
-                    float3 d_omega_b = (d_lambda * ratio_a) * n * inv_mi_b.yzw;
+                    float3 d_omega_b = -d_lambda * n * inv_mi_b.yzw;
                     float4 dq = quat_multiply(float4(d_omega_b, 0), quat_b_curr) * 0.5;
                     quaternions[idx_b] = quat_normalize(quat_b_curr + dq);
                 }
@@ -1040,6 +1062,105 @@ kernel void solve_joints(
 
                 if (inv_mass_b > 0) {
                     positions[idx_b].xyz += impulse * inv_mass_b;
+                }
+            }
+        }
+    }
+
+    // --- Slider Constraint (Prismatic: perpendicular positional + angular weld) ---
+    else if (type == 10) { // slider
+        // 1. Perpendicular positional constraint: constrain displacement perpendicular to slide axis
+        float3 r_a = rotate_by_quat(c.anchor_a.xyz, quat_a);
+        float3 r_b = rotate_by_quat(c.anchor_b.xyz, quat_b);
+
+        // diff convention matches positional constraint: A - B
+        float3 diff = (pos_a + r_a) - (pos_b + r_b);
+
+        // Slide axis in world frame (stored in axis_target)
+        float3 axis_local = c.axis_target.xyz;
+        float3 axis_world = rotate_by_quat(axis_local, quat_a);
+
+        // Remove the component along the slide axis (allow free translation along it)
+        float along = dot(diff, axis_world);
+        float3 perp = diff - along * axis_world;
+        float perp_len = length(perp);
+
+        if (perp_len > 1e-6) {
+            float3 n = perp / perp_len;
+
+            float3 rn_a = cross(r_a, n);
+            float3 rn_b = cross(r_b, n);
+
+            float w_a = inv_mass_a + dot(rn_a * inv_mi_a.yzw, rn_a);
+            float w_b = inv_mass_b + dot(rn_b * inv_mi_b.yzw, rn_b);
+            float w = w_a + w_b;
+
+            float d_lambda = (-perp_len) / (w + alpha_tilde);
+            float3 impulse = d_lambda * n;
+
+            if (inv_mass_a > 0) {
+                positions[idx_a].xyz += impulse * inv_mass_a;
+                float3 ang_impulse = cross(r_a, impulse);
+                float3 d_omega = ang_impulse * inv_mi_a.yzw;
+                float4 dq = quat_multiply(float4(d_omega, 0), quat_a) * 0.5;
+                quaternions[idx_a] = quat_normalize(quat_a + dq);
+            }
+
+            if (inv_mass_b > 0) {
+                positions[idx_b].xyz -= impulse * inv_mass_b;
+                float3 ang_impulse = cross(r_b, impulse);
+                float3 d_omega = ang_impulse * inv_mi_b.yzw;
+                float4 dq = quat_multiply(float4(d_omega, 0), quat_b) * 0.5;
+                quaternions[idx_b] = quat_normalize(quat_b - dq);
+            }
+        }
+
+        // 2. Angular weld: lock relative orientation
+        // Reference relative quaternion stored in limits field
+        float4 q_rel_target = float4(c.limits[0], c.limits[1], c.limits[2], c.limits[3]);
+
+        float4 quat_a_upd = quaternions[idx_a];
+        float4 quat_b_upd = quaternions[idx_b];
+
+        float4 q_a_inv = quat_conjugate(quat_a_upd);
+        float4 q_rel = quat_multiply(q_a_inv, quat_b_upd);
+
+        float4 q_target_inv = quat_conjugate(q_rel_target);
+        float4 q_err = quat_multiply(q_rel, q_target_inv);
+
+        if (q_err.w < 0) {
+            q_err = -q_err;
+        }
+
+        float3 q_err_xyz = float3(q_err.x, q_err.y, q_err.z);
+        float sin_half_angle = length(q_err_xyz);
+
+        if (sin_half_angle > 1e-6) {
+            float3 axis_err = q_err_xyz / sin_half_angle;
+            float angle_err = 2.0 * atan2(sin_half_angle, q_err.w);
+            float3 axis_err_world = rotate_by_quat(axis_err, quat_a_upd);
+
+            float w_a = dot(axis_err_world * inv_mi_a.yzw, axis_err_world);
+            float w_b = dot(axis_err_world * inv_mi_b.yzw, axis_err_world);
+            float w = w_a + w_b;
+
+            if (w > 1e-8) {
+                // Sign: +angle_err (not -angle_err) because q_err axis points
+                // in the direction of body_b's excess rotation. With +angle_err,
+                // body_a rotates in +axis direction (catching up) via += dq, and
+                // body_b rotates in -axis direction (going back) via -= dq.
+                float d_lambda_ang = (angle_err) / (w + alpha_tilde);
+                float3 ang_impulse = d_lambda_ang * axis_err_world;
+
+                if (inv_mass_a > 0) {
+                    float3 d_omega = ang_impulse * inv_mi_a.yzw;
+                    float4 dq = quat_multiply(float4(d_omega, 0), quat_a_upd) * 0.5;
+                    quaternions[idx_a] = quat_normalize(quat_a_upd + dq);
+                }
+                if (inv_mass_b > 0) {
+                    float3 d_omega = ang_impulse * inv_mi_b.yzw;
+                    float4 dq = quat_multiply(float4(d_omega, 0), quat_b_upd) * 0.5;
+                    quaternions[idx_b] = quat_normalize(quat_b_upd - dq);
                 }
             }
         }
@@ -1472,7 +1593,7 @@ kernel void read_sensors(
     uint dim = sensor.type_object.z;
     uint output_offset = uint(sensor.params.w);
 
-    uint obs_base = env_id * params.num_sensors; // Simplified - should use total obs dim
+    uint obs_base = env_id * params.obs_dim;
 
     switch (sensor_type) {
         case 0: { // joint_pos
@@ -1540,6 +1661,74 @@ kernel void read_sensors(
         default:
             break;
     }
+}
+
+// ============================================================================
+// XPBD Save Previous State
+// ============================================================================
+// Save positions and quaternions before integration for XPBD velocity update.
+
+kernel void save_prev_state(
+    device const float4* positions [[buffer(0)]],
+    device const float4* quaternions [[buffer(1)]],
+    device float4* prev_positions [[buffer(2)]],
+    device float4* prev_quaternions [[buffer(3)]],
+    constant SimParams& params [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint env_id = gid / params.num_bodies;
+    if (env_id >= params.num_envs) return;
+
+    prev_positions[gid] = positions[gid];
+    prev_quaternions[gid] = quaternions[gid];
+}
+
+// ============================================================================
+// XPBD Velocity Update
+// ============================================================================
+// After constraint solving, derive velocities from position/quaternion changes.
+// v = (x - x_prev) / dt
+// omega = 2 * dq.xyz / dt (from quaternion difference)
+
+kernel void xpbd_update_velocities(
+    device const float4* positions [[buffer(0)]],
+    device float4* velocities [[buffer(1)]],
+    device const float4* quaternions [[buffer(2)]],
+    device float4* angular_velocities [[buffer(3)]],
+    device const float4* prev_positions [[buffer(4)]],
+    device const float4* prev_quaternions [[buffer(5)]],
+    device const float4* inv_mass_inertia [[buffer(6)]],
+    constant SimParams& params [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint env_id = gid / params.num_bodies;
+    if (env_id >= params.num_envs) return;
+
+    float4 inv_mi = inv_mass_inertia[gid];
+    float inv_mass = inv_mi.x;
+
+    // Skip static/kinematic bodies
+    if (inv_mass < 1e-8) return;
+
+    float dt = params.dt;
+    float inv_dt = 1.0 / dt;
+
+    // Linear velocity from position change
+    float3 pos = positions[gid].xyz;
+    float3 prev_pos = prev_positions[gid].xyz;
+    velocities[gid] = float4((pos - prev_pos) * inv_dt, 0);
+
+    // Angular velocity from quaternion change
+    // dq = q * q_prev^-1
+    float4 q = quaternions[gid];
+    float4 q_prev = prev_quaternions[gid];
+    float4 dq = quat_multiply(q, quat_conjugate(q_prev));
+
+    // Ensure positive hemisphere
+    if (dq.w < 0) dq = -dq;
+
+    // omega = 2 * dq.xyz / dt (small angle approximation)
+    angular_velocities[gid] = float4(2.0 * dq.xyz * inv_dt, 0);
 }
 
 // ============================================================================

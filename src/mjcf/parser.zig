@@ -924,18 +924,13 @@ fn processBody(
         // Determine body type
         var body_type: body_mod.BodyType = .dynamic;
         var has_joints = false;
-        
+
         for (child.joints.items) |_| {
             has_joints = true;
             break;
-        } 
-        
-        // If no joints and has parent, it's effectively fixed to parent.
-        // In maximal coordinates, we treat this as a separate dynamic body with a fixed joint.
-        // Unless it has no mass/geom, in which case it might be a marker... but MJCF defaults to dynamic.
+        }
+
         if (!has_joints and parent_id >= 0) {
-            // Check if we should treat as kinematic or fixed dynamic
-            // For now, assume dynamic with fixed joint
             body_type = .dynamic;
         }
 
@@ -951,44 +946,33 @@ fn processBody(
             .quaternion = body_quat,
             .mass = mass_inertia.mass,
             .inertia = mass_inertia.inertia,
+            .com_offset = mass_inertia.com_offset,
         });
-        
+
         // If implicit fixed joint needed
         if (!has_joints and parent_id >= 0) {
-             _ = try scene.addJoint(.{
-                 .name = "",
-                 .joint_type = .fixed,
-                 .parent_body = @intCast(parent_id),
-                 .child_body = body_id,
-                 // Anchors are 0 in local space because 'pos' above accumulates world pos?
-                 // Wait, 'pos' calculated above is world pos (summing parent).
-                 // Bodies are stored in world space in initial state.
-                 // Joint anchors are local.
-                 // If child is at 'pos' and parent at 'parent_pos',
-                 // anchor_parent = local pos of child in parent frame
-                 // anchor_child = 0
-                 
-                 // However, MJCF structure usually implies:
-                 // <body> (pos relative to parent) 
-                 //   <joint> (pos relative to body)
-                 
-                 // Since we don't have the explicit joint tag, the "joint" is implicitly at the body origin.
-                 // So anchor_child = (0,0,0).
-                 // anchor_parent = child.pos (the relative pos from MJCF).
-                 
-                 .anchor_parent = child.pos,
-                 .anchor_child = .{ 0, 0, 0 },
-             });
+            _ = try scene.addJoint(.{
+                .name = "",
+                .joint_type = .fixed,
+                .parent_body = @intCast(parent_id),
+                .child_body = body_id,
+                .anchor_parent = child.pos,
+                .anchor_child = .{ 0, 0, 0 },
+            });
         }
-        
+
         // Process joints
         for (child.joints.items) |mjcf_joint| {
             var joint_def = joint_mod.JointDef{
                 .name = mjcf_joint.name,
                 .parent_body = if (parent_id >= 0) @intCast(parent_id) else 0,
                 .child_body = body_id,
-                .anchor_parent = mjcf_joint.pos,
-                .anchor_child = .{ 0, 0, 0 },
+                .anchor_parent = .{
+                    child.pos[0] + mjcf_joint.pos[0],
+                    child.pos[1] + mjcf_joint.pos[1],
+                    child.pos[2] + mjcf_joint.pos[2],
+                },
+                .anchor_child = mjcf_joint.pos,
                 .axis = mjcf_joint.axis,
                 .damping = mjcf_joint.damping,
                 .stiffness = mjcf_joint.stiffness,
@@ -1027,6 +1011,7 @@ fn processBody(
 const MassInertia = struct {
     mass: f32,
     inertia: [3]f32,
+    com_offset: [3]f32 = .{ 0, 0, 0 },
 };
 
 /// Compute the mass and inertia tensor for a body.
@@ -1057,6 +1042,7 @@ fn computeBodyMassInertia(body: *const schema.MjcfBody) MassInertia {
     // Case 3: Compute composite inertia from geoms
     var total_mass: f32 = 0;
     var total_inertia: [3]f32 = .{ 0, 0, 0 };
+    var com: [3]f32 = .{ 0, 0, 0 };
 
     for (body.geoms.items) |geom| {
         const geom_mass = geomMass(&geom);
@@ -1074,6 +1060,11 @@ fn computeBodyMassInertia(body: *const schema.MjcfBody) MassInertia {
         total_inertia[1] += geom_inertia[1] + geom_mass * (d_sq[0] + d_sq[2]);
         total_inertia[2] += geom_inertia[2] + geom_mass * (d_sq[0] + d_sq[1]);
 
+        // Accumulate weighted COM
+        com[0] += geom_mass * d[0];
+        com[1] += geom_mass * d[1];
+        com[2] += geom_mass * d[2];
+
         total_mass += geom_mass;
     }
 
@@ -1081,7 +1072,14 @@ fn computeBodyMassInertia(body: *const schema.MjcfBody) MassInertia {
         total_mass = 1.0;
     }
 
-    return .{ .mass = total_mass, .inertia = total_inertia };
+    // COM offset from body frame origin
+    const com_offset: [3]f32 = .{
+        com[0] / total_mass,
+        com[1] / total_mass,
+        com[2] / total_mass,
+    };
+
+    return .{ .mass = total_mass, .inertia = total_inertia, .com_offset = com_offset };
 }
 
 /// Compute the mass of a single geom from its mass attribute or density * volume.
@@ -1415,15 +1413,25 @@ const XmlTokenizer = struct {
         const attrs_start = self.pos;
 
         // Find end of tag
-        var is_self_closing = false;
         while (self.pos < self.source.len and self.source[self.pos] != '>') {
-            if (self.source[self.pos] == '/') {
-                is_self_closing = true;
-            }
             self.pos += 1;
         }
 
-        const attrs_end = if (is_self_closing) self.pos - 1 else self.pos;
+        // A tag is self-closing only when the final non-whitespace
+        // character before '>' is '/'. Do not treat '/' inside attribute
+        // values (e.g. file paths) as self-closing.
+        var attrs_end = self.pos;
+        var is_self_closing = false;
+        if (!is_end) {
+            var check = self.pos;
+            while (check > attrs_start and isWhitespace(self.source[check - 1])) {
+                check -= 1;
+            }
+            if (check > attrs_start and self.source[check - 1] == '/') {
+                is_self_closing = true;
+                attrs_end = check - 1;
+            }
+        }
         const attrs = self.source[attrs_start..attrs_end];
 
         if (self.pos < self.source.len) self.pos += 1; // Skip '>'

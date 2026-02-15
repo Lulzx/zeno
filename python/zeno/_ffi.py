@@ -385,7 +385,7 @@ class ZenoWorld:
         mjcf_path: Optional[str] = None,
         mjcf_string: Optional[str] = None,
         num_envs: int = 1,
-        timestep: float = 0.002,
+        timestep: float = 0,  # 0 = use MJCF timestep
         contact_iterations: int = 4,
         max_contacts_per_env: int = 64,
         seed: int = 42,
@@ -754,6 +754,24 @@ class ZenoWorld:
         )
         return arr if zero_copy else arr.copy()
 
+    def get_body_accelerations(self, zero_copy: bool = True) -> np.ndarray:
+        """
+        Get body linear accelerations.
+
+        Returns
+        -------
+        np.ndarray
+            Accelerations of shape (num_envs, num_bodies, 4).
+            Format is (ax, ay, az, padding).
+        """
+        ptr = _lib.zeno_world_get_body_accelerations(self._handle)
+        arr = self._make_zero_copy_array(
+            ptr,
+            (self._num_envs, self._num_bodies, 4),
+            cache_key="body_accelerations" if zero_copy else None
+        )
+        return arr if zero_copy else arr.copy()
+
     def get_joint_positions(self, zero_copy: bool = True) -> np.ndarray:
         """
         Get joint positions/angles.
@@ -859,12 +877,13 @@ class ZenoWorld:
         Returns
         -------
         np.ndarray
-            Sensor data of shape (num_envs, num_sensors).
+            Sensor data of shape (num_envs, obs_dim).
+            This is the same per-env sensor vector returned by get_observations().
         """
         ptr = _lib.zeno_world_get_sensor_data(self._handle)
         arr = self._make_zero_copy_array(
             ptr,
-            (self._num_envs, max(self._num_sensors, 1)),
+            (self._num_envs, self._obs_dim),
             cache_key="sensor_data" if zero_copy else None
         )
         return arr if zero_copy else arr.copy()

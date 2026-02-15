@@ -45,6 +45,8 @@ pub const BodyDef = struct {
     collision_group: u32 = 0,
     /// Collision mask (bitfield for which groups to collide with).
     collision_mask: u32 = 0xFFFFFFFF,
+    /// Center of mass offset from body frame origin (local coordinates).
+    com_offset: [3]f32 = .{ 0, 0, 0 },
 
     /// Calculate inverse mass.
     /// Static and kinematic bodies have infinite mass (inv_mass = 0) so forces don't affect them.

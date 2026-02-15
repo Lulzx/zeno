@@ -28,6 +28,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: ABI contract check
+        run: python tests/check_abi_contract.py
+
       - name: Install Python package
         run: pip install -e python/
 

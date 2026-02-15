@@ -6,28 +6,25 @@
         <geom type="plane" size="10 10 0.1" rgba="0.8 0.8 0.8 1"/>
 
         <!-- Rail (visual only) -->
-        <geom type="box" pos="0 0 0.05" size="2.4 0.05 0.05" rgba="0.3 0.3 0.3 1" contype="0" conaffinity="0"/>
+        <geom type="box" pos="0 0 0.05" size="10 0.05 0.05" rgba="0.3 0.3 0.3 1" contype="0" conaffinity="0"/>
 
         <!-- Cart -->
         <body name="cart" pos="0 0 0.1">
-            <joint name="slider" type="slide" axis="1 0 0" damping="0.5" range="-2.4 2.4"/>
+            <joint name="slider" type="slide" axis="1 0 0" damping="0.5" range="-10 10"/>
             <geom type="box" size="0.2 0.1 0.05" mass="1" rgba="0.2 0.6 0.2 1"/>
 
             <!-- Pole -->
             <body name="pole" pos="0 0 0.05">
                 <joint name="hinge" type="hinge" axis="0 1 0" damping="0.001"/>
                 <geom type="capsule" fromto="0 0 0 0 0 0.5" size="0.02" mass="0.1" rgba="0.8 0.4 0.1 1"/>
-
-                <!-- Pole tip (for visualization) -->
-                <body name="pole_tip" pos="0 0 0.5">
-                    <geom type="sphere" size="0.04" mass="0.01" rgba="0.8 0.1 0.1 1"/>
-                </body>
+                <!-- Pole tip (visual marker on pole body, not a separate body) -->
+                <geom name="pole_tip" type="sphere" pos="0 0 0.5" size="0.04" mass="0.01" rgba="0.8 0.1 0.1 1"/>
             </body>
         </body>
     </worldbody>
 
     <actuator>
-        <motor joint="slider" ctrlrange="-10 10" gear="1"/>
+        <motor joint="slider" ctrlrange="-30 30" gear="1"/>
     </actuator>
 
     <sensor>

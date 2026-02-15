@@ -50,7 +50,7 @@ class ZenoEnv:
         mjcf_path: Optional[str] = None,
         mjcf_string: Optional[str] = None,
         num_envs: int = 1,
-        timestep: float = 0.002,
+        timestep: float = 0,  # 0 = use MJCF timestep
         contact_iterations: int = 4,
         max_contacts_per_env: int = 64,
         seed: int = 42,
