@@ -431,9 +431,9 @@ pub const GeomGPU = extern struct {
     /// Size[1], size[2], friction, restitution.
     params: [4]f32 align(16),
 
-    pub fn fromGeom(g: *const Geom, idx: u32) GeomGPU {
+    pub fn fromGeom(g: *const Geom) GeomGPU {
         return .{
-            .type_body = .{ @intFromEnum(g.geom_type), g.body_id, idx, g.group },
+            .type_body = .{ @intFromEnum(g.geom_type), g.body_id, g.mask, g.group },
             .pos_size0 = .{ g.local_pos[0], g.local_pos[1], g.local_pos[2], g.size[0] },
             .quat = g.local_quat,
             .params = .{ g.size[1], g.size[2], g.friction, g.restitution },

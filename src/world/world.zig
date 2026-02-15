@@ -545,7 +545,7 @@ pub const World = struct {
         // Upload geom data
         const geom_data = self.geom_data_buffer.getSlice(primitives.GeomGPU);
         for (self.scene.geoms.items, 0..) |geom, i| {
-            geom_data[i] = primitives.GeomGPU.fromGeom(&geom, @intCast(i));
+            geom_data[i] = primitives.GeomGPU.fromGeom(&geom);
         }
 
         // Upload actuator data

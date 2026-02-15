@@ -486,6 +486,10 @@ kernel void broad_phase(
     float3 pos_a = positions[body_idx_a].xyz + geom_a.pos_size0.xyz;
     float radius_a = geom_a.pos_size0.w;
 
+    uint type_a = geom_a.type_body.x;
+    uint group_a = geom_a.type_body.w;  // contype
+    uint mask_a = geom_a.type_body.z;   // conaffinity
+
     // Check against all other geoms (simple O(n²) for now)
     for (uint other = geom_id + 1; other < params.num_geoms; other++) {
         GeomData geom_b = geoms[other];
@@ -494,24 +498,36 @@ kernel void broad_phase(
         // Skip self-collision
         if (body_a == body_b) continue;
 
+        uint type_b = geom_b.type_body.x;
+        uint group_b = geom_b.type_body.w;  // contype
+        uint mask_b = geom_b.type_body.z;   // conaffinity
+
+        // contype/conaffinity filter (MuJoCo semantics)
+        if ((group_a & mask_b) == 0 && (group_b & mask_a) == 0) continue;
+
         uint body_idx_b = env_id * params.num_bodies + body_b;
         float3 pos_b = positions[body_idx_b].xyz + geom_b.pos_size0.xyz;
         float radius_b = geom_b.pos_size0.w;
 
-        // AABB test (simplified as sphere-sphere)
-        float3 diff = pos_b - pos_a;
-        float dist_sq = dot(diff, diff);
-        float min_dist = radius_a + radius_b + 0.1; // Margin
+        // Plane bypass — planes are infinite, always emit candidate
+        bool is_plane_pair = (type_a == 3 || type_b == 3);
 
-        if (dist_sq < min_dist * min_dist) {
-            // Potential collision - add to narrow phase
-            uint count = atomic_fetch_add_explicit(
-                &contact_counts[env_id], 1, memory_order_relaxed);
+        if (!is_plane_pair) {
+            // AABB test (simplified as sphere-sphere)
+            float3 diff = pos_b - pos_a;
+            float dist_sq = dot(diff, diff);
+            float min_dist = radius_a + radius_b + 0.1; // Margin
 
-            if (count < params.max_contacts) {
-                uint contact_idx = env_id * params.max_contacts + count;
-                contacts[contact_idx].indices = uint4(body_a, body_b, geom_id, other);
-            }
+            if (dist_sq >= min_dist * min_dist) continue;
+        }
+
+        // Potential collision - add to narrow phase
+        uint count = atomic_fetch_add_explicit(
+            &contact_counts[env_id], 1, memory_order_relaxed);
+
+        if (count < params.max_contacts) {
+            uint contact_idx = env_id * params.max_contacts + count;
+            contacts[contact_idx].indices = uint4(body_a, body_b, geom_id, other);
         }
     }
 }
