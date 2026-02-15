@@ -55,6 +55,22 @@ pub const SimParams = extern struct {
     obs_dim: u32, // Observation dimension per environment
 };
 
+/// GPU spatial hash parameters (matches Metal SpatialHashParams struct).
+pub const SpatialHashParamsGPU = extern struct {
+    grid_dim_x: u32 align(16),
+    grid_dim_y: u32,
+    grid_dim_z: u32,
+    total_cells: u32,
+    cell_size: f32,
+    inv_cell_size: f32,
+    num_geoms: u32,
+    num_envs: u32,
+    max_contacts: u32,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+    _pad2: u32 = 0,
+};
+
 /// Profiling data for the most recent step call.
 pub const ProfilingData = struct {
     integrate_ns: f32 = 0,
@@ -117,6 +133,14 @@ pub const World = struct {
     num_colors: u8,
     color_ranges: ?[][2]u32, // [color] = (start_offset, count)
 
+    // GPU spatial hash buffers for broad phase (allocated when num_geoms > 512)
+    spatial_hash_cell_counts: ?Buffer = null,
+    spatial_hash_cell_offsets: ?Buffer = null,
+    spatial_hash_sorted_geoms: ?Buffer = null,
+    spatial_hash_cell_ids: ?Buffer = null,
+    spatial_hash_params_buffer: ?Buffer = null,
+    use_spatial_hash: bool = false,
+
     // Contact caching buffers for temporal coherence
     prev_contacts_buffer: Buffer,
     prev_contact_counts_buffer: Buffer,
@@ -129,6 +153,21 @@ pub const World = struct {
     max_adaptive_substeps: u32,
     violation_threshold: f32,
     profiling: ProfilingDataRaw = .{},
+
+    // Persistent backup buffers for stepSubset (lazily allocated)
+    subset_backup_positions: ?[]align(16) [4]f32 = null,
+    subset_backup_quaternions: ?[]align(16) [4]f32 = null,
+    subset_backup_velocities: ?[]align(16) [4]f32 = null,
+    subset_backup_accelerations: ?[]align(16) [4]f32 = null,
+    subset_backup_angular_velocities: ?[]align(16) [4]f32 = null,
+    subset_backup_joint_positions: ?[]f32 = null,
+    subset_backup_joint_velocities: ?[]f32 = null,
+    subset_backup_joint_torques: ?[]f32 = null,
+    subset_backup_observations: ?[]f32 = null,
+    subset_backup_rewards: ?[]f32 = null,
+    subset_backup_dones: ?[]u8 = null,
+    subset_backup_contact_counts: ?[]u32 = null,
+    subset_backup_contacts: ?[]u8 = null,
 
     // Allocator
     allocator: std.mem.Allocator,
@@ -196,6 +235,10 @@ pub const World = struct {
             "compute_forces",
             "integrate",
             "broad_phase",
+            "broad_phase_count_cells",
+            "broad_phase_prefix_sum",
+            "broad_phase_detect",
+            "sort_contacts",
             "narrow_phase",
             "solve_contacts",
             "solve_joints",
@@ -487,6 +530,44 @@ pub const World = struct {
             .obs_dim = obs_dim,
         };
 
+        // Allocate spatial hash buffers for large scenes
+        const use_spatial_hash = num_geoms > 512;
+        var sh_cell_counts: ?Buffer = null;
+        var sh_cell_offsets: ?Buffer = null;
+        var sh_sorted_geoms: ?Buffer = null;
+        var sh_cell_ids: ?Buffer = null;
+        var sh_params_buf: ?Buffer = null;
+
+        if (use_spatial_hash) {
+            // Grid dimensions: use a reasonable default (64^3 = 262144 cells)
+            const grid_dim: u32 = 64;
+            const total_cells = grid_dim * grid_dim * grid_dim;
+            const total_geoms = config.num_envs * num_geoms;
+
+            sh_cell_counts = try Buffer.init(device.device, config.num_envs * total_cells * @sizeOf(u32), opts);
+            sh_cell_offsets = try Buffer.init(device.device, config.num_envs * total_cells * @sizeOf(u32), opts);
+            sh_sorted_geoms = try Buffer.init(device.device, total_geoms * @sizeOf(u32), opts);
+            sh_cell_ids = try Buffer.init(device.device, total_geoms * @sizeOf(u32), opts);
+            sh_params_buf = try Buffer.init(device.device, @sizeOf(SpatialHashParamsGPU), opts);
+
+            // Initialize spatial hash params with defaults (cell_size will be refined at step time)
+            const sh_params_ptr = sh_params_buf.?.getSlice(SpatialHashParamsGPU);
+            sh_params_ptr[0] = .{
+                .grid_dim_x = grid_dim,
+                .grid_dim_y = grid_dim,
+                .grid_dim_z = grid_dim,
+                .total_cells = total_cells,
+                .cell_size = 1.0, // Default, could be tuned
+                .inv_cell_size = 1.0,
+                .num_geoms = num_geoms,
+                .num_envs = config.num_envs,
+                .max_contacts = config.max_contacts_per_env,
+            };
+
+            try sh_cell_counts.?.zero();
+            try sh_cell_offsets.?.zero();
+        }
+
         var world = World{
             .device = device,
             .pipelines = pipelines,
@@ -505,6 +586,12 @@ pub const World = struct {
             .num_constraints_per_env = num_constraints_per_env,
             .num_colors = num_colors,
             .color_ranges = color_ranges,
+            .spatial_hash_cell_counts = sh_cell_counts,
+            .spatial_hash_cell_offsets = sh_cell_offsets,
+            .spatial_hash_sorted_geoms = sh_sorted_geoms,
+            .spatial_hash_cell_ids = sh_cell_ids,
+            .spatial_hash_params_buffer = sh_params_buf,
+            .use_spatial_hash = use_spatial_hash,
             .prev_contacts_buffer = prev_contacts_buffer,
             .prev_contact_counts_buffer = prev_contact_counts_buffer,
             .warm_start_factor_buffer = warm_start_factor_buffer,
@@ -704,8 +791,45 @@ pub const World = struct {
         }
     }
 
+    /// Lazily allocate a persistent backup buffer, reusing if already allocated with correct size.
+    fn ensureBackupF4(self: *World, slot: *?[]align(16) [4]f32, len: usize) ![]align(16) [4]f32 {
+        if (slot.*) |buf| {
+            if (buf.len == len) return buf;
+            self.allocator.free(buf);
+        }
+        slot.* = try self.allocator.alignedAlloc([4]f32, .@"16", len);
+        return slot.*.?;
+    }
+
+    fn ensureBackupF32(self: *World, slot: *?[]f32, len: usize) ![]f32 {
+        if (slot.*) |buf| {
+            if (buf.len == len) return buf;
+            self.allocator.free(buf);
+        }
+        slot.* = try self.allocator.alloc(f32, len);
+        return slot.*.?;
+    }
+
+    fn ensureBackupU32(self: *World, slot: *?[]u32, len: usize) ![]u32 {
+        if (slot.*) |buf| {
+            if (buf.len == len) return buf;
+            self.allocator.free(buf);
+        }
+        slot.* = try self.allocator.alloc(u32, len);
+        return slot.*.?;
+    }
+
+    fn ensureBackupU8(self: *World, slot: *?[]u8, len: usize) ![]u8 {
+        if (slot.*) |buf| {
+            if (buf.len == len) return buf;
+            self.allocator.free(buf);
+        }
+        slot.* = try self.allocator.alloc(u8, len);
+        return slot.*.?;
+    }
+
     /// Step only the masked environments while keeping others unchanged.
-    /// This is implemented by stepping all envs once and restoring unmasked env state.
+    /// Uses persistent backup buffers to avoid per-call allocation overhead.
     pub fn stepSubset(self: *World, actions: []const f32, env_mask: []const u8, substeps: u32) !void {
         const num_envs: usize = @intCast(self.config.num_envs);
         if (env_mask.len != num_envs) return error.InvalidSize;
@@ -738,32 +862,20 @@ pub const World = struct {
         const contact_counts = self.state.contact_counts_buffer.getSlice(u32);
         const contacts = self.state.contacts_buffer.getSlice(u8);
 
-        const positions_backup = try self.allocator.alloc([4]f32, positions.len);
-        defer self.allocator.free(positions_backup);
-        const quaternions_backup = try self.allocator.alloc([4]f32, quaternions.len);
-        defer self.allocator.free(quaternions_backup);
-        const velocities_backup = try self.allocator.alloc([4]f32, velocities.len);
-        defer self.allocator.free(velocities_backup);
-        const accelerations_backup = try self.allocator.alloc([4]f32, accelerations.len);
-        defer self.allocator.free(accelerations_backup);
-        const angular_velocities_backup = try self.allocator.alloc([4]f32, angular_velocities.len);
-        defer self.allocator.free(angular_velocities_backup);
-        const joint_positions_backup = try self.allocator.alloc(f32, joint_positions.len);
-        defer self.allocator.free(joint_positions_backup);
-        const joint_velocities_backup = try self.allocator.alloc(f32, joint_velocities.len);
-        defer self.allocator.free(joint_velocities_backup);
-        const joint_torques_backup = try self.allocator.alloc(f32, joint_torques.len);
-        defer self.allocator.free(joint_torques_backup);
-        const observations_backup = try self.allocator.alloc(f32, observations.len);
-        defer self.allocator.free(observations_backup);
-        const rewards_backup = try self.allocator.alloc(f32, rewards.len);
-        defer self.allocator.free(rewards_backup);
-        const dones_backup = try self.allocator.alloc(u8, dones.len);
-        defer self.allocator.free(dones_backup);
-        const contact_counts_backup = try self.allocator.alloc(u32, contact_counts.len);
-        defer self.allocator.free(contact_counts_backup);
-        const contacts_backup = try self.allocator.alloc(u8, contacts.len);
-        defer self.allocator.free(contacts_backup);
+        // Lazily allocate persistent backup buffers (reused across calls)
+        const positions_backup = try self.ensureBackupF4(&self.subset_backup_positions, positions.len);
+        const quaternions_backup = try self.ensureBackupF4(&self.subset_backup_quaternions, quaternions.len);
+        const velocities_backup = try self.ensureBackupF4(&self.subset_backup_velocities, velocities.len);
+        const accelerations_backup = try self.ensureBackupF4(&self.subset_backup_accelerations, accelerations.len);
+        const angular_velocities_backup = try self.ensureBackupF4(&self.subset_backup_angular_velocities, angular_velocities.len);
+        const joint_positions_backup = try self.ensureBackupF32(&self.subset_backup_joint_positions, joint_positions.len);
+        const joint_velocities_backup = try self.ensureBackupF32(&self.subset_backup_joint_velocities, joint_velocities.len);
+        const joint_torques_backup = try self.ensureBackupF32(&self.subset_backup_joint_torques, joint_torques.len);
+        const observations_backup = try self.ensureBackupF32(&self.subset_backup_observations, observations.len);
+        const rewards_backup = try self.ensureBackupF32(&self.subset_backup_rewards, rewards.len);
+        const dones_backup = try self.ensureBackupU8(&self.subset_backup_dones, dones.len);
+        const contact_counts_backup = try self.ensureBackupU32(&self.subset_backup_contact_counts, contact_counts.len);
+        const contacts_backup = try self.ensureBackupU8(&self.subset_backup_contacts, contacts.len);
 
         @memcpy(positions_backup, positions);
         @memcpy(quaternions_backup, quaternions);
@@ -926,9 +1038,64 @@ pub const World = struct {
 
         encoder.memoryBarrier(.buffers);
 
-        // GROUP E: broad_phase
+        // GROUP E: broad_phase (O(n²) fallback or 3-pass spatial hash)
         const broad_start = if (profile != null) nowNanos() else 0;
-        {
+        if (self.use_spatial_hash) {
+            // 3-pass GPU spatial hash broad phase
+            var sh_cell_counts = self.spatial_hash_cell_counts.?;
+            var sh_cell_offsets = self.spatial_hash_cell_offsets.?;
+            var sh_sorted_geoms = self.spatial_hash_sorted_geoms.?;
+            var sh_cell_ids = self.spatial_hash_cell_ids.?;
+            var sh_params_buf = self.spatial_hash_params_buffer.?;
+
+            // Zero cell counts before each step
+            try sh_cell_counts.zero();
+
+            // Pass 1: Count cells
+            {
+                const pipeline = try self.pipelines.getPipeline("broad_phase_count_cells");
+                encoder.setPipeline(pipeline);
+                encoder.setBuffer(&self.state.positions_buffer, 0, 0);
+                encoder.setBuffer(&self.geom_data_buffer, 0, 1);
+                encoder.setBuffer(&sh_cell_counts, 0, 2);
+                encoder.setBuffer(&sh_cell_ids, 0, 3);
+                encoder.setBuffer(&sh_params_buf, 0, 4);
+                encoder.setBuffer(&self.params_buffer, 0, 5);
+                encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_geoms);
+            }
+
+            encoder.memoryBarrier(.buffers);
+
+            // Pass 2: Prefix sum
+            {
+                const pipeline = try self.pipelines.getPipeline("broad_phase_prefix_sum");
+                encoder.setPipeline(pipeline);
+                encoder.setBuffer(&sh_cell_counts, 0, 0);
+                encoder.setBuffer(&sh_cell_offsets, 0, 1);
+                encoder.setBuffer(&sh_params_buf, 0, 2);
+                encoder.dispatch1D(pipeline, self.config.num_envs);
+            }
+
+            encoder.memoryBarrier(.buffers);
+
+            // Pass 3: Detect collisions
+            {
+                const pipeline = try self.pipelines.getPipeline("broad_phase_detect");
+                encoder.setPipeline(pipeline);
+                encoder.setBuffer(&self.state.positions_buffer, 0, 0);
+                encoder.setBuffer(&self.geom_data_buffer, 0, 1);
+                encoder.setBuffer(&sh_cell_ids, 0, 2);
+                encoder.setBuffer(&sh_cell_offsets, 0, 3);
+                encoder.setBuffer(&sh_cell_counts, 0, 4);
+                encoder.setBuffer(&sh_sorted_geoms, 0, 5);
+                encoder.setBuffer(&self.state.contacts_buffer, 0, 6);
+                encoder.setBuffer(&self.state.contact_counts_buffer, 0, 7);
+                encoder.setBuffer(&sh_params_buf, 0, 8);
+                encoder.setBuffer(&self.params_buffer, 0, 9);
+                encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_geoms);
+            }
+        } else {
+            // O(n²) fallback for small scenes
             const pipeline = try self.pipelines.getPipeline("broad_phase");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.positions_buffer, 0, 0);
@@ -941,6 +1108,18 @@ pub const World = struct {
         }
         if (profile) |p| {
             p.collision_broad_ns += nowNanos() - broad_start;
+        }
+
+        encoder.memoryBarrier(.buffers);
+
+        // GROUP E.5: sort_contacts (deterministic ordering)
+        {
+            const pipeline = try self.pipelines.getPipeline("sort_contacts");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.contacts_buffer, 0, 0);
+            encoder.setBuffer(&self.state.contact_counts_buffer, 0, 1);
+            encoder.setBuffer(&self.params_buffer, 0, 2);
+            encoder.dispatch1D(pipeline, self.config.num_envs);
         }
 
         encoder.memoryBarrier(.buffers);
@@ -1334,6 +1513,21 @@ pub const World = struct {
             self.allocator.free(ranges);
         }
 
+        // Free persistent stepSubset backup buffers
+        if (self.subset_backup_positions) |b| self.allocator.free(b);
+        if (self.subset_backup_quaternions) |b| self.allocator.free(b);
+        if (self.subset_backup_velocities) |b| self.allocator.free(b);
+        if (self.subset_backup_accelerations) |b| self.allocator.free(b);
+        if (self.subset_backup_angular_velocities) |b| self.allocator.free(b);
+        if (self.subset_backup_joint_positions) |b| self.allocator.free(b);
+        if (self.subset_backup_joint_velocities) |b| self.allocator.free(b);
+        if (self.subset_backup_joint_torques) |b| self.allocator.free(b);
+        if (self.subset_backup_observations) |b| self.allocator.free(b);
+        if (self.subset_backup_rewards) |b| self.allocator.free(b);
+        if (self.subset_backup_dones) |b| self.allocator.free(b);
+        if (self.subset_backup_contact_counts) |b| self.allocator.free(b);
+        if (self.subset_backup_contacts) |b| self.allocator.free(b);
+
         self.body_data_buffer.deinit();
         self.joint_data_buffer.deinit();
         self.geom_data_buffer.deinit();
@@ -1341,6 +1535,14 @@ pub const World = struct {
         self.sensor_data_buffer.deinit();
         self.params_buffer.deinit();
         self.constraints_buffer.deinit();
+
+        // Free spatial hash buffers
+        if (self.spatial_hash_cell_counts) |*b| b.deinit();
+        if (self.spatial_hash_cell_offsets) |*b| b.deinit();
+        if (self.spatial_hash_sorted_geoms) |*b| b.deinit();
+        if (self.spatial_hash_cell_ids) |*b| b.deinit();
+        if (self.spatial_hash_params_buffer) |*b| b.deinit();
+
         self.prev_contacts_buffer.deinit();
         self.prev_contact_counts_buffer.deinit();
         self.warm_start_factor_buffer.deinit();

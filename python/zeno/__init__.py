@@ -63,6 +63,7 @@ from ._ffi import (
     ZenoWorld,
     ZeroCopyArray,
 )
+from .swarm import ZenoSwarm, SwarmConfig, SwarmMetrics, create_swarm_world
 
 # Wrappers for RL training
 from .wrappers import (
@@ -95,6 +96,11 @@ __all__ = [
     "TimeLimit",
     "wrap_env",
     "RunningMeanStd",
+    # Swarm
+    "ZenoSwarm",
+    "SwarmConfig",
+    "SwarmMetrics",
+    "create_swarm_world",
 ]
 
 

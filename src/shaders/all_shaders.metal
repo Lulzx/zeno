@@ -533,6 +533,218 @@ kernel void broad_phase(
 }
 
 // ============================================================================
+// GPU Spatial Hash Broad Phase (3-pass)
+// ============================================================================
+
+// Grid parameters embedded in SimParams are insufficient for spatial hash,
+// so we use a separate constant buffer for grid config.
+struct SpatialHashParams {
+    uint grid_dim_x;
+    uint grid_dim_y;
+    uint grid_dim_z;
+    uint total_cells;
+    float cell_size;
+    float inv_cell_size;
+    uint num_geoms;
+    uint num_envs;
+    uint max_contacts;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+// Pass 1: Compute cell ID for each geom and atomically increment cell counts.
+kernel void broad_phase_count_cells(
+    device const float4* positions [[buffer(0)]],
+    device const GeomData* geoms [[buffer(1)]],
+    device atomic_uint* cell_counts [[buffer(2)]],
+    device uint* cell_ids [[buffer(3)]],
+    constant SpatialHashParams& grid [[buffer(4)]],
+    constant SimParams& params [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint env_id = gid / grid.num_geoms;
+    uint geom_id = gid % grid.num_geoms;
+
+    if (env_id >= grid.num_envs) return;
+
+    GeomData geom = geoms[geom_id];
+    uint body_id = geom.type_body.y;
+    uint body_idx = env_id * params.num_bodies + body_id;
+    float3 pos = positions[body_idx].xyz + geom.pos_size0.xyz;
+
+    // Compute cell coordinates (clamped to grid bounds)
+    int3 cell_coord = int3(floor(pos * grid.inv_cell_size));
+    cell_coord = clamp(cell_coord, int3(0), int3(grid.grid_dim_x - 1, grid.grid_dim_y - 1, grid.grid_dim_z - 1));
+
+    uint cell_id = uint(cell_coord.x) + uint(cell_coord.y) * grid.grid_dim_x +
+                   uint(cell_coord.z) * grid.grid_dim_x * grid.grid_dim_y;
+
+    // Store per-env cell offset
+    uint env_cell_offset = env_id * grid.total_cells;
+    uint global_geom_idx = env_id * grid.num_geoms + geom_id;
+
+    cell_ids[global_geom_idx] = cell_id;
+    atomic_fetch_add_explicit(&cell_counts[env_cell_offset + cell_id], 1, memory_order_relaxed);
+}
+
+// Pass 2: Prefix sum over cell_counts to produce cell_offsets.
+// One threadgroup per env, serial scan (sufficient for grids up to ~262k cells).
+kernel void broad_phase_prefix_sum(
+    device uint* cell_counts [[buffer(0)]],
+    device uint* cell_offsets [[buffer(1)]],
+    constant SpatialHashParams& grid [[buffer(2)]],
+    uint env_id [[thread_position_in_grid]]
+) {
+    if (env_id >= grid.num_envs) return;
+
+    uint base = env_id * grid.total_cells;
+    uint sum = 0;
+    for (uint i = 0; i < grid.total_cells; i++) {
+        cell_offsets[base + i] = sum;
+        sum += cell_counts[base + i];
+        cell_counts[base + i] = 0; // Reset for scatter pass
+    }
+}
+
+// Pass 3: Scatter geoms into sorted order and detect collisions via cell neighbors.
+kernel void broad_phase_detect(
+    device const float4* positions [[buffer(0)]],
+    device const GeomData* geoms [[buffer(1)]],
+    device const uint* cell_ids [[buffer(2)]],
+    device uint* cell_offsets [[buffer(3)]],
+    device atomic_uint* cell_counts [[buffer(4)]],
+    device uint* sorted_geoms [[buffer(5)]],
+    device Contact* contacts [[buffer(6)]],
+    device atomic_uint* contact_counts [[buffer(7)]],
+    constant SpatialHashParams& grid [[buffer(8)]],
+    constant SimParams& params [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint env_id = gid / grid.num_geoms;
+    uint geom_id = gid % grid.num_geoms;
+
+    if (env_id >= grid.num_envs) return;
+
+    uint env_cell_base = env_id * grid.total_cells;
+    uint env_geom_base = env_id * grid.num_geoms;
+    uint global_geom_idx = env_geom_base + geom_id;
+
+    uint cell_id = cell_ids[global_geom_idx];
+
+    // Scatter into sorted position
+    uint slot = atomic_fetch_add_explicit(&cell_counts[env_cell_base + cell_id], 1, memory_order_relaxed);
+    sorted_geoms[env_geom_base + cell_offsets[env_cell_base + cell_id] + slot] = geom_id;
+
+    // Memory fence to ensure all geoms are scattered before neighbor queries
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Now query own cell + 26 neighbors for potential collisions
+    GeomData geom_a = geoms[geom_id];
+    uint body_a = geom_a.type_body.y;
+    uint body_idx_a = env_id * params.num_bodies + body_a;
+    float3 pos_a = positions[body_idx_a].xyz + geom_a.pos_size0.xyz;
+    float radius_a = geom_a.pos_size0.w;
+    uint type_a = geom_a.type_body.x;
+    uint group_a = geom_a.type_body.w;
+    uint mask_a = geom_a.type_body.z;
+
+    int3 center = int3(floor(pos_a * grid.inv_cell_size));
+    center = clamp(center, int3(0), int3(grid.grid_dim_x - 1, grid.grid_dim_y - 1, grid.grid_dim_z - 1));
+
+    for (int dz = -1; dz <= 1; dz++) {
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int3 nc = center + int3(dx, dy, dz);
+                if (nc.x < 0 || nc.y < 0 || nc.z < 0) continue;
+                if (uint(nc.x) >= grid.grid_dim_x || uint(nc.y) >= grid.grid_dim_y || uint(nc.z) >= grid.grid_dim_z) continue;
+
+                uint ncid = uint(nc.x) + uint(nc.y) * grid.grid_dim_x + uint(nc.z) * grid.grid_dim_x * grid.grid_dim_y;
+                uint start = cell_offsets[env_cell_base + ncid];
+                uint end = start + cell_counts[env_cell_base + ncid];
+
+                for (uint s = start; s < end; s++) {
+                    uint other = sorted_geoms[env_geom_base + s];
+                    if (other <= geom_id) continue; // Avoid duplicates
+
+                    GeomData geom_b = geoms[other];
+                    uint body_b = geom_b.type_body.y;
+                    if (body_a == body_b) continue;
+
+                    uint group_b = geom_b.type_body.w;
+                    uint mask_b = geom_b.type_body.z;
+                    if ((group_a & mask_b) == 0 && (group_b & mask_a) == 0) continue;
+
+                    uint type_b = geom_b.type_body.x;
+                    uint body_idx_b = env_id * params.num_bodies + body_b;
+                    float3 pos_b = positions[body_idx_b].xyz + geom_b.pos_size0.xyz;
+                    float radius_b = geom_b.pos_size0.w;
+
+                    bool is_plane_pair = (type_a == 3 || type_b == 3);
+
+                    if (!is_plane_pair) {
+                        float3 diff = pos_b - pos_a;
+                        float dist_sq = dot(diff, diff);
+                        float min_dist = radius_a + radius_b + 0.1;
+                        if (dist_sq >= min_dist * min_dist) continue;
+                    }
+
+                    uint count = atomic_fetch_add_explicit(
+                        &contact_counts[env_id], 1, memory_order_relaxed);
+
+                    if (count < params.max_contacts) {
+                        uint contact_idx = env_id * params.max_contacts + count;
+                        contacts[contact_idx].indices = uint4(body_a, body_b, geom_id, other);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Deterministic Contact Sorting
+// ============================================================================
+
+// Sort contacts within each env by (min_body, max_body) for deterministic results.
+// One thread per env, serial insertion sort on ≤max_contacts items.
+kernel void sort_contacts(
+    device Contact* contacts [[buffer(0)]],
+    device const uint* contact_counts [[buffer(1)]],
+    constant SimParams& params [[buffer(2)]],
+    uint env_id [[thread_position_in_grid]]
+) {
+    if (env_id >= params.num_envs) return;
+
+    uint count = min(contact_counts[env_id], params.max_contacts);
+    if (count <= 1) return;
+
+    uint base = env_id * params.max_contacts;
+
+    // Insertion sort by composite key: min(body_a,body_b) << 16 | max(body_a,body_b)
+    for (uint i = 1; i < count; i++) {
+        Contact key = contacts[base + i];
+        uint ka = min(key.indices.x, key.indices.y);
+        uint kb = max(key.indices.x, key.indices.y);
+        uint key_val = (ka << 16) | kb;
+
+        int j = int(i) - 1;
+        while (j >= 0) {
+            Contact cj = contacts[base + uint(j)];
+            uint ja = min(cj.indices.x, cj.indices.y);
+            uint jb = max(cj.indices.x, cj.indices.y);
+            uint j_val = (ja << 16) | jb;
+
+            if (j_val <= key_val) break;
+
+            contacts[base + uint(j) + 1] = contacts[base + uint(j)];
+            j--;
+        }
+        contacts[base + uint(j) + 1] = key;
+    }
+}
+
+// ============================================================================
 // Narrow Phase Collision Detection
 // ============================================================================
 
@@ -1521,22 +1733,23 @@ kernel void solve_contacts(
     // Apply normal impulse
     float3 impulse_n = j_n * normal;
 
+    // Position correction: only fix penetration beyond slop, scaled by baumgarte
+    float pos_correction = params.baumgarte * max(penetration - params.slop, 0.0f);
+
     if (inv_mass_a > 1e-8) {
         velocities[idx_a].xyz += impulse_n * inv_mass_a;
         angular_velocities[idx_a].xyz += cross(r_a, impulse_n) * inv_mi_a.yzw;
 
-        // Position correction
         float mass_ratio_a = inv_mass_a / inv_mass_sum;
-        positions[idx_a].xyz += penetration * mass_ratio_a * normal;
+        positions[idx_a].xyz += pos_correction * mass_ratio_a * normal;
     }
 
     if (inv_mass_b > 1e-8) {
         velocities[idx_b].xyz -= impulse_n * inv_mass_b;
         angular_velocities[idx_b].xyz -= cross(r_b, impulse_n) * inv_mi_b.yzw;
 
-        // Position correction
         float mass_ratio_b = inv_mass_b / inv_mass_sum;
-        positions[idx_b].xyz -= penetration * mass_ratio_b * normal;
+        positions[idx_b].xyz -= pos_correction * mass_ratio_b * normal;
     }
 
     // Friction (Coulomb friction cone)

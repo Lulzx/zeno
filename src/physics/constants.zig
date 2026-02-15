@@ -27,9 +27,9 @@ pub const DEFAULT_JOINT_STIFFNESS: f32 = 0.0;
 pub const DEFAULT_JOINT_ARMATURE: f32 = 0.0;
 
 /// Simulation limits.
-pub const MAX_BODIES_PER_ENV: u32 = 256;
+pub const MAX_BODIES_PER_ENV: u32 = 16384;
 pub const MAX_JOINTS_PER_ENV: u32 = 256;
-pub const MAX_GEOMS_PER_ENV: u32 = 512;
+pub const MAX_GEOMS_PER_ENV: u32 = 32768;
 pub const MAX_ACTUATORS_PER_ENV: u32 = 64;
 pub const MAX_SENSORS_PER_ENV: u32 = 128;
 

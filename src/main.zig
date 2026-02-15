@@ -37,12 +37,25 @@ pub const mjcf = struct {
     pub const parser = @import("mjcf/parser.zig");
     pub const schema = @import("mjcf/schema.zig");
 };
+pub const swarm = struct {
+    pub const types = @import("swarm/types.zig");
+    pub const grid = @import("swarm/grid.zig");
+    pub const graph = @import("swarm/graph.zig");
+    pub const message_bus = @import("swarm/message_bus.zig");
+    pub const policy_mod = @import("swarm/policy.zig");
+    pub const dispatcher = @import("swarm/dispatcher.zig");
+    pub const swarm_mod = @import("swarm/swarm.zig");
+};
 
 // Re-exports for convenience
 pub const World = world.world_mod.World;
 pub const WorldConfig = world.world_mod.WorldConfig;
 pub const Scene = world.scene.Scene;
 pub const SceneBuilder = world.scene.SceneBuilder;
+pub const Swarm = swarm.swarm_mod.Swarm;
+pub const SwarmConfig = swarm.types.SwarmConfig;
+pub const SwarmMetrics = swarm.types.SwarmMetrics;
+pub const AgentState = swarm.types.AgentState;
 
 // ============================================================================
 // C ABI Types
@@ -702,10 +715,116 @@ export fn zeno_version() [*:0]const u8 {
     return "0.1.0";
 }
 
+/// Get the max contacts per environment for the world.
+export fn zeno_world_max_contacts_per_env(handle: ZenoWorldHandle) u32 {
+    if (handle == null) return 0;
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.config.max_contacts_per_env;
+}
+
 /// Check if Metal is available.
 export fn zeno_metal_available() bool {
     const device = objc.createSystemDefaultDevice();
     return device != null;
+}
+
+// ============================================================================
+// Swarm C ABI Types
+// ============================================================================
+
+pub const ZenoSwarmHandle = ?*anyopaque;
+
+pub const ZenoSwarmConfig = swarm.types.SwarmConfig;
+pub const ZenoSwarmMetrics = swarm.types.SwarmMetrics;
+pub const ZenoAgentState = swarm.types.AgentState;
+
+// ============================================================================
+// Swarm C ABI Functions
+// ============================================================================
+
+/// Create a new swarm instance attached to a world.
+export fn zeno_swarm_create(
+    world_handle: ZenoWorldHandle,
+    config: *const ZenoSwarmConfig,
+) ZenoSwarmHandle {
+    if (world_handle == null) return null;
+    _ = @as(*World, @ptrCast(@alignCast(world_handle)));
+
+    const allocator = gpa.allocator();
+    const swarm_ptr = allocator.create(Swarm) catch return null;
+    swarm_ptr.* = Swarm.init(allocator, config.*) catch {
+        allocator.destroy(swarm_ptr);
+        return null;
+    };
+    return @ptrCast(swarm_ptr);
+}
+
+/// Destroy a swarm and free resources.
+export fn zeno_swarm_destroy(handle: ZenoSwarmHandle) void {
+    if (handle == null) return;
+    const allocator = gpa.allocator();
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    swarm_ptr.deinit();
+    allocator.destroy(swarm_ptr);
+}
+
+/// Step the swarm (grid rebuild, graph build, message delivery).
+/// Physics stepping should be done separately via zeno_world_step.
+export fn zeno_swarm_step(
+    handle: ZenoSwarmHandle,
+    world_handle: ZenoWorldHandle,
+    actions_ptr: ?[*]f32,
+) ZenoError {
+    if (handle == null or world_handle == null) return .invalid_handle;
+
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    const world_ptr: *World = @ptrCast(@alignCast(world_handle));
+
+    const positions = world_ptr.state.getPositions();
+    const velocities = world_ptr.state.getVelocities();
+
+    const action_dim: u32 = world_ptr.params.num_actuators;
+    const num_agents = swarm_ptr.config.num_agents;
+
+    var actions: ?[]f32 = null;
+    if (actions_ptr) |ap| {
+        actions = ap[0 .. num_agents * action_dim];
+    }
+
+    swarm_ptr.step(positions, velocities, actions, action_dim);
+
+    return .success;
+}
+
+/// Get swarm metrics.
+export fn zeno_swarm_get_metrics(handle: ZenoSwarmHandle, out: *ZenoSwarmMetrics) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    out.* = swarm_ptr.metrics;
+    return .success;
+}
+
+/// Get pointer to agent states array.
+export fn zeno_swarm_get_agent_states(handle: ZenoSwarmHandle) ?[*]ZenoAgentState {
+    if (handle == null) return null;
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    if (swarm_ptr.agent_states.len == 0) return null;
+    return swarm_ptr.agent_states.ptr;
+}
+
+/// Get neighbor counts for all agents (caller provides buffer of size num_agents).
+export fn zeno_swarm_get_neighbor_counts(handle: ZenoSwarmHandle, out: [*]u32, count: u32) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    swarm_ptr.getNeighborCounts(out[0..count]);
+    return .success;
+}
+
+/// Set the body offset (index of first agent body in world body array).
+export fn zeno_swarm_set_body_offset(handle: ZenoSwarmHandle, offset: u32) void {
+    if (handle == null) return;
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    swarm_ptr.setBodyOffset(offset);
 }
 
 // ============================================================================

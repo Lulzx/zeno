@@ -201,6 +201,54 @@ ffi.cdef("""
     // Memory management
     uint64_t zeno_world_memory_usage(ZenoWorldHandle world);
     void zeno_world_compact_memory(ZenoWorldHandle world);
+
+    // Query limits
+    uint32_t zeno_world_max_contacts_per_env(ZenoWorldHandle world);
+
+    // Swarm types
+    typedef void* ZenoSwarmHandle;
+
+    typedef struct {
+        uint32_t num_agents;
+        float communication_range;
+        uint32_t max_neighbors;
+        uint32_t max_message_bytes;
+        uint32_t max_messages_per_step;
+        float grid_cell_size;
+        uint64_t seed;
+        bool enable_physics;
+        uint8_t _pad[7];
+    } ZenoSwarmConfig;
+
+    typedef struct {
+        float connectivity_ratio;
+        float fragmentation_score;
+        uint32_t collision_count;
+        uint32_t message_count;
+        uint32_t bytes_sent;
+        uint32_t total_edges;
+        float avg_neighbors;
+        uint32_t _pad;
+    } ZenoSwarmMetrics;
+
+    typedef struct {
+        uint32_t agent_id;
+        uint32_t team_id;
+        uint32_t status;
+        uint32_t flags;
+        float local_state[4];
+    } ZenoAgentState;
+
+    // Swarm lifecycle
+    ZenoSwarmHandle zeno_swarm_create(ZenoWorldHandle world, const ZenoSwarmConfig* config);
+    void zeno_swarm_destroy(ZenoSwarmHandle swarm);
+
+    // Swarm simulation
+    int zeno_swarm_step(ZenoSwarmHandle swarm, ZenoWorldHandle world, float* actions);
+    int zeno_swarm_get_metrics(ZenoSwarmHandle swarm, ZenoSwarmMetrics* metrics);
+    ZenoAgentState* zeno_swarm_get_agent_states(ZenoSwarmHandle swarm);
+    int zeno_swarm_get_neighbor_counts(ZenoSwarmHandle swarm, uint32_t* out, uint32_t count);
+    void zeno_swarm_set_body_offset(ZenoSwarmHandle swarm, uint32_t offset);
 """)
 
 
@@ -439,6 +487,9 @@ class ZenoWorld:
         self._timestep = info.timestep
         self._memory_usage = info.memory_usage
         self._gpu_memory_usage = info.gpu_memory_usage
+
+        # Cache max contacts per env from the engine
+        self._max_contacts_per_env = _lib.zeno_world_max_contacts_per_env(self._handle)
 
         # Cache for zero-copy arrays (to prevent garbage collection issues)
         self._cached_arrays: Dict[str, ZeroCopyArray] = {}
@@ -820,17 +871,7 @@ class ZenoWorld:
             - impulses: (4,) float32 (impulse_n, impulse_t1, impulse_t2, restitution)
         """
         ptr = _lib.zeno_world_get_contacts(self._handle)
-        if ptr == ffi.NULL:
-             # Assume max 64 contacts per env (default)
-            max_contacts = 64
-            # Return empty structured array with correct shape
-            contact_dtype = np.dtype([
-                ('position_pen', '4f4'),
-                ('normal_friction', '4f4'),
-                ('indices', '4u4'),
-                ('impulses', '4f4')
-            ])
-            return np.zeros((self._num_envs, max_contacts), dtype=contact_dtype)
+        max_contacts = self._max_contacts_per_env
 
         # Define structured dtype matching ContactGPU layout (64 bytes)
         contact_dtype = np.dtype([
@@ -840,8 +881,9 @@ class ZenoWorld:
             ('impulses', '4f4')
         ])
 
-        # Assume max 64 contacts per env for now (should be exposed via API)
-        max_contacts = 64
+        if ptr == ffi.NULL:
+            return np.zeros((self._num_envs, max_contacts), dtype=contact_dtype)
+
         size_bytes = self._num_envs * max_contacts * 64
         
         buffer = ffi.buffer(ptr, size_bytes)
