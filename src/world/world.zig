@@ -623,12 +623,14 @@ pub const World = struct {
         const vel_before = self.state.getVelocities();
         @memcpy(prev_vel, vel_before);
 
-        // ONE command buffer for ALL substeps — single GPU submission.
+        // ONE command buffer + ONE encoder for ALL substeps — single GPU submission,
+        // using memory barriers instead of separate encoder create/destroy per stage.
         var cmd = try CommandBuffer.init(self.device.command_queue);
+        var encoder = try cmd.computeEncoder();
 
         for (0..actual_substeps) |_| {
             var substep_profile: ProfilingDataRaw = .{};
-            try self.stepOnce(&cmd, if (profile_enabled) &substep_profile else null);
+            try self.stepOnce(&encoder, if (profile_enabled) &substep_profile else null);
 
             if (profile_enabled) {
                 step_profile.integrate_ns += substep_profile.integrate_ns;
@@ -636,8 +638,11 @@ pub const World = struct {
                 step_profile.collision_narrow_ns += substep_profile.collision_narrow_ns;
                 step_profile.constraint_solve_ns += substep_profile.constraint_solve_ns;
             }
+
+            encoder.memoryBarrier(.buffers); // barrier between substeps
         }
 
+        encoder.endEncoding();
         cmd.commitAndWait(); // Single GPU-CPU round-trip for all substeps
 
         // Compute acceleration ONCE from total velocity change over the full step.
@@ -812,30 +817,25 @@ pub const World = struct {
     }
 
     /// Execute one physics substep.
-    /// Encodes all GPU work into the provided command buffer without committing.
-    fn stepOnce(self: *World, cmd: *CommandBuffer, profile: ?*ProfilingDataRaw) !void {
+    /// Encodes all GPU work into the provided compute encoder using memory barriers
+    /// between dependent dispatch groups, instead of creating separate encoders.
+    fn stepOnce(self: *World, encoder: *ComputeEncoder, profile: ?*ProfilingDataRaw) !void {
 
-        // Stage 0a: Warm start constraints from previous frame's lambda values
+        // GROUP A: warm_start_constraints + apply_actions
+        // (independent — write to different buffers: constraints vs joint_torques)
         if (self.num_constraints_per_env > 0) {
-            const params_ptr = self.params_buffer.getSlice(SimParams);
-            params_ptr[0].target_color = self.num_constraints_per_env;
-
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
+            var local_params = self.params_buffer.getSlice(SimParams)[0];
+            local_params.target_color = self.num_constraints_per_env;
 
             const pipeline = try self.pipelines.getPipeline("warm_start_constraints");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.constraints_buffer, 0, 0);
-            encoder.setBuffer(&self.params_buffer, 0, 1);
+            encoder.setBytes(std.mem.asBytes(&local_params), 1);
             encoder.setBuffer(&self.warm_start_factor_buffer, 0, 2);
             encoder.dispatch1D(pipeline, self.config.num_envs * self.num_constraints_per_env);
         }
 
-        // Stage 1: Apply actions to joint torques
         {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
-
             const pipeline = try self.pipelines.getPipeline("apply_actions");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.actions_buffer, 0, 0);
@@ -845,13 +845,11 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_actuators);
         }
 
-        // Stage 2: Compute forces (overwrites forces/torques with gravity)
-        // Runs before apply_joint_forces so it can overwrite instead of accumulate,
-        // eliminating the need to zero buffers between substeps.
-        {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
+        encoder.memoryBarrier(.buffers);
 
+        // GROUP B: compute_forces + update_kinematic
+        // (independent — forces/torques vs kinematic positions/quaternions)
+        {
             const pipeline = try self.pipelines.getPipeline("compute_forces");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.positions_buffer, 0, 0);
@@ -866,29 +864,7 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
         }
 
-        // Stage 2.5: Apply joint forces (convert joint torques to body forces/torques)
-        // Accumulates on top of gravity forces written by compute_forces via atomic_add_float.
-        if (self.params.num_joints > 0) {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
-
-            const pipeline = try self.pipelines.getPipeline("apply_joint_forces");
-            encoder.setPipeline(pipeline);
-            encoder.setBuffer(&self.state.torques_buffer, 0, 0);
-            encoder.setBuffer(&self.state.joint_torques_buffer, 0, 1);
-            encoder.setBuffer(&self.joint_data_buffer, 0, 2);
-            encoder.setBuffer(&self.state.quaternions_buffer, 0, 3);
-            encoder.setBuffer(&self.params_buffer, 0, 4);
-            encoder.setBuffer(&self.state.forces_buffer, 0, 5);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_joints);
-        }
-
-        // Stage 2.7: Update kinematic bodies
-        // Kinematic bodies follow their velocities but aren't affected by forces
         {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
-
             const pipeline = try self.pipelines.getPipeline("update_kinematic");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.positions_buffer, 0, 0);
@@ -900,11 +876,23 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
         }
 
-        // Stage 3.5: Save previous positions/quaternions for XPBD velocity update
-        {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
+        encoder.memoryBarrier(.buffers);
 
+        // GROUP C: apply_joint_forces + save_prev_state
+        // (independent — atomic forces/torques vs prev_positions/prev_quaternions)
+        if (self.params.num_joints > 0) {
+            const pipeline = try self.pipelines.getPipeline("apply_joint_forces");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.torques_buffer, 0, 0);
+            encoder.setBuffer(&self.state.joint_torques_buffer, 0, 1);
+            encoder.setBuffer(&self.joint_data_buffer, 0, 2);
+            encoder.setBuffer(&self.state.quaternions_buffer, 0, 3);
+            encoder.setBuffer(&self.params_buffer, 0, 4);
+            encoder.setBuffer(&self.state.forces_buffer, 0, 5);
+            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_joints);
+        }
+
+        {
             const pipeline = try self.pipelines.getPipeline("save_prev_state");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.positions_buffer, 0, 0);
@@ -915,12 +903,11 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
         }
 
-        // Stage 4: Integration
+        encoder.memoryBarrier(.buffers);
+
+        // GROUP D: integrate
         const integrate_start = if (profile != null) nowNanos() else 0;
         {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
-
             const pipeline = try self.pipelines.getPipeline("integrate");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.positions_buffer, 0, 0);
@@ -937,12 +924,11 @@ pub const World = struct {
             p.integrate_ns += nowNanos() - integrate_start;
         }
 
-        // Stage 5: Broad phase collision detection
+        encoder.memoryBarrier(.buffers);
+
+        // GROUP E: broad_phase
         const broad_start = if (profile != null) nowNanos() else 0;
         {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
-
             const pipeline = try self.pipelines.getPipeline("broad_phase");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.positions_buffer, 0, 0);
@@ -957,12 +943,11 @@ pub const World = struct {
             p.collision_broad_ns += nowNanos() - broad_start;
         }
 
-        // Stage 6: Narrow phase collision detection
+        encoder.memoryBarrier(.buffers);
+
+        // GROUP F: narrow_phase
         const narrow_start = if (profile != null) nowNanos() else 0;
         {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
-
             const pipeline = try self.pipelines.getPipeline("narrow_phase");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.positions_buffer, 0, 0);
@@ -977,12 +962,10 @@ pub const World = struct {
             p.collision_narrow_ns += nowNanos() - narrow_start;
         }
 
-        // Stage 6.5: Match new contacts against cached contacts from previous frame
-        // Transfer accumulated impulses for temporal coherence
-        {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
+        encoder.memoryBarrier(.buffers);
 
+        // GROUP G: match_cached_contacts
+        {
             const pipeline = try self.pipelines.getPipeline("match_cached_contacts");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.contacts_buffer, 0, 0);
@@ -993,15 +976,16 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
         }
 
-        // Stage 7: Joint solver (XPBD iterations with graph coloring)
-        // Process constraints by color to avoid race conditions when constraints share bodies
+        encoder.memoryBarrier(.buffers);
+
+        // GROUP H: solve_joints loop
+        // (barrier between each color; barrier between each iteration)
         const solve_start = if (profile != null) nowNanos() else 0;
         if (self.num_constraints_per_env > 0 and self.color_ranges != null) {
             const params_ptr = self.params_buffer.getSlice(SimParams);
             const ranges = self.color_ranges.?;
 
             for (0..self.config.contact_iterations) |_| {
-                // Process each color sequentially (constraints within a color don't share bodies)
                 for (0..self.num_colors) |color| {
                     const range = ranges[color];
                     const offset = range[0];
@@ -1009,17 +993,10 @@ pub const World = struct {
 
                     if (count == 0) continue;
 
-                    // Use a local copy of params with setBytes to snapshot per-color values.
-                    // setBuffer records a pointer read at GPU execution time, so all dispatches
-                    // in the same command buffer would see only the last-written values.
-                    // setBytes copies data into the command buffer at encoding time.
                     var local_params = params_ptr[0];
                     local_params.constraint_offset = offset;
                     local_params.num_constraints = count;
                     local_params.target_color = self.num_constraints_per_env;
-
-                    var encoder = try cmd.computeEncoder();
-                    defer encoder.endEncoding();
 
                     const pipeline = try self.pipelines.getPipeline("solve_joints");
                     encoder.setPipeline(pipeline);
@@ -1031,17 +1008,16 @@ pub const World = struct {
                     encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 5);
                     encoder.setBytes(std.mem.asBytes(&local_params), 6);
                     encoder.setBuffer(&self.body_data_buffer, 0, 7);
-                    // Dispatch count * num_envs threads (one per constraint instance)
                     encoder.dispatch1D(pipeline, self.config.num_envs * count);
+
+                    encoder.memoryBarrier(.buffers);
                 }
             }
         }
 
-        // Stage 8: Contact solver (PBD iterations)
+        // GROUP I: solve_contacts loop
+        // (barrier between each iteration)
         for (0..self.config.contact_iterations) |_| {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
-
             const pipeline = try self.pipelines.getPipeline("solve_contacts");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.positions_buffer, 0, 0);
@@ -1053,16 +1029,15 @@ pub const World = struct {
             encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 6);
             encoder.setBuffer(&self.params_buffer, 0, 7);
             encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
+
+            encoder.memoryBarrier(.buffers);
         }
         if (profile) |p| {
             p.constraint_solve_ns += nowNanos() - solve_start;
         }
 
-        // Stage 8.5: XPBD velocity update - derive velocities from position changes
+        // GROUP J: xpbd_update_velocities
         {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
-
             const pipeline = try self.pipelines.getPipeline("xpbd_update_velocities");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.positions_buffer, 0, 0);
@@ -1076,11 +1051,10 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
         }
 
-        // Stage 9: Update joint states (Inverse Kinematics for observations)
-        if (self.params.num_joints > 0) {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
+        encoder.memoryBarrier(.buffers);
 
+        // GROUP K: update_joint_states
+        if (self.params.num_joints > 0) {
             const pipeline = try self.pipelines.getPipeline("update_joint_states");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.positions_buffer, 0, 0);
@@ -1094,11 +1068,11 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_joints);
         }
 
-        // Stage 8: Read sensors
-        {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
+        encoder.memoryBarrier(.buffers);
 
+        // GROUP L: read_sensors + cache_contacts
+        // (independent — observations vs prev_contacts)
+        {
             const pipeline = try self.pipelines.getPipeline("read_sensors");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.positions_buffer, 0, 0);
@@ -1113,11 +1087,7 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_sensors);
         }
 
-        // Stage 9: Cache contacts for next frame's temporal coherence
         {
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
-
             const pipeline = try self.pipelines.getPipeline("cache_contacts");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.contacts_buffer, 0, 0);
@@ -1128,21 +1098,19 @@ pub const World = struct {
             encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
         }
 
-        // Stage 10: Store lambda_prev for next frame's warm starting
-        if (self.num_constraints_per_env > 0) {
-            const params_ptr = self.params_buffer.getSlice(SimParams);
-            params_ptr[0].target_color = self.num_constraints_per_env;
+        encoder.memoryBarrier(.buffers);
 
-            var encoder = try cmd.computeEncoder();
-            defer encoder.endEncoding();
+        // GROUP M: store_lambda_prev
+        if (self.num_constraints_per_env > 0) {
+            var local_params = self.params_buffer.getSlice(SimParams)[0];
+            local_params.target_color = self.num_constraints_per_env;
 
             const pipeline = try self.pipelines.getPipeline("store_lambda_prev");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.constraints_buffer, 0, 0);
-            encoder.setBuffer(&self.params_buffer, 0, 1);
+            encoder.setBytes(std.mem.asBytes(&local_params), 1);
             encoder.dispatch1D(pipeline, self.config.num_envs * self.num_constraints_per_env);
         }
-
     }
 
     /// Reset specific environments.
