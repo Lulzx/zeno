@@ -46,16 +46,20 @@ Zeno is a GPU-accelerated rigid body physics simulation engine optimized for rei
 
 ## Performance
 
-Benchmarked on Apple M4 Pro with real MJCF models:
+Benchmarked on Apple M4 Pro with real MJCF models (full `World.step`, medians of 5 runs):
 
-| Environment | 1024 envs × 1000 steps | vs MuJoCo |
-|-------------|------------------------|-----------|
-| Pendulum    | 206 ms | **9.7x faster** |
-| Cartpole    | 157 ms | **19.1x faster** |
-| Ant         | 174 ms | **258x faster** |
-| Humanoid    | 172 ms | **697x faster** |
+| Environment | 1024 envs × 1000 steps | Throughput |
+|-------------|------------------------|-----------------|
+| Pendulum    | 345 ms  | 2.97M steps/sec |
+| Cartpole    | 375 ms  | 2.73M steps/sec |
+| Ant         | 699 ms  | 1.47M steps/sec |
+| Humanoid    | 1367 ms | 0.75M steps/sec |
 
-**Average: 246x faster than MuJoCo**
+These are wall-clock throughput figures for Zeno's own pipeline, **not** a semantics-matched
+comparison against MuJoCo — Zeno does simplified per-step physics, so cross-simulator ratios
+would measure throughput, not physics equivalence. The timers also measure CPU encode time
+rather than GPU execution. A matched-semantics MuJoCo parity benchmark is planned but does not
+exist yet.
 
 ## Quick Example
 

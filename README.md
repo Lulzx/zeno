@@ -57,12 +57,12 @@ If you need physics you can trust unconditionally today, use MuJoCo. If you want
 
 | Environment | 1024 envs × 1000 steps | Throughput |
 |-------------|------------------------|-----------------|
-| Pendulum    | 206 ms                 | 4.97M steps/sec |
-| Cartpole    | 157 ms                 | 6.52M steps/sec |
-| Ant         | 174 ms                 | 5.89M steps/sec |
-| Humanoid    | 172 ms                 | 5.95M steps/sec |
+| Pendulum    | 345 ms                 | 2.97M steps/sec |
+| Cartpole    | 375 ms                 | 2.73M steps/sec |
+| Ant         | 699 ms                 | 1.47M steps/sec |
+| Humanoid    | 1367 ms                | 0.75M steps/sec |
 
-For reference, single-threaded MuJoCo on the same machine steps these models 10–700× slower in wall-clock terms — but see the caveat above before quoting that as a physics speedup.
+Medians of 5 runs. Throughput is lower than earlier published figures because those were measured while broad-phase collision bugs were skipping work; the corrected pipeline does the collision passes it previously dropped. Note these timers measure CPU encode time rather than GPU execution, so treat them as pipeline-throughput indicators, not device-utilization numbers.
 
 ### Scaling (synthetic GPU benchmark)
 

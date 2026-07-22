@@ -82,8 +82,9 @@ fn benchmarkCapsuleCapsule() void {
     var geom_a = primitives.Geom.capsule(0.1, 0.5);
     var geom_b = primitives.Geom.capsule(0.1, 0.5);
 
+    // Parallel z-axis capsules; axis separation sqrt(0.1^2+0.1^2)=0.1414 < radii sum 0.2 -> overlap.
     const transform_a = body.Transform{ .position = .{ 0, 0, 0 }, .quaternion = .{ 0, 0, 0, 1 } };
-    const transform_b = body.Transform{ .position = .{ 0.15, 0.15, 0 }, .quaternion = .{ 0, 0, 0, 1 } };
+    const transform_b = body.Transform{ .position = .{ 0.1, 0.1, 0 }, .quaternion = .{ 0, 0, 0, 1 } };
 
     var timer = zeno.Timer.start() catch unreachable;
 

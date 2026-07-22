@@ -65,7 +65,7 @@ Also in this area (lower severity): `sort_contacts` key ignores geom IDs so same
 
 ## P2 — Presentation & process
 
-- Re-baseline the performance tables after the P0-B fixes land (current numbers were measured with the broad-phase bugs above; throughput may change once cell/contact clears are added).
+- ~~Re-baseline the performance tables after the P0-B fixes land~~ **DONE (2026-07-22).** README + `docs/index.md` tables re-measured on M4 Pro post-fix (medians of 5 runs): Pendulum 2.97M, Cartpole 2.73M, Ant 1.47M, Humanoid 0.75M env-steps/sec — ~40–75% below the pre-fix figures, which had been inflated by the broad-phase bugs skipping collision work. Timers still measure CPU encode time (see below). Also fixed a bench-scene bug where capsule-capsule was placed 0.212 apart with combined radius 0.2, reporting a misleading 0 collisions.
 - Benchmarks: label synthetic vs engine-pipeline numbers in the bench output itself, and store hardware/compiler metadata with results.
 - Add CI steps for `scripts/test_python.sh` and a Metal API-validation (debug) test run, which would have caught the zero-thread dispatch and barrier issues.
 - `src/render/material.zig` texture loading is stubbed — either implement or stop claiming PBR texture support (README already softened).
