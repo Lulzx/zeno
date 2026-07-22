@@ -140,10 +140,20 @@ class ZenoSwarm:
         Parameters
         ----------
         actions : np.ndarray, optional
-            Actions for all agents. If None, no external actions applied.
+            External actions of shape (num_agents, action_dim) where
+            action_dim is the world's actuator count. They are stored in the
+            swarm's actions buffer (see ``get_actions``) and override the
+            built-in policy for this step. The swarm does not apply them to
+            the physics world — pass them to ``world.step`` yourself.
         """
         if actions is not None:
             actions = np.ascontiguousarray(actions, dtype=np.float32).flatten()
+            expected = self._num_agents * self._world._action_dim
+            if actions.size < expected:
+                raise ValueError(
+                    f"actions has {actions.size} elements; expected at least "
+                    f"{expected} (num_agents * world action_dim)"
+                )
             actions_ptr = ffi.cast("float*", actions.ctypes.data)
         else:
             actions_ptr = ffi.NULL
@@ -152,10 +162,25 @@ class ZenoSwarm:
         if result != 0:
             raise RuntimeError(f"Swarm step failed with error code {result}")
 
+    def get_actions(self) -> Optional[np.ndarray]:
+        """
+        Get the actions produced by the last step (policy output or the
+        external actions passed to ``step``). Returns None before the first
+        step. Shape: (num_agents, action_dim).
+        """
+        out_len = ffi.new("uint32_t*")
+        ptr = _lib.zeno_swarm_get_actions(self._handle, out_len)
+        if ptr == ffi.NULL or out_len[0] == 0:
+            return None
+        flat = np.frombuffer(ffi.buffer(ptr, out_len[0] * 4), dtype=np.float32).copy()
+        return flat.reshape(self._num_agents, -1)
+
     def get_metrics(self) -> SwarmMetrics:
         """Get metrics from the most recent step."""
         c_metrics = ffi.new("ZenoSwarmMetrics*")
-        _lib.zeno_swarm_get_metrics(self._handle, c_metrics)
+        rc = _lib.zeno_swarm_get_metrics(self._handle, c_metrics)
+        if rc != 0:
+            raise RuntimeError(f"zeno_swarm_get_metrics failed with error code {rc}")
         return SwarmMetrics(
             connectivity_ratio=c_metrics.connectivity_ratio,
             fragmentation_score=c_metrics.fragmentation_score,
@@ -174,7 +199,9 @@ class ZenoSwarm:
         """Get neighbor count for each agent as numpy array."""
         out = np.zeros(self._num_agents, dtype=np.uint32)
         out_ptr = ffi.cast("uint32_t*", out.ctypes.data)
-        _lib.zeno_swarm_get_neighbor_counts(self._handle, out_ptr, self._num_agents)
+        rc = _lib.zeno_swarm_get_neighbor_counts(self._handle, out_ptr, self._num_agents)
+        if rc != 0:
+            raise RuntimeError(f"zeno_swarm_get_neighbor_counts failed with error code {rc}")
         return out
 
     def set_body_offset(self, offset: int) -> None:
@@ -370,8 +397,6 @@ def create_swarm_world(
         mjcf_string=mjcf_xml,
         num_envs=num_envs,
         max_contacts_per_env=max_contacts_per_env,
-        max_bodies_per_env=num_agents + 1,
-        max_geoms_per_env=num_agents + 1,
     )
 
     swarm_config = SwarmConfig(

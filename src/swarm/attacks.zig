@@ -46,8 +46,10 @@ pub fn applyJamming(bus: *MessageBus, config: *const AttackConfig) void {
 
         // Block sending: zero outbox
         bus.outbox_counts[agent] = 0;
-        // Block receiving: fill inbox to max
-        bus.inbox_counts[agent] = bus.max_messages_per_step;
+        // Block receiving: discard everything that was delivered this step.
+        // (Setting the count to capacity instead would make the agent read
+        // stale slots as phantom messages.)
+        bus.inbox_counts[agent] = 0;
     }
 }
 
@@ -61,24 +63,42 @@ pub fn applyDropout(
     var rng_state: u32 = config.seed +% @as(u32, @truncate(step_count));
     if (rng_state == 0) rng_state = 1;
 
+    // Phase 1: decide which agents drop this step.
+    // (Writing row_ptr[agent+1] = row_ptr[agent] directly would break CSR
+    // monotonicity and hand this agent's neighbors to the next agent.)
+    var dropped = std.DynamicBitSet.initEmpty(graph.allocator, bus.num_agents) catch return;
+    defer dropped.deinit();
+
     for (0..bus.num_agents) |agent_idx| {
-        const agent: u32 = @intCast(agent_idx);
         const r = xorshiftFloat(&rng_state);
         if (r < config.intensity) {
-            // Clear inbox
-            bus.inbox_counts[agent] = 0;
-            // Zero graph row (disconnect from all neighbors)
-            const start = graph.row_ptr[agent];
-            const end = graph.row_ptr[agent + 1];
-            // We can't actually remove edges from CSR without rebuild,
-            // so we mark the row as empty by setting row_ptr[agent+1] = row_ptr[agent]
-            // This is safe because the graph is rebuilt every step.
-            _ = start;
-            _ = end;
-            // Instead, zero the neighbor count by adjusting total_edges tracking
-            graph.row_ptr[agent + 1] = graph.row_ptr[agent];
+            dropped.set(agent_idx);
+            bus.inbox_counts[agent_idx] = 0;
         }
     }
+
+    // Phase 2: compact the CSR graph in place, removing every edge that
+    // touches a dropped agent (both directions).
+    var new_total: u32 = 0;
+    for (0..graph.num_agents) |agent_idx| {
+        const agent: u32 = @intCast(agent_idx);
+        const start = graph.row_ptr[agent];
+        const end = graph.row_ptr[agent + 1];
+        const agent_dropped = agent_idx < bus.num_agents and dropped.isSet(agent_idx);
+
+        graph.row_ptr[agent] = new_total;
+        if (!agent_dropped) {
+            for (start..end) |e| {
+                const neighbor = graph.neighbor_ids[e];
+                if (neighbor < bus.num_agents and dropped.isSet(neighbor)) continue;
+                graph.neighbor_ids[new_total] = neighbor;
+                graph.neighbor_dists[new_total] = graph.neighbor_dists[e];
+                new_total += 1;
+            }
+        }
+    }
+    graph.row_ptr[graph.num_agents] = new_total;
+    graph.total_edges = new_total;
 }
 
 /// Byzantine: corrupt message payloads from targeted agents.

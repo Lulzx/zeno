@@ -59,8 +59,10 @@ pub const MessageBus = struct {
     pub fn init(allocator: std.mem.Allocator, config: SwarmConfig) !MessageBus {
         const num_agents = config.num_agents;
         const max_mps = config.max_messages_per_step;
+        // A configured per-agent inbox limit applies even when it is smaller
+        // than max_messages_per_step — that is the only case where it matters.
         const inbox_cap = if (config.max_inbox_per_agent > 0)
-            @max(config.max_inbox_per_agent, max_mps)
+            config.max_inbox_per_agent
         else
             max_mps;
 
@@ -247,6 +249,9 @@ pub const MessageBus = struct {
                 if (count < self.max_messages_per_step) {
                     pq[pending_base + count] = msg;
                     pc[pending_idx] = count + 1;
+                } else {
+                    // Ring slot full — the message is lost; count it.
+                    self.total_messages_dropped += 1;
                 }
             }
         }
@@ -327,6 +332,14 @@ pub const MessageBus = struct {
         self.total_messages_delivered = 0;
         self.total_bytes_sent = 0;
         self.total_messages_dropped = 0;
+    }
+
+    /// Open a fresh send window after delivery: clears only the outbox so
+    /// policies can queue messages for the NEXT step while this step's inbox
+    /// contents and delivery metrics stay intact.
+    pub fn clearOutbox(self: *MessageBus) void {
+        @memset(self.outbox_counts, 0);
+        @memset(self.bytes_sent, 0);
     }
 
     /// Get inbox messages for a specific agent.

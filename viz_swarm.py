@@ -1,7 +1,10 @@
 """3D swarm visualization — animated scatter with neighbor edges, trails, and metrics."""
 
 import sys
-sys.path.insert(0, '/Users/lulzx/work/zeno/python')
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT / "python"))
 
 import numpy as np
 import matplotlib.pyplot as plt

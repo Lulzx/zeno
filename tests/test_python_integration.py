@@ -696,7 +696,12 @@ class TestAllEnvironments:
 
         assert info["num_envs"] == 1
         assert info["num_bodies"] >= 1
-        assert info["action_dim"] >= 1
+        # Passive scenes (no <actuator> block) legitimately have action_dim 0.
+        has_actuators = "<actuator" in mjcf_path.read_text()
+        if has_actuators:
+            assert info["action_dim"] >= 1
+        else:
+            assert info["action_dim"] == 0
         assert info["obs_dim"] >= 1
         assert info["timestep"] > 0
 
@@ -862,3 +867,45 @@ class TestProfilingAPI:
 
         # Should not raise
         world.reset_profiling()
+
+
+class TestSwarm:
+    """Smoke tests for the swarm platform Python bindings."""
+
+    def _make(self, num_agents=8):
+        from zeno.swarm import ZenoSwarm, SwarmConfig, create_swarm_world
+
+        world, swarm = create_swarm_world(num_agents=num_agents, communication_range=5.0)
+        return world, swarm
+
+    def test_create_step_destroy(self):
+        _skip_if_no_lib()
+        world, swarm = self._make()
+
+        world.step(np.zeros((world.num_envs, max(world.action_dim, 1)), dtype=np.float32)[:, : world.action_dim])
+        swarm.step()
+
+        counts = swarm.get_neighbor_counts()
+        assert counts.shape == (swarm.num_agents,)
+
+    def test_metrics_populated(self):
+        _skip_if_no_lib()
+        world, swarm = self._make()
+
+        for _ in range(3):
+            swarm.step()
+
+        metrics = swarm.get_metrics()
+        assert metrics.total_edges >= 0
+        assert 0.0 <= metrics.connectivity_ratio <= 1.0
+        # A fully-clustered spawn grid within communication range is connected.
+        assert metrics.fragmentation_score >= 1.0
+
+    def test_oversized_swarm_rejected(self):
+        _skip_if_no_lib()
+        from zeno._ffi import ZenoWorld
+        from zeno.swarm import ZenoSwarm, SwarmConfig
+
+        world = ZenoWorld(mjcf_string=PENDULUM_MJCF, num_envs=1)
+        with pytest.raises(RuntimeError):
+            ZenoSwarm(world, SwarmConfig(num_agents=100000))

@@ -131,6 +131,10 @@ fn evaluateCoverage(
     const y_max = params[3];
     const cell_size = @max(params[4], 0.1);
 
+    // Reject inverted/degenerate/NaN bounds — a negative extent through
+    // @intFromFloat(u32) is illegal behavior in ReleaseFast.
+    if (!(x_max > x_min) or !(y_max > y_min)) return .{};
+
     const nx: u32 = @intFromFloat(@ceil((x_max - x_min) / cell_size));
     const ny: u32 = @intFromFloat(@ceil((y_max - y_min) / cell_size));
     const total_cells = nx * ny;

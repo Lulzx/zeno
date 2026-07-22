@@ -19,17 +19,22 @@ pub const ReplayFrame = struct {
 };
 
 const REPLAY_MAGIC: u32 = 0x5A454E4F; // "ZENO"
-const REPLAY_VERSION: u32 = 1;
+// Version 2: frame metrics are serialized (v1 silently zeroed them on load).
+const REPLAY_VERSION: u32 = 2;
+
+/// Upper bound on agents per frame accepted from a replay stream. Guards
+/// against corrupt/hostile files requesting absurd allocations.
+const MAX_REPLAY_AGENTS: u32 = 1 << 22; // 4M agents ≈ 128 MB/frame
 
 /// Records swarm frames for replay and determinism verification.
 pub const ReplayRecorder = struct {
-    frames: std.ArrayList(ReplayFrame),
+    frames: std.ArrayListUnmanaged(ReplayFrame),
     recording: bool,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) ReplayRecorder {
         return .{
-            .frames = .{},
+            .frames = .empty,
             .recording = false,
             .allocator = allocator,
         };
@@ -65,7 +70,9 @@ pub const ReplayRecorder = struct {
 
         // Copy position/velocity data for the agents
         const pos_copy = try self.allocator.alloc([4]f32, num_agents);
+        errdefer self.allocator.free(pos_copy);
         const vel_copy = try self.allocator.alloc([4]f32, num_agents);
+        errdefer self.allocator.free(vel_copy);
 
         if (num_agents > 0) {
             @memcpy(pos_copy, positions[body_offset .. body_offset + num_agents]);
@@ -128,7 +135,7 @@ pub const ReplayRecorder = struct {
     }
 
     /// Write all frames to a binary stream.
-    pub fn writeTo(self: *const ReplayRecorder, writer: anytype) !void {
+    pub fn writeTo(self: *const ReplayRecorder, writer: *std.Io.Writer) !void {
         try writer.writeInt(u32, REPLAY_MAGIC, .little);
         try writer.writeInt(u32, REPLAY_VERSION, .little);
         try writer.writeInt(u64, self.frames.items.len, .little);
@@ -153,31 +160,33 @@ pub const ReplayRecorder = struct {
             try writer.writeInt(u32, frame.messages_sent, .little);
             try writer.writeInt(u32, frame.messages_delivered, .little);
             try writer.writeInt(u32, frame.checksum, .little);
+            try writer.writeAll(std.mem.asBytes(&frame.metrics));
         }
     }
 
     /// Read frames from a binary stream.
-    pub fn readFrom(reader: anytype, allocator: std.mem.Allocator) !ReplayRecorder {
-        const magic = try reader.readInt(u32, .little);
+    pub fn readFrom(reader: *std.Io.Reader, allocator: std.mem.Allocator) !ReplayRecorder {
+        const magic = try reader.takeInt(u32, .little);
         if (magic != REPLAY_MAGIC) return error.InvalidFormat;
 
-        const version = try reader.readInt(u32, .little);
+        const version = try reader.takeInt(u32, .little);
         if (version != REPLAY_VERSION) return error.UnsupportedVersion;
 
-        const num_frames = try reader.readInt(u64, .little);
+        const num_frames = try reader.takeInt(u64, .little);
 
         var recorder = ReplayRecorder.init(allocator);
         errdefer recorder.deinit();
 
         for (0..num_frames) |_| {
-            const step = try reader.readInt(u64, .little);
-            const num_agents = try reader.readInt(u32, .little);
+            const step = try reader.takeInt(u64, .little);
+            const num_agents = try reader.takeInt(u32, .little);
+            if (num_agents > MAX_REPLAY_AGENTS) return error.InvalidFormat;
 
             const pos_copy = try allocator.alloc([4]f32, num_agents);
             errdefer allocator.free(pos_copy);
             for (pos_copy) |*pos| {
                 for (pos) |*v| {
-                    v.* = @bitCast(try reader.readInt(u32, .little));
+                    v.* = @bitCast(try reader.takeInt(u32, .little));
                 }
             }
 
@@ -185,13 +194,16 @@ pub const ReplayRecorder = struct {
             errdefer allocator.free(vel_copy);
             for (vel_copy) |*vel| {
                 for (vel) |*v| {
-                    v.* = @bitCast(try reader.readInt(u32, .little));
+                    v.* = @bitCast(try reader.takeInt(u32, .little));
                 }
             }
 
-            const messages_sent = try reader.readInt(u32, .little);
-            const messages_delivered = try reader.readInt(u32, .little);
-            const checksum = try reader.readInt(u32, .little);
+            const messages_sent = try reader.takeInt(u32, .little);
+            const messages_delivered = try reader.takeInt(u32, .little);
+            const checksum = try reader.takeInt(u32, .little);
+
+            var metrics: SwarmMetrics = .{};
+            try reader.readSliceAll(std.mem.asBytes(&metrics));
 
             try recorder.frames.append(allocator, .{
                 .step = step,
@@ -200,7 +212,7 @@ pub const ReplayRecorder = struct {
                 .velocities = vel_copy,
                 .messages_sent = messages_sent,
                 .messages_delivered = messages_delivered,
-                .metrics = .{},
+                .metrics = metrics,
                 .checksum = checksum,
             });
         }

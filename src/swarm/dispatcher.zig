@@ -28,7 +28,8 @@ pub fn stepOnce(
     num_agents: u32,
     range_sq: f32,
     policy: ?PolicyVtable,
-    external_actions: ?[]f32,
+    external_actions: ?[]const f32,
+    actions_out: []f32,
     action_dim: u32,
     step_count: u64,
     attack_config: ?*const AttackConfig,
@@ -59,9 +60,19 @@ pub fn stepOnce(
         }
     }
 
-    // 6. Dispatch policy or apply external actions
+    // 6. Open a fresh send window. This step's outbox was consumed by
+    //    deliver(); clearing only the outbox lets the policy queue messages
+    //    for the NEXT step without erasing this step's inbox or metrics.
+    //    (Clearing everything at the end of the step made delivery of
+    //    policy-sent messages impossible and zeroed all message metrics.)
+    message_bus.clearOutbox();
+
+    // 7. Dispatch policy or apply external actions into the swarm-owned
+    //    actions buffer. The caller reads the buffer back and feeds it to
+    //    World.step — the swarm itself does not touch the physics state.
     if (external_actions) |actions| {
-        _ = actions;
+        const n = @min(actions.len, actions_out.len);
+        @memcpy(actions_out[0..n], actions[0..n]);
     } else if (policy) |vtable| {
         for (0..num_agents) |i| {
             const agent_id: u32 = @intCast(i);
@@ -73,8 +84,11 @@ pub fn stepOnce(
                 .sender_id = agent_id,
             };
 
-            var dummy_actions: [1]f32 = .{0};
-            const action_slice = if (action_dim > 0) dummy_actions[0..@min(action_dim, 1)] else dummy_actions[0..0];
+            const base = i * action_dim;
+            const action_slice = if (action_dim > 0 and actions_out.len >= base + action_dim)
+                actions_out[base .. base + action_dim]
+            else
+                actions_out[0..0];
 
             vtable.step_fn(
                 agent_id,
@@ -89,9 +103,7 @@ pub fn stepOnce(
         }
     }
 
-    // 7. Physics step is done by the caller (World.step())
-    // 8. Clear message bus for next step
-    message_bus.clearStep();
+    // 8. Physics step is done by the caller (World.step()).
 }
 
 /// Compute swarm metrics from current state. Delegates to metrics module.

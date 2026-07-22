@@ -52,19 +52,23 @@ pub fn computeFragmentation(graph: *const AdjacencyGraph, num_agents: u32) u32 {
     var parent: []u32 = undefined;
     var rank: []u8 = undefined;
 
+    // Heap allocations must be freed at function scope — a defer inside the
+    // else block would free them before use.
+    const page_alloc = std.heap.page_allocator;
+    var heap_parent: ?[]u32 = null;
+    var heap_rank: ?[]u8 = null;
+    defer if (heap_rank) |r| page_alloc.free(r);
+    defer if (heap_parent) |p| page_alloc.free(p);
+
     if (num_agents <= MAX_STACK) {
         parent = stack_parent[0..num_agents];
         rank = stack_rank[0..num_agents];
     } else {
         // For large swarms, fall back to page allocator
-        const page_alloc = std.heap.page_allocator;
-        parent = page_alloc.alloc(u32, num_agents) catch return num_agents;
-        rank = page_alloc.alloc(u8, num_agents) catch {
-            page_alloc.free(parent);
-            return num_agents;
-        };
-        defer page_alloc.free(parent);
-        defer page_alloc.free(rank);
+        heap_parent = page_alloc.alloc(u32, num_agents) catch return num_agents;
+        heap_rank = page_alloc.alloc(u8, num_agents) catch return num_agents;
+        parent = heap_parent.?;
+        rank = heap_rank.?;
     }
 
     // Initialize: each node is its own parent

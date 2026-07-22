@@ -5,7 +5,10 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.animation import FuncAnimation
 import sys
-sys.path.insert(0, '/Users/lulzx/work/zeno/python')
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT / "python"))
 
 import zeno
 from zeno.examples import get_asset
@@ -113,11 +116,11 @@ def visualize_cartpole():
     plt.tight_layout()
 
     # Save the figure
-    output_path = '/Users/lulzx/work/zeno/cartpole_visualization.png'
+    output_path = PROJECT_ROOT / "cartpole_visualization.png"
     plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
     print(f"Saved visualization to: {output_path}")
 
-    return output_path
+    return str(output_path)
 
 
 def visualize_ant():
@@ -136,12 +139,28 @@ def visualize_ant():
 
     print("Running simulation...")
     for step in range(300):
-        # Sinusoidal gait
+        # Coordinated trot gait (front-right + back-left in phase)
         t = step * 0.02
         actions = np.zeros((1, 8), dtype=np.float32)
-        for i in range(8):
-            phase = i * np.pi / 4
-            actions[0, i] = 0.5 * np.sin(2 * np.pi * 2 * t + phase)
+
+        phase_a = np.sin(2 * np.pi * 1.2 * t)
+        phase_b = np.sin(2 * np.pi * 1.2 * t + np.pi)
+        phase_a_knee = np.sin(2 * np.pi * 1.2 * t + np.pi / 2)
+        phase_b_knee = np.sin(2 * np.pi * 1.2 * t + np.pi + np.pi / 2)
+
+        hip_amp = 0.25
+        ankle_amp = 0.20
+        ankle_bias = -0.20
+
+        actions[0, 0] = hip_amp * phase_a  # hip_1
+        actions[0, 6] = hip_amp * phase_a  # hip_4
+        actions[0, 2] = hip_amp * phase_b  # hip_2
+        actions[0, 4] = hip_amp * phase_b  # hip_3
+        actions[0, 1] = ankle_bias + ankle_amp * phase_a_knee  # ankle_1
+        actions[0, 7] = ankle_bias + ankle_amp * phase_a_knee  # ankle_4
+        actions[0, 3] = ankle_bias + ankle_amp * phase_b_knee  # ankle_2
+        actions[0, 5] = ankle_bias + ankle_amp * phase_b_knee  # ankle_3
+        actions = np.clip(actions, -1, 1)
 
         obs, rewards, dones, info = env.step(actions)
 
@@ -189,11 +208,11 @@ def visualize_ant():
 
     plt.tight_layout()
 
-    output_path = '/Users/lulzx/work/zeno/ant_trajectory.png'
+    output_path = PROJECT_ROOT / "ant_trajectory.png"
     plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
     print(f"Saved visualization to: {output_path}")
 
-    return output_path
+    return str(output_path)
 
 
 if __name__ == "__main__":

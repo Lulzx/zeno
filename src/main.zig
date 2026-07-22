@@ -5,6 +5,29 @@ const std = @import("std");
 
 // Module imports
 pub const objc = @import("objc.zig");
+
+/// Monotonic nanosecond timer (replacement for the removed std.time.Timer).
+pub const Timer = struct {
+    start_ns: u64,
+
+    pub fn nowNanos() u64 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    }
+
+    pub fn start() error{TimerUnsupported}!Timer {
+        return .{ .start_ns = nowNanos() };
+    }
+
+    pub fn read(self: *Timer) u64 {
+        return nowNanos() - self.start_ns;
+    }
+
+    pub fn reset(self: *Timer) void {
+        self.start_ns = nowNanos();
+    }
+};
 pub const metal = struct {
     pub const device = @import("metal/device.zig");
     pub const buffer = @import("metal/buffer.zig");
@@ -80,9 +103,6 @@ pub const ZenoConfig = extern struct {
     seed: u64 = 42,
     substeps: u32 = 1,
     enable_profiling: bool = false,
-    max_bodies_per_env: u32 = 0,
-    max_joints_per_env: u32 = 0,
-    max_geoms_per_env: u32 = 0,
 };
 
 /// World information.
@@ -125,7 +145,7 @@ pub const ZenoError = enum(i32) {
 };
 
 // Global allocator for C API
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+var gpa: std.heap.DebugAllocator(.{}) = .init;
 
 fn uploadParams(world_ptr: *World) void {
     world_ptr.params_buffer.getSlice(world.world_mod.SimParams)[0] = world_ptr.params;
@@ -474,6 +494,8 @@ export fn zeno_world_get_info(handle: ZenoWorldHandle, info: *ZenoInfo) ZenoErro
         .action_dim = world_info.action_dim,
         .timestep = world_info.timestep,
         .memory_usage = @intCast(world_info.memory_usage),
+        // Unified memory: CPU-visible and GPU-resident memory are the same
+        // allocation on Apple Silicon, so the two figures are identical.
         .gpu_memory_usage = @intCast(world_info.memory_usage),
         .metal_available = true,
     };
@@ -758,7 +780,11 @@ export fn zeno_swarm_create(
     config: *const ZenoSwarmConfig,
 ) ZenoSwarmHandle {
     if (world_handle == null) return null;
-    _ = @as(*World, @ptrCast(@alignCast(world_handle)));
+    const world_ptr = @as(*World, @ptrCast(@alignCast(world_handle)));
+
+    // Agents map onto world bodies; refuse a swarm larger than the world.
+    const total_bodies = world_ptr.params.num_envs * world_ptr.params.num_bodies;
+    if (config.num_agents > total_bodies) return null;
 
     const allocator = gpa.allocator();
     const swarm_ptr = allocator.create(Swarm) catch return null;
@@ -796,7 +822,12 @@ export fn zeno_swarm_step(
     const action_dim: u32 = world_ptr.params.num_actuators;
     const num_agents = swarm_ptr.config.num_agents;
 
-    var actions: ?[]f32 = null;
+    // Agents index into the world's body array; an oversized swarm would read
+    // past the shared GPU buffers.
+    const total_bodies = world_ptr.params.num_envs * world_ptr.params.num_bodies;
+    if (@as(u64, swarm_ptr.body_offset) + num_agents > total_bodies) return .invalid_argument;
+
+    var actions: ?[]const f32 = null;
     if (actions_ptr) |ap| {
         actions = ap[0 .. num_agents * action_dim];
     }
@@ -804,6 +835,18 @@ export fn zeno_swarm_step(
     swarm_ptr.step(positions, velocities, actions, action_dim);
 
     return .success;
+}
+
+/// Get pointer to the swarm's actions buffer (num_agents * action_dim floats),
+/// filled by the policy or external actions during the last zeno_swarm_step.
+/// Returns null if no step has run yet or the buffer is empty.
+export fn zeno_swarm_get_actions(handle: ZenoSwarmHandle, out_len: ?*u32) ?[*]const f32 {
+    if (handle == null) return null;
+    const swarm_ptr: *Swarm = @ptrCast(@alignCast(handle));
+    const actions = swarm_ptr.getActions();
+    if (out_len) |l| l.* = @intCast(actions.len);
+    if (actions.len == 0) return null;
+    return actions.ptr;
 }
 
 /// Get swarm metrics.
@@ -853,7 +896,7 @@ export fn zeno_swarm_evaluate_task(
     const positions = world_ptr.state.getPositions();
     const velocities = world_ptr.state.getVelocities();
 
-    const tt = std.meta.intToEnum(swarm.tasks.TaskType, task_type) catch return .invalid_argument;
+    const tt = std.enums.fromInt(swarm.tasks.TaskType, task_type) orelse return .invalid_argument;
     result.* = swarm_ptr.evaluateTask(tt, positions, velocities, params.*);
     return .success;
 }

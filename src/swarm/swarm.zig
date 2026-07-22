@@ -38,6 +38,11 @@ pub const Swarm = struct {
     attack_config: ?AttackConfig,
     /// Optional replay recorder.
     recorder: ?replay_mod.ReplayRecorder,
+    /// Swarm-owned actions buffer (num_agents * action_dim), filled by the
+    /// policy or by external actions each step. Read back via getActions().
+    actions: []f32,
+    /// Per-agent action dimension the buffer was sized for.
+    action_dim: u32,
 
     allocator: std.mem.Allocator,
 
@@ -76,6 +81,8 @@ pub const Swarm = struct {
             .metrics = .{},
             .attack_config = null,
             .recorder = null,
+            .actions = &.{},
+            .action_dim = 0,
             .allocator = allocator,
         };
     }
@@ -85,7 +92,26 @@ pub const Swarm = struct {
         self.graph.deinit();
         self.message_bus.deinit();
         self.allocator.free(self.agent_states);
+        if (self.actions.len > 0) self.allocator.free(self.actions);
         if (self.recorder) |*rec| rec.deinit();
+    }
+
+    /// Ensure the actions buffer matches num_agents * action_dim.
+    fn ensureActions(self: *Swarm, action_dim: u32) []f32 {
+        const needed: usize = @as(usize, self.config.num_agents) * action_dim;
+        if (self.actions.len != needed) {
+            const new_buf = self.allocator.alloc(f32, needed) catch return self.actions[0..0];
+            if (self.actions.len > 0) self.allocator.free(self.actions);
+            self.actions = new_buf;
+            self.action_dim = action_dim;
+        }
+        @memset(self.actions, 0);
+        return self.actions;
+    }
+
+    /// Actions produced by the last step (policy output or external actions).
+    pub fn getActions(self: *const Swarm) []const f32 {
+        return self.actions;
     }
 
     /// Execute one swarm step.
@@ -93,12 +119,13 @@ pub const Swarm = struct {
         self: *Swarm,
         positions: [][4]f32,
         velocities: [][4]f32,
-        external_actions: ?[]f32,
+        external_actions: ?[]const f32,
         action_dim: u32,
     ) void {
         const range_sq = self.config.communication_range * self.config.communication_range;
 
         const ac_ptr: ?*const AttackConfig = if (self.attack_config) |*ac| ac else null;
+        const actions_out = self.ensureActions(action_dim);
 
         dispatcher.stepOnce(
             &self.grid,
@@ -112,6 +139,7 @@ pub const Swarm = struct {
             range_sq,
             self.policy,
             external_actions,
+            actions_out,
             action_dim,
             self.step_count,
             ac_ptr,

@@ -50,9 +50,6 @@ ffi.cdef("""
         uint64_t seed;
         uint32_t substeps;
         bool enable_profiling;
-        uint32_t max_bodies_per_env;
-        uint32_t max_joints_per_env;
-        uint32_t max_geoms_per_env;
     } ZenoConfig;
 
     typedef struct {
@@ -277,6 +274,7 @@ ffi.cdef("""
 
     // Swarm simulation
     int zeno_swarm_step(ZenoSwarmHandle swarm, ZenoWorldHandle world, float* actions);
+    const float* zeno_swarm_get_actions(ZenoSwarmHandle swarm, uint32_t* out_len);
     int zeno_swarm_get_metrics(ZenoSwarmHandle swarm, ZenoSwarmMetrics* metrics);
     ZenoAgentState* zeno_swarm_get_agent_states(ZenoSwarmHandle swarm);
     int zeno_swarm_get_neighbor_counts(ZenoSwarmHandle swarm, uint32_t* out, uint32_t count);
@@ -364,6 +362,22 @@ def is_metal_available() -> bool:
     """Check if Metal GPU acceleration is available."""
     _check_lib()
     return _lib.zeno_metal_available()
+
+
+class _SharedMemoryArray(np.ndarray):
+    """
+    ndarray view into world-owned unified memory.
+
+    Holds a strong reference to the owning world so the underlying Metal
+    buffers cannot be freed while the view (or any view derived from it)
+    is still alive.
+    """
+
+    _zeno_owner = None
+
+    def __array_finalize__(self, obj):
+        if obj is not None:
+            self._zeno_owner = getattr(obj, "_zeno_owner", None)
 
 
 class ZeroCopyArray:
@@ -488,9 +502,6 @@ class ZenoWorld:
         seed: int = 42,
         substeps: int = 1,
         enable_profiling: bool = False,
-        max_bodies_per_env: int = 64,
-        max_joints_per_env: int = 64,
-        max_geoms_per_env: int = 128,
     ):
         _check_lib()
 
@@ -506,9 +517,6 @@ class ZenoWorld:
         config.seed = seed
         config.substeps = substeps
         config.enable_profiling = enable_profiling
-        config.max_bodies_per_env = max_bodies_per_env
-        config.max_joints_per_env = max_joints_per_env
-        config.max_geoms_per_env = max_geoms_per_env
 
         # Create world
         if mjcf_path is not None:
@@ -528,7 +536,9 @@ class ZenoWorld:
 
         # Get full info
         info = ffi.new("ZenoInfo*")
-        _lib.zeno_world_get_info(self._handle, info)
+        rc = _lib.zeno_world_get_info(self._handle, info)
+        if rc != 0:
+            raise RuntimeError(f"zeno_world_get_info failed with error code {rc}")
         self._num_bodies = info.num_bodies
         self._num_joints = info.num_joints
         self._num_sensors = info.num_sensors
@@ -594,7 +604,11 @@ class ZenoWorld:
 
     @property
     def gpu_memory_usage(self) -> int:
-        """GPU memory usage in bytes."""
+        """GPU memory usage in bytes.
+
+        On Apple Silicon unified memory this is the same allocation as
+        ``memory_usage`` — the two values are identical by design.
+        """
         return self._gpu_memory_usage
 
     def _make_zero_copy_array(
@@ -611,7 +625,10 @@ class ZenoWorld:
         # Calculate buffer size
         size = int(np.prod(shape)) * np.dtype(dtype).itemsize
         buffer = ffi.buffer(ptr, size)
-        arr = np.frombuffer(buffer, dtype=dtype).reshape(shape)
+        # The returned view must keep the world alive: a bare np.frombuffer
+        # view dangles as soon as the world is garbage collected.
+        arr = np.frombuffer(buffer, dtype=dtype).reshape(shape).view(_SharedMemoryArray)
+        arr._zeno_owner = self
 
         # Optionally cache for lifecycle management
         if cache_key is not None:
@@ -939,8 +956,10 @@ class ZenoWorld:
         arr = np.frombuffer(buffer, dtype=contact_dtype).reshape(self._num_envs, max_contacts)
 
         if zero_copy:
-             self._cached_arrays["contacts"] = ZeroCopyArray(arr, self, ptr)
-             return arr
+            arr = arr.view(_SharedMemoryArray)
+            arr._zeno_owner = self
+            self._cached_arrays["contacts"] = ZeroCopyArray(arr, self, ptr)
+            return arr
         return arr.copy()
 
     def get_contact_counts(self) -> np.ndarray:
@@ -1144,7 +1163,9 @@ class ZenoWorld:
             Dictionary with world metadata.
         """
         info = ffi.new("ZenoInfo*")
-        _lib.zeno_world_get_info(self._handle, info)
+        rc = _lib.zeno_world_get_info(self._handle, info)
+        if rc != 0:
+            raise RuntimeError(f"zeno_world_get_info failed with error code {rc}")
 
         return {
             "num_envs": info.num_envs,

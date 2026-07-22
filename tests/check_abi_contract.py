@@ -66,6 +66,15 @@ def main() -> int:
             print(f"  - {name}", file=sys.stderr)
         return 1
 
+    # Reverse direction: every exported zeno_* symbol should be declared in the
+    # cdef, otherwise the Python bindings silently drift behind the native ABI.
+    undeclared = sorted(exported - set(declared))
+    if undeclared:
+        print("ABI check failed: exported zeno_* symbols missing from the cdef:", file=sys.stderr)
+        for name in undeclared:
+            print(f"  - {name}", file=sys.stderr)
+        return 1
+
     print(f"ABI check passed: {len(declared)} declared zeno_* functions are exported.")
     return 0
 

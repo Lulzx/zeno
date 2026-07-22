@@ -50,11 +50,29 @@ pub const UniformGrid = struct {
         self.allocator.free(self.cell_ids);
     }
 
+    /// Convert one coordinate to a signed cell coordinate, safe against NaN,
+    /// infinities, and values outside i32 range.
+    fn safeCellCoord(v: f32, inv_cell_size: f32) i32 {
+        const scaled = @floor(v * inv_cell_size);
+        if (!(scaled >= 0)) return 0; // negative or NaN
+        if (scaled >= 2147483000.0) return 2147483000;
+        return @intFromFloat(scaled);
+    }
+
+    /// Convert one scaled coordinate to a cell index, safe against NaN,
+    /// infinities, and values outside u32 range (illegal @intFromFloat).
+    fn safeCellIndex(v: f32, inv_cell_size: f32, dim: u32) u32 {
+        const scaled = @floor(v * inv_cell_size);
+        if (!(scaled >= 0)) return 0; // negative or NaN
+        if (scaled >= 4294967040.0) return dim - 1; // beyond u32 range
+        return @as(u32, @intFromFloat(scaled)) % dim;
+    }
+
     /// Compute cell ID from a 3D position.
     fn cellIdFromPos(self: *const UniformGrid, x: f32, y: f32, z: f32) u32 {
-        const ix = @as(u32, @intFromFloat(@max(0, @floor(x * self.inv_cell_size)))) % self.dim_x;
-        const iy = @as(u32, @intFromFloat(@max(0, @floor(y * self.inv_cell_size)))) % self.dim_y;
-        const iz = @as(u32, @intFromFloat(@max(0, @floor(z * self.inv_cell_size)))) % self.dim_z;
+        const ix = safeCellIndex(x, self.inv_cell_size, self.dim_x);
+        const iy = safeCellIndex(y, self.inv_cell_size, self.dim_y);
+        const iz = safeCellIndex(z, self.inv_cell_size, self.dim_z);
         return ix + iy * self.dim_x + iz * self.dim_x * self.dim_y;
     }
 
@@ -114,9 +132,9 @@ pub const UniformGrid = struct {
         const pz = pos[2];
 
         // Compute cell range to search (own cell + neighbors)
-        const cx = @as(i32, @intFromFloat(@max(0, @floor(px * self.inv_cell_size))));
-        const cy = @as(i32, @intFromFloat(@max(0, @floor(py * self.inv_cell_size))));
-        const cz = @as(i32, @intFromFloat(@max(0, @floor(pz * self.inv_cell_size))));
+        const cx = safeCellCoord(px, self.inv_cell_size);
+        const cy = safeCellCoord(py, self.inv_cell_size);
+        const cz = safeCellCoord(pz, self.inv_cell_size);
 
         var count: u32 = 0;
         const max_out = @as(u32, @intCast(out_buffer.len));

@@ -32,6 +32,7 @@ Thumbs.db
 *.metallib
 
 # Generated data and visualizations
+site/
 *.csv
 *.png
 *.mp4

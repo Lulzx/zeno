@@ -520,7 +520,7 @@ test "metrics: near misses" {
     var positions = [_][4]f32{
         .{ 0, 0, 0, 0 },
         .{ 0.15, 0, 0, 0 }, // within 2x radius but not colliding (dist=0.15, col_radius=0.1)
-        .{ 100, 0, 0, 0 },  // far away
+        .{ 100, 0, 0, 0 }, // far away
     };
 
     const near_miss = metrics_mod.computeNearMisses(&positions, 0, 3, 0.1);
@@ -694,8 +694,11 @@ test "attack: jamming blocks communication" {
     attack_config.target_agents[0] = 1;
     attacks_mod.applyJamming(&bus, &attack_config);
 
-    // Agent 1's inbox should be maxed out (blocked)
-    try std.testing.expectEqual(bus.max_messages_per_step, bus.inbox_counts[1]);
+    // Agent 1's inbox is emptied — a jammed agent receives nothing (the old
+    // behavior set the count to capacity, exposing stale slots as phantom
+    // messages).
+    try std.testing.expectEqual(@as(u32, 0), bus.inbox_counts[1]);
+    try std.testing.expectEqual(@as(usize, 0), bus.getInbox(1).len);
 }
 
 test "attack: partition splits graph" {
@@ -840,13 +843,13 @@ test "replay: binary serialization roundtrip" {
     try recorder.recordFrame(0, &positions, &velocities, 0, 2, &bus, .{});
 
     // Serialize to buffer
-    var buf: std.ArrayList(u8) = .{};
-    defer buf.deinit(allocator);
-    try recorder.writeTo(buf.writer(allocator));
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try recorder.writeTo(&aw.writer);
 
     // Deserialize
-    var stream = std.io.fixedBufferStream(buf.items);
-    var recorder2 = try replay_mod.ReplayRecorder.readFrom(stream.reader(), allocator);
+    var stream: std.Io.Reader = .fixed(aw.writer.buffered());
+    var recorder2 = try replay_mod.ReplayRecorder.readFrom(&stream, allocator);
     defer recorder2.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), recorder2.frameCount());
