@@ -116,7 +116,7 @@ pub const SpatialHash = struct {
     pub fn query(
         self: *const SpatialHash,
         aabb: *const body.AABB,
-        result: *std.ArrayList(u32),
+        result: *std.array_list.Managed(u32),
     ) void {
         const min_cell: [3]i32 = .{
             @intFromFloat(@floor(aabb.min[0] / self.cell_size)),
@@ -154,14 +154,14 @@ pub const SpatialHash = struct {
     pub fn findPairs(
         self: *const SpatialHash,
         aabbs: []const body.AABB,
-        pairs: *std.ArrayList(CollisionPair),
+        pairs: *std.array_list.Managed(CollisionPair),
         env_id: u32,
     ) void {
         // Check each geometry against cells it overlaps
         for (0..self.num_geoms) |i| {
             const aabb = &aabbs[i];
 
-            var candidates = std.ArrayList(u32).init(self.allocator);
+            var candidates = std.array_list.Managed(u32).init(self.allocator);
             defer candidates.deinit();
 
             self.query(aabb, &candidates);
@@ -264,7 +264,7 @@ pub const BruteForceBroadPhase = struct {
         groups: []const u32,
         masks: []const u32,
     ) ![]CollisionPair {
-        var pairs = std.ArrayList(CollisionPair).init(allocator);
+        var pairs = std.array_list.Managed(CollisionPair).init(allocator);
 
         for (0..aabbs.len) |i| {
             for ((i + 1)..aabbs.len) |j| {

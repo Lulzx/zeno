@@ -1,0 +1,52 @@
+<mujoco model="tower">
+    <option timestep="0.005" gravity="0 0 -9.81"/>
+
+    <default>
+        <geom friction="0.9 0.01 0.01"/>
+    </default>
+
+    <worldbody>
+        <!-- Ground plane -->
+        <geom type="plane" size="20 20 0.1" rgba="0.85 0.85 0.85 1"/>
+
+        <!-- Stacked blocks (free bodies). Cube side 0.30, tiny gap to avoid initial overlap. -->
+        <body name="block0" pos="0 0 0.150">
+            <freejoint/>
+            <geom type="box" size="0.15 0.15 0.15" mass="1" rgba="0.90 0.30 0.24 1"/>
+        </body>
+        <body name="block1" pos="0 0 0.455">
+            <freejoint/>
+            <geom type="box" size="0.15 0.15 0.15" mass="1" rgba="0.95 0.61 0.07 1"/>
+        </body>
+        <body name="block2" pos="0 0 0.760">
+            <freejoint/>
+            <geom type="box" size="0.15 0.15 0.15" mass="1" rgba="0.95 0.85 0.24 1"/>
+        </body>
+        <body name="block3" pos="0 0 1.065">
+            <freejoint/>
+            <geom type="box" size="0.15 0.15 0.15" mass="1" rgba="0.18 0.72 0.42 1"/>
+        </body>
+        <body name="block4" pos="0 0 1.370">
+            <freejoint/>
+            <geom type="box" size="0.15 0.15 0.15" mass="1" rgba="0.20 0.68 0.86 1"/>
+        </body>
+        <body name="block5" pos="0 0 1.675">
+            <freejoint/>
+            <geom type="box" size="0.15 0.15 0.15" mass="1" rgba="0.30 0.42 0.90 1"/>
+        </body>
+        <body name="block6" pos="0 0 1.980">
+            <freejoint/>
+            <geom type="box" size="0.15 0.15 0.15" mass="1" rgba="0.61 0.35 0.90 1"/>
+        </body>
+        <body name="block7" pos="0 0 2.285">
+            <freejoint/>
+            <geom type="box" size="0.15 0.15 0.15" mass="1" rgba="0.90 0.35 0.66 1"/>
+        </body>
+
+        <!-- Wrecking ball projectile -->
+        <body name="ball" pos="-3.0 0 1.20">
+            <freejoint/>
+            <geom type="sphere" size="0.25" mass="6" rgba="0.15 0.15 0.18 1"/>
+        </body>
+    </worldbody>
+</mujoco>

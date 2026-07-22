@@ -66,9 +66,11 @@ pub const SpatialHashParamsGPU = extern struct {
     num_geoms: u32,
     num_envs: u32,
     max_contacts: u32,
-    _pad0: u32 = 0,
-    _pad1: u32 = 0,
-    _pad2: u32 = 0,
+    /// World-space position of grid cell (0,0,0). Without this offset every
+    /// geom at negative coordinates clamps into the boundary cells.
+    origin_x: f32 = 0,
+    origin_y: f32 = 0,
+    origin_z: f32 = 0,
 };
 
 /// Profiling data for the most recent step call.
@@ -173,7 +175,9 @@ pub const World = struct {
     allocator: std.mem.Allocator,
 
     fn nowNanos() u64 {
-        return @intCast(std.time.nanoTimestamp());
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
     }
 
     // Helper functions for quaternion math
@@ -237,7 +241,9 @@ pub const World = struct {
             "broad_phase",
             "broad_phase_count_cells",
             "broad_phase_prefix_sum",
+            "broad_phase_scatter",
             "broad_phase_detect",
+            "clear_uint_buffer",
             "sort_contacts",
             "narrow_phase",
             "solve_contacts",
@@ -309,7 +315,7 @@ pub const World = struct {
         );
 
         // Generate constraints from joints
-        var template_constraints: std.ArrayListUnmanaged(XPBDConstraint) = .{};
+        var template_constraints: std.ArrayListUnmanaged(XPBDConstraint) = .empty;
         defer template_constraints.deinit(allocator);
 
         for (scene.joints.items) |joint| {
@@ -550,18 +556,34 @@ pub const World = struct {
             sh_cell_ids = try Buffer.init(device.device, total_geoms * @sizeOf(u32), opts);
             sh_params_buf = try Buffer.init(device.device, @sizeOf(SpatialHashParamsGPU), opts);
 
-            // Initialize spatial hash params with defaults (cell_size will be refined at step time)
+            // Cell size must exceed the largest pairwise reach or the ±1-cell
+            // neighbor query misses overlapping geoms in non-adjacent cells.
+            var max_reach: f32 = 0;
+            for (scene.geoms.items) |g| {
+                if (g.geom_type == .plane) continue;
+                const reach = g.size[0] + g.size[1];
+                max_reach = @max(max_reach, reach);
+            }
+            const cell_size: f32 = @max(1.0, 2.0 * max_reach + 0.2);
+
+            // Center the grid on the origin — scenes are origin-centered, and an
+            // unshifted grid clamps all negative coordinates into boundary cells.
+            const half_extent = 0.5 * cell_size * @as(f32, @floatFromInt(grid_dim));
+
             const sh_params_ptr = sh_params_buf.?.getSlice(SpatialHashParamsGPU);
             sh_params_ptr[0] = .{
                 .grid_dim_x = grid_dim,
                 .grid_dim_y = grid_dim,
                 .grid_dim_z = grid_dim,
                 .total_cells = total_cells,
-                .cell_size = 1.0, // Default, could be tuned
-                .inv_cell_size = 1.0,
+                .cell_size = cell_size,
+                .inv_cell_size = 1.0 / cell_size,
                 .num_geoms = num_geoms,
                 .num_envs = config.num_envs,
                 .max_contacts = config.max_contacts_per_env,
+                .origin_x = -half_extent,
+                .origin_y = -half_extent,
+                .origin_z = -half_extent,
             };
 
             try sh_cell_counts.?.zero();
@@ -933,6 +955,31 @@ pub const World = struct {
     /// between dependent dispatch groups, instead of creating separate encoders.
     fn stepOnce(self: *World, encoder: *ComputeEncoder, profile: ?*ProfilingDataRaw) !void {
 
+        // GROUP 0: GPU-side count clears. CPU memsets execute at encode time —
+        // before any GPU work runs — so per-substep resets must be GPU kernels:
+        // contact counts would otherwise accumulate across substeps until they
+        // saturate max_contacts, and spatial-hash cell counts would double on
+        // every substep after the first.
+        {
+            const pipeline = try self.pipelines.getPipeline("clear_uint_buffer");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.contact_counts_buffer, 0, 0);
+            var clear_count: u32 = self.config.num_envs;
+            encoder.setBytes(std.mem.asBytes(&clear_count), 1);
+            encoder.dispatch1D(pipeline, clear_count);
+
+            if (self.use_spatial_hash) {
+                var sh_cell_counts = self.spatial_hash_cell_counts.?;
+                const sh_params = self.spatial_hash_params_buffer.?.getSlice(SpatialHashParamsGPU)[0];
+                var cell_clear_count: u32 = sh_params.total_cells * self.config.num_envs;
+                encoder.setBuffer(&sh_cell_counts, 0, 0);
+                encoder.setBytes(std.mem.asBytes(&cell_clear_count), 1);
+                encoder.dispatch1D(pipeline, cell_clear_count);
+            }
+        }
+
+        encoder.memoryBarrier(.buffers);
+
         // GROUP A: warm_start_constraints + apply_actions
         // (independent — write to different buffers: constraints vs joint_torques)
         if (self.num_constraints_per_env > 0) {
@@ -1048,9 +1095,6 @@ pub const World = struct {
             var sh_cell_ids = self.spatial_hash_cell_ids.?;
             var sh_params_buf = self.spatial_hash_params_buffer.?;
 
-            // Zero cell counts before each step
-            try sh_cell_counts.zero();
-
             // Pass 1: Count cells
             {
                 const pipeline = try self.pipelines.getPipeline("broad_phase_count_cells");
@@ -1078,7 +1122,23 @@ pub const World = struct {
 
             encoder.memoryBarrier(.buffers);
 
-            // Pass 3: Detect collisions
+            // Pass 3a: Scatter geoms into sorted order. Separate dispatch from
+            // detection — a threadgroup_barrier cannot synchronize the whole
+            // grid, so scatter must fully complete before any thread queries.
+            {
+                const pipeline = try self.pipelines.getPipeline("broad_phase_scatter");
+                encoder.setPipeline(pipeline);
+                encoder.setBuffer(&sh_cell_ids, 0, 0);
+                encoder.setBuffer(&sh_cell_offsets, 0, 1);
+                encoder.setBuffer(&sh_cell_counts, 0, 2);
+                encoder.setBuffer(&sh_sorted_geoms, 0, 3);
+                encoder.setBuffer(&sh_params_buf, 0, 4);
+                encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_geoms);
+            }
+
+            encoder.memoryBarrier(.buffers);
+
+            // Pass 3b: Detect collisions
             {
                 const pipeline = try self.pipelines.getPipeline("broad_phase_detect");
                 encoder.setPipeline(pipeline);

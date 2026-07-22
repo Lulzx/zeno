@@ -234,6 +234,9 @@ pub const ComputeEncoder = struct {
 
     /// Dispatch 1D work.
     pub fn dispatch1D(self: *ComputeEncoder, pipeline: *const ComputePipeline, count: u32) void {
+        // A zero-sized dispatch is invalid in Metal (threadsPerThreadgroup would
+        // be {0,1,1}); scenes with no sensors/actuators/joints hit this.
+        if (count == 0) return;
         const tg_size = pipeline.optimalThreadgroupSize(count);
         const grid = objc.MTLSize.make1D(count);
         self.dispatchThreads(grid, tg_size);

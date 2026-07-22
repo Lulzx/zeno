@@ -627,3 +627,44 @@ test "motor actuator with high gear produces nonzero torque" {
     try testing.expectApproxEqAbs(@as(f32, -100.0), torque3, 0.01);
     try testing.expect(torque3 < 0.0);
 }
+
+// ============================================================================
+// GPU Pipeline Regression Tests
+// ============================================================================
+
+test "contact counts do not accumulate across steps" {
+    // Regression: contact_counts was never cleared during stepping, so counts
+    // grew monotonically until they saturated max_contacts and froze the
+    // contact slots on the first pairs ever seen.
+    const allocator = testing.allocator;
+    const zeno = @import("zeno");
+
+    const scene = try zeno.mjcf.parser.parseFile(allocator, "assets/ant.xml");
+
+    const config = zeno.WorldConfig{
+        .num_envs = 2,
+        .timestep = 0.005,
+        .substeps = 2,
+        .max_contacts_per_env = 64,
+    };
+
+    var world = try zeno.World.init(allocator, scene, config);
+    defer world.deinit();
+
+    const info = world.getInfo();
+    const actions = try allocator.alloc(f32, config.num_envs * info.action_dim);
+    defer allocator.free(actions);
+    @memset(actions, 0);
+
+    // An ant resting on the plane keeps a persistent set of contacts. With the
+    // accumulation bug, counts hit max_contacts within a few steps.
+    for (0..50) |_| {
+        try world.step(actions, 0);
+    }
+
+    const counts_ptr = world.getContactCountsPtr() orelse return error.NoContactCounts;
+    for (0..config.num_envs) |env| {
+        const count = counts_ptr[env];
+        try testing.expect(count < config.max_contacts_per_env);
+    }
+}
