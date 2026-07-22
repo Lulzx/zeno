@@ -76,12 +76,10 @@ pub const Device = struct {
 
     /// Load Metal shader library from file path.
     pub fn loadLibraryFromFile(self: *Device, path: []const u8) DeviceError!void {
-        const file = std.fs.cwd().openFile(path, .{}) catch {
-            return DeviceError.LibraryCreationFailed;
-        };
-        defer file.close();
-
-        const source = file.readToEndAlloc(self.allocator, 1024 * 1024) catch {
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        const source = std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(1024 * 1024)) catch {
             return DeviceError.LibraryCreationFailed;
         };
         defer self.allocator.free(source);

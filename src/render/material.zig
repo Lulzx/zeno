@@ -321,14 +321,11 @@ pub const MaterialLibrary = struct {
     /// Load texture from file (PNG).
     pub fn loadTexture(self: *MaterialLibrary, name: []const u8, path: []const u8) !u32 {
         // Read file
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-
-        const stat = try file.stat();
-        const data = try self.allocator.alloc(u8, stat.size);
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        const data = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(64 * 1024 * 1024));
         defer self.allocator.free(data);
-
-        _ = try file.readAll(data);
 
         // Simple PNG decoder would go here
         // For now, assume raw RGBA data

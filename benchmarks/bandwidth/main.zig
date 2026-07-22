@@ -7,6 +7,13 @@ const std = @import("std");
 
 const THEORETICAL_BANDWIDTH_GBS: f64 = 273.0; // M4 Pro
 
+/// Monotonic nanosecond clock (std.time.nanoTimestamp is gone in Zig 0.16).
+fn nowNanos() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
 // Objective-C runtime
 const objc = struct {
     const c = @cImport({
@@ -200,11 +207,11 @@ const Benchmark = struct {
         // Warmup
         self.dispatchKernel(pipeline, buffers, threads, threadgroup_size);
 
-        const start = std.time.nanoTimestamp();
+        const start = nowNanos();
         for (0..iterations) |_| {
             self.dispatchKernel(pipeline, buffers, threads, threadgroup_size);
         }
-        const end = std.time.nanoTimestamp();
+        const end = nowNanos();
 
         return @intCast(@divFloor(end - start, iterations));
     }
@@ -414,7 +421,7 @@ const Benchmark = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

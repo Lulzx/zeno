@@ -122,9 +122,9 @@ pub const Renderer = struct {
         const instance_buffer = try Buffer.init(device, max_instances * @sizeOf(InstanceData), opts);
 
         // Generate geometry
-        var vertex_data = std.ArrayList(f32).init(allocator);
+        var vertex_data = std.array_list.Managed(f32).init(allocator);
         defer vertex_data.deinit();
-        var index_data = std.ArrayList(u32).init(allocator);
+        var index_data = std.array_list.Managed(u32).init(allocator);
         defer index_data.deinit();
 
         // Sphere (UV sphere)
@@ -355,7 +355,7 @@ fn createLinePipeline(device: objc.id, library: objc.id) !objc.id {
 }
 
 // Geometry generation
-fn generateSphere(vertices: *std.ArrayList(f32), indices: *std.ArrayList(u32), segments: u32, rings: u32) !void {
+fn generateSphere(vertices: *std.array_list.Managed(f32), indices: *std.array_list.Managed(u32), segments: u32, rings: u32) !void {
     const base_vertex: u32 = @intCast(vertices.items.len / 8);
 
     // Generate vertices
@@ -404,7 +404,7 @@ fn generateSphere(vertices: *std.ArrayList(f32), indices: *std.ArrayList(u32), s
     }
 }
 
-fn generateCapsule(vertices: *std.ArrayList(f32), indices: *std.ArrayList(u32), segments: u32, rings: u32) !void {
+fn generateCapsule(vertices: *std.array_list.Managed(f32), indices: *std.array_list.Managed(u32), segments: u32, rings: u32) !void {
     // Proper capsule: two hemispheres connected by a cylinder
     // The capsule is aligned along Z-axis with total height 2 (1 for each cap + 0 for cylinder at unit scale)
     // Scale will be applied in the shader
@@ -546,7 +546,7 @@ fn generateCapsule(vertices: *std.ArrayList(f32), indices: *std.ArrayList(u32), 
     }
 }
 
-fn generateBox(vertices: *std.ArrayList(f32), indices: *std.ArrayList(u32)) !void {
+fn generateBox(vertices: *std.array_list.Managed(f32), indices: *std.array_list.Managed(u32)) !void {
     const base_vertex: u32 = @intCast(vertices.items.len / 8);
 
     // Box vertices (24 vertices for proper normals)

@@ -13,11 +13,11 @@ const joint_mod = @import("zeno").physics.joint;
 const primitives = @import("zeno").collision.primitives;
 
 /// Create a leak-detecting allocator for testing.
-fn createLeakDetectingAllocator() std.heap.GeneralPurposeAllocator(.{
+fn createLeakDetectingAllocator() std.heap.DebugAllocator(.{
     .enable_memory_limit = false,
     .safety = true,
 }) {
-    return .{};
+    return .init;
 }
 
 test "scene allocation and deallocation - no leaks" {

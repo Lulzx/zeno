@@ -30,7 +30,7 @@ fn benchmarkGridRebuild(allocator: std.mem.Allocator, num_agents: u32) !void {
     }
 
     const iters: u32 = 100;
-    var timer = try std.time.Timer.start();
+    var timer = try zeno.Timer.start();
 
     for (0..iters) |_| {
         grid.rebuild(positions, 0, num_agents);
@@ -64,7 +64,7 @@ fn benchmarkGraphBuild(allocator: std.mem.Allocator, num_agents: u32) !void {
     grid.rebuild(positions, 0, num_agents);
 
     const iters: u32 = 100;
-    var timer = try std.time.Timer.start();
+    var timer = try zeno.Timer.start();
 
     for (0..iters) |_| {
         graph.buildFromGrid(&grid, positions, 0, num_agents, 100.0);
@@ -107,7 +107,7 @@ fn benchmarkMessageDelivery(allocator: std.mem.Allocator, num_agents: u32) !void
     graph.buildFromGrid(&grid, positions, 0, num_agents, 100.0);
 
     const iters: u32 = 100;
-    var timer = try std.time.Timer.start();
+    var timer = try zeno.Timer.start();
 
     for (0..iters) |iter| {
         bus.clearStep();
@@ -159,7 +159,7 @@ fn benchmarkFullStep(allocator: std.mem.Allocator, num_agents: u32) !void {
     swarm.setBodyOffset(1);
 
     const iters: u32 = 100;
-    var timer = try std.time.Timer.start();
+    var timer = try zeno.Timer.start();
 
     for (0..iters) |_| {
         swarm.step(positions, velocities, null, 0);

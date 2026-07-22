@@ -71,7 +71,7 @@ fn runBenchmark(allocator: Allocator, config: BenchConfig) !BenchResult {
     world.reset(null);
 
     // Timed benchmark
-    var timer = try std.time.Timer.start();
+    var timer = try zeno.Timer.start();
 
     for (0..config.num_steps) |_| {
         try world.step(actions, 1);
@@ -184,41 +184,42 @@ fn outputTrajectoryCSV(allocator: Allocator) !void {
     defer allocator.free(actions);
     @memset(actions, 0);
 
-    // Open CSV file
-    const file = try std.fs.cwd().createFile("zeno_trajectory.csv", .{});
-    defer file.close();
+    // Accumulate CSV in memory, write once at the end.
+    var csv: std.Io.Writer.Allocating = .init(allocator);
+    defer csv.deinit();
 
-    // Write header
-    _ = try file.write("step,time,bob_x,bob_y,bob_z\n");
+    try csv.writer.writeAll("step,time,bob_x,bob_y,bob_z\n");
 
     const positions = world.getBodyPositions();
     const dt: f64 = 0.02;
-
-    var line_buf: [256]u8 = undefined;
 
     // Simulate 5 seconds
     for (0..250) |step| {
         const t = @as(f64, @floatFromInt(step)) * dt;
         const bob_pos = positions[2]; // Bob is body index 2
 
-        const line = std.fmt.bufPrint(&line_buf, "{d},{d:.4},{d:.6},{d:.6},{d:.6}\n", .{
+        try csv.writer.print("{d},{d:.4},{d:.6},{d:.6},{d:.6}\n", .{
             step,
             t,
             bob_pos[0],
             bob_pos[1],
             bob_pos[2],
-        }) catch continue;
-        _ = try file.write(line);
+        });
 
         try world.step(actions, 1);
     }
+
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "zeno_trajectory.csv", .data = csv.writer.buffered() });
 
     std.debug.print("Saved: zeno_trajectory.csv\n", .{});
     std.debug.print("Run: python benchmarks/validate_physics.py to compare with MuJoCo\n", .{});
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

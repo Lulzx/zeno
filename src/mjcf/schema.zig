@@ -128,10 +128,10 @@ pub const MjcfBody = struct {
     mocap: bool = false,
     inertial: ?MjcfInertial = null,
 
-    joints: std.ArrayListUnmanaged(MjcfJoint) = .{},
-    geoms: std.ArrayListUnmanaged(MjcfGeom) = .{},
-    children: std.ArrayListUnmanaged(MjcfBody) = .{},
-    sites: std.ArrayListUnmanaged(MjcfSite) = .{},
+    joints: std.ArrayListUnmanaged(MjcfJoint) = .empty,
+    geoms: std.ArrayListUnmanaged(MjcfGeom) = .empty,
+    children: std.ArrayListUnmanaged(MjcfBody) = .empty,
+    sites: std.ArrayListUnmanaged(MjcfSite) = .empty,
 
     pub fn deinit(self: *MjcfBody, allocator: std.mem.Allocator) void {
         for (self.children.items) |*child| {
@@ -369,7 +369,7 @@ pub const MjcfTendon = struct {
     name: []const u8 = "",
     tendon_type: TendonType = .fixed,
     /// Path elements.
-    path: std.ArrayListUnmanaged(MjcfTendonPath) = .{},
+    path: std.ArrayListUnmanaged(MjcfTendonPath) = .empty,
     /// Stiffness coefficient.
     stiffness: f32 = 0.0,
     /// Damping coefficient.
@@ -424,16 +424,16 @@ pub const MjcfEquality = struct {
 pub const MjcfModel = struct {
     model_name: []const u8 = "",
     option: MjcfOption = .{},
-    defaults: std.StringHashMapUnmanaged(MjcfDefault) = .{},
+    defaults: std.StringHashMapUnmanaged(MjcfDefault) = .empty,
     worldbody: MjcfBody = .{},
-    actuators: std.ArrayListUnmanaged(MjcfActuator) = .{},
-    sensors: std.ArrayListUnmanaged(MjcfSensor) = .{},
-    meshes: std.ArrayListUnmanaged(MjcfMesh) = .{},
-    heightfields: std.ArrayListUnmanaged(MjcfHeightfield) = .{},
-    textures: std.ArrayListUnmanaged(MjcfTexture) = .{},
-    materials: std.ArrayListUnmanaged(MjcfMaterial) = .{},
-    tendons: std.ArrayListUnmanaged(MjcfTendon) = .{},
-    equalities: std.ArrayListUnmanaged(MjcfEquality) = .{},
+    actuators: std.ArrayListUnmanaged(MjcfActuator) = .empty,
+    sensors: std.ArrayListUnmanaged(MjcfSensor) = .empty,
+    meshes: std.ArrayListUnmanaged(MjcfMesh) = .empty,
+    heightfields: std.ArrayListUnmanaged(MjcfHeightfield) = .empty,
+    textures: std.ArrayListUnmanaged(MjcfTexture) = .empty,
+    materials: std.ArrayListUnmanaged(MjcfMaterial) = .empty,
+    tendons: std.ArrayListUnmanaged(MjcfTendon) = .empty,
+    equalities: std.ArrayListUnmanaged(MjcfEquality) = .empty,
     model_dir: []const u8 = "", // Directory containing the model for relative paths
 
     pub fn deinit(self: *MjcfModel, allocator: std.mem.Allocator) void {

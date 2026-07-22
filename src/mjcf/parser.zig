@@ -18,15 +18,19 @@ pub const ParseError = error{
     OutOfMemory,
 };
 
+/// Read an entire file into memory using a blocking Io instance.
+fn readWholeFile(allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(limit));
+}
+
 /// Parse an MJCF file and return a Scene.
 pub fn parseFile(allocator: std.mem.Allocator, path: []const u8) !Scene {
-    const file = std.fs.cwd().openFile(path, .{}) catch {
-        return ParseError.FileNotFound;
-    };
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch {
-        return ParseError.OutOfMemory;
+    const content = readWholeFile(allocator, path, 10 * 1024 * 1024) catch |err| switch (err) {
+        error.OutOfMemory => return ParseError.OutOfMemory,
+        else => return ParseError.FileNotFound,
     };
     defer allocator.free(content);
 
@@ -67,7 +71,7 @@ fn processIncludes(allocator: std.mem.Allocator, xml: []const u8, model_dir: []c
     }
 
     // Find include directives
-    var result: std.ArrayListUnmanaged(u8) = .{};
+    var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(allocator);
 
     var pos: usize = 0;
@@ -129,10 +133,10 @@ fn processIncludes(allocator: std.mem.Allocator, xml: []const u8, model_dir: []c
 
 /// Load content from an included file.
 fn loadIncludedFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const file = std.fs.cwd().openFile(path, .{}) catch return error.FileNotFound;
-    defer file.close();
-
-    return try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    return readWholeFile(allocator, path, 10 * 1024 * 1024) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.FileNotFound,
+    };
 }
 
 /// Extract attribute value from a tag.

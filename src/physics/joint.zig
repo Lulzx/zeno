@@ -200,7 +200,7 @@ pub const ConstraintParams = struct {
 
 /// Decompose joint into primitive constraints.
 pub fn decomposeJoint(joint: *const JointDef, allocator: std.mem.Allocator) ![]JointConstraint {
-    var constraints: std.ArrayListUnmanaged(JointConstraint) = .{};
+    var constraints: std.ArrayListUnmanaged(JointConstraint) = .empty;
     // defer constraints.deinit(allocator); // Don't deinit, we return owned slice
 
     switch (joint.joint_type) {

@@ -162,7 +162,7 @@ pub const SensorGPU = extern struct {
 
 /// Sensor configuration for a model.
 pub const SensorConfig = struct {
-    sensors: std.ArrayListUnmanaged(Sensor) = .{},
+    sensors: std.ArrayListUnmanaged(Sensor) = .empty,
     total_dim: u32 = 0,
     allocator: ?std.mem.Allocator = null,
 

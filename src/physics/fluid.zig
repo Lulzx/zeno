@@ -79,7 +79,7 @@ pub const SpatialHash = struct {
             .allocator = allocator,
             .cell_size = cell_size,
             .cells = std.AutoHashMap(u32, std.ArrayListUnmanaged(u32)).init(allocator),
-            .particle_cells = .{},
+            .particle_cells = .empty,
         };
     }
 
@@ -124,7 +124,7 @@ pub const SpatialHash = struct {
 
             const gop = try self.cells.getOrPut(cell_id);
             if (!gop.found_existing) {
-                gop.value_ptr.* = .{};
+                gop.value_ptr.* = .empty;
             }
             try gop.value_ptr.append(self.allocator, @intCast(i));
         }

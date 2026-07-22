@@ -31,7 +31,7 @@ fn benchmarkSphereSphere() void {
     const transform_a = body.Transform{ .position = .{ 0, 0, 0 }, .quaternion = .{ 0, 0, 0, 1 } };
     const transform_b = body.Transform{ .position = .{ 0.8, 0, 0 }, .quaternion = .{ 0, 0, 0, 1 } };
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = zeno.Timer.start() catch unreachable;
 
     var collisions: u32 = 0;
     for (0..iterations) |_| {
@@ -58,7 +58,7 @@ fn benchmarkSphereCapsule() void {
     const transform_a = body.Transform{ .position = .{ 0, 0, 0 }, .quaternion = .{ 0, 0, 0, 1 } };
     const transform_b = body.Transform{ .position = .{ 0.5, 0, 0 }, .quaternion = .{ 0, 0, 0, 1 } };
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = zeno.Timer.start() catch unreachable;
 
     var collisions: u32 = 0;
     for (0..iterations) |_| {
@@ -85,7 +85,7 @@ fn benchmarkCapsuleCapsule() void {
     const transform_a = body.Transform{ .position = .{ 0, 0, 0 }, .quaternion = .{ 0, 0, 0, 1 } };
     const transform_b = body.Transform{ .position = .{ 0.15, 0.15, 0 }, .quaternion = .{ 0, 0, 0, 1 } };
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = zeno.Timer.start() catch unreachable;
 
     var collisions: u32 = 0;
     for (0..iterations) |_| {
@@ -126,7 +126,7 @@ fn benchmarkSpatialHash(allocator: std.mem.Allocator) !void {
     }
 
     // Benchmark update
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = zeno.Timer.start() catch unreachable;
 
     for (0..iterations) |_| {
         hash.update(&positions, num_objects);

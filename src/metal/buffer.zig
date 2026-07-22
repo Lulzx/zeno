@@ -198,14 +198,14 @@ pub const Buffer = struct {
 /// Pool of pre-allocated buffers for efficient memory management.
 pub const BufferPool = struct {
     device: objc.id,
-    buffers: std.ArrayList(Buffer),
+    buffers: std.array_list.Managed(Buffer),
     allocator: std.mem.Allocator,
     default_options: BufferOptions,
 
     pub fn init(allocator: std.mem.Allocator, device: objc.id) BufferPool {
         return .{
             .device = device,
-            .buffers = std.ArrayList(Buffer).init(allocator),
+            .buffers = std.array_list.Managed(Buffer).init(allocator),
             .allocator = allocator,
             .default_options = .{ .storage_mode = .shared },
         };

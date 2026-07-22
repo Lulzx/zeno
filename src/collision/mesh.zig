@@ -167,7 +167,7 @@ fn computeConvexHull(allocator: std.mem.Allocator, vertices: []const [3]f32) ![]
     }
 
     // Also add diagonal extremals for better approximation
-    var hull_list = std.ArrayList([3]f32).init(allocator);
+    var hull_list = std.array_list.Managed([3]f32).init(allocator);
     errdefer hull_list.deinit();
 
     // Add unique extremal vertices
@@ -239,12 +239,20 @@ pub const MeshAsset = struct {
     mesh: Mesh,
 };
 
+/// Read an entire file into memory using a blocking Io instance.
+fn readWholeFile(allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(limit));
+}
+
 /// Load STL file (ASCII or binary).
 pub fn loadSTL(allocator: std.mem.Allocator, path: []const u8, scale: [3]f32) !Mesh {
-    const file = std.fs.cwd().openFile(path, .{}) catch return error.FileNotFound;
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, 50 * 1024 * 1024); // 50MB max
+    const content = readWholeFile(allocator, path, 50 * 1024 * 1024) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.FileNotFound,
+    };
     defer allocator.free(content);
 
     // Check if binary or ASCII
@@ -263,9 +271,9 @@ fn loadBinarySTL(allocator: std.mem.Allocator, content: []const u8, scale: [3]f3
     const expected_size = 84 + num_triangles * 50;
     if (content.len < expected_size) return error.InvalidFormat;
 
-    var vertices = std.ArrayList([3]f32).init(allocator);
+    var vertices = std.array_list.Managed([3]f32).init(allocator);
     errdefer vertices.deinit();
-    var indices = std.ArrayList(u32).init(allocator);
+    var indices = std.array_list.Managed(u32).init(allocator);
     errdefer indices.deinit();
 
     var offset: usize = 84;
@@ -302,9 +310,9 @@ fn loadBinarySTL(allocator: std.mem.Allocator, content: []const u8, scale: [3]f3
 }
 
 fn loadAsciiSTL(allocator: std.mem.Allocator, content: []const u8, scale: [3]f32) !Mesh {
-    var vertices = std.ArrayList([3]f32).init(allocator);
+    var vertices = std.array_list.Managed([3]f32).init(allocator);
     errdefer vertices.deinit();
-    var indices = std.ArrayList(u32).init(allocator);
+    var indices = std.array_list.Managed(u32).init(allocator);
     errdefer indices.deinit();
 
     var lines = std.mem.splitAny(u8, content, "\r\n");
@@ -339,15 +347,15 @@ fn loadAsciiSTL(allocator: std.mem.Allocator, content: []const u8, scale: [3]f32
 
 /// Load simple OBJ file (vertices and faces only).
 pub fn loadOBJ(allocator: std.mem.Allocator, path: []const u8, scale: [3]f32) !Mesh {
-    const file = std.fs.cwd().openFile(path, .{}) catch return error.FileNotFound;
-    defer file.close();
-
-    const content = try file.readToEndAlloc(allocator, 50 * 1024 * 1024);
+    const content = readWholeFile(allocator, path, 50 * 1024 * 1024) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.FileNotFound,
+    };
     defer allocator.free(content);
 
-    var vertices = std.ArrayList([3]f32).init(allocator);
+    var vertices = std.array_list.Managed([3]f32).init(allocator);
     errdefer vertices.deinit();
-    var indices = std.ArrayList(u32).init(allocator);
+    var indices = std.array_list.Managed(u32).init(allocator);
     errdefer indices.deinit();
 
     var lines = std.mem.splitAny(u8, content, "\r\n");

@@ -588,7 +588,7 @@ fn runBenchmark(
     }
 
     // Timed runs
-    var timer = try std.time.Timer.start();
+    var timer = try zeno.Timer.start();
 
     if (use_fused_kernel) {
         // Single dispatch does all steps - minimal overhead

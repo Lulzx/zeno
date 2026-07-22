@@ -3,8 +3,11 @@
 ## Requirements
 
 - **macOS 13+** (Ventura or later)
-- **Zig 0.15+** ([download](https://ziglang.org/download/))
+- **Zig 0.16.0** ([download](https://ziglang.org/download/))
 - **Apple Silicon** (M1/M2/M3/M4) recommended
+
+!!! warning "Zig version"
+    Zeno targets Zig 0.16, matching `.tool-versions` and CI. Zig 0.14 is no longer supported: besides the stdlib API differences, Zig 0.14 cannot link native binaries against the macOS 26 SDK at all (its libSystem stub parser predates that SDK format).
 
 ## Building from Source
 
@@ -104,7 +107,7 @@ If you see errors about Metal not being available:
 
 If the Zig build fails:
 
-1. Verify Zig version: `zig version` (should be 0.15+)
+1. Verify Zig version: `zig version` (should be 0.16.x)
 2. Clean and rebuild: `rm -rf .zig-cache && zig build`
 
 ### Python Import Errors

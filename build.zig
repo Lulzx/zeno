@@ -1,5 +1,19 @@
 const std = @import("std");
 
+fn linkAppleRuntime(artifact: *std.Build.Step.Compile) void {
+    if (@hasDecl(std.Build.Step.Compile, "linkFramework")) {
+        artifact.linkFramework("Metal");
+        artifact.linkFramework("Foundation");
+        artifact.linkFramework("QuartzCore");
+        artifact.linkLibC();
+    } else {
+        artifact.root_module.linkFramework("Metal", .{});
+        artifact.root_module.linkFramework("Foundation", .{});
+        artifact.root_module.linkFramework("QuartzCore", .{});
+        artifact.root_module.link_libc = true;
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -15,11 +29,8 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
     });
 
-    // Link against Metal and Foundation frameworks
-    lib.linkFramework("Metal");
-    lib.linkFramework("Foundation");
-    lib.linkFramework("QuartzCore");
-    lib.linkLibC();
+    // Link against Metal and Foundation frameworks.
+    linkAppleRuntime(lib);
 
     // Install the library
     b.installArtifact(lib);
@@ -34,10 +45,7 @@ pub fn build(b: *std.Build) void {
         }),
         .linkage = .static,
     });
-    static_lib.linkFramework("Metal");
-    static_lib.linkFramework("Foundation");
-    static_lib.linkFramework("QuartzCore");
-    static_lib.linkLibC();
+    linkAppleRuntime(static_lib);
 
     // Bandwidth benchmark (standalone)
     const bandwidth_bench = b.addExecutable(.{
@@ -48,9 +56,15 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
-    bandwidth_bench.linkFramework("Metal");
-    bandwidth_bench.linkFramework("Foundation");
-    bandwidth_bench.linkLibC();
+    if (@hasDecl(std.Build.Step.Compile, "linkFramework")) {
+        bandwidth_bench.linkFramework("Metal");
+        bandwidth_bench.linkFramework("Foundation");
+        bandwidth_bench.linkLibC();
+    } else {
+        bandwidth_bench.root_module.linkFramework("Metal", .{});
+        bandwidth_bench.root_module.linkFramework("Foundation", .{});
+        bandwidth_bench.root_module.link_libc = true;
+    }
 
     b.installArtifact(bandwidth_bench);
 
@@ -88,10 +102,7 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
-        unit_test.linkFramework("Metal");
-        unit_test.linkFramework("Foundation");
-        unit_test.linkFramework("QuartzCore");
-        unit_test.linkLibC();
+        linkAppleRuntime(unit_test);
 
         const run_test = b.addRunArtifact(unit_test);
         test_step.dependOn(&run_test.step);
@@ -120,10 +131,7 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
-        bench.linkFramework("Metal");
-        bench.linkFramework("Foundation");
-        bench.linkFramework("QuartzCore");
-        bench.linkLibC();
+        linkAppleRuntime(bench);
 
         const run_bench = b.addRunArtifact(bench);
         bench_step.dependOn(&run_bench.step);

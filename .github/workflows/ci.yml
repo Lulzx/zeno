@@ -15,13 +15,16 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.0
+          version: 0.16.0
 
       - name: Build
         run: zig build -Doptimize=ReleaseFast
 
       - name: Zig tests
         run: zig build test
+        env:
+          # Metal API validation catches invalid dispatches/bindings in CI.
+          MTL_DEBUG_LAYER: "1"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -50,7 +53,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.0
+          version: 0.16.0
 
       - name: Run benchmarks
         run: zig build bench

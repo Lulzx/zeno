@@ -1,17 +1,29 @@
-# Zeno: High-Performance Batched Robotics Simulation Engine
+# Zeno: Batched Rigid-Body Simulation for Apple Silicon
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/platform-macOS-blue.svg)](https://www.apple.com/macos/)
 [![CI](https://github.com/lulzx/zeno/actions/workflows/ci.yml/badge.svg)](https://github.com/lulzx/zeno/actions/workflows/ci.yml)
 
-**Zeno** is a GPU-accelerated rigid body physics simulation engine optimized for reinforcement learning and robot policy training. It is designed from first principles to exploit Apple Silicon's unified memory architecture, achieving 10-100x throughput improvements over existing solutions for batched parallel environments.
+**Zeno** is a Metal-native, massively batched rigid-body physics engine written in Zig, built for reinforcement-learning workloads on Apple Silicon. It is designed around unified memory: simulation state lives in shared `MTLBuffer`s that Python sees as zero-copy numpy arrays, and thousands of environments step in parallel on the GPU.
+
+The niche it targets is specific: **Isaac Gym–style batched simulation, but for Macs.** Most robotics simulation stacks assume NVIDIA GPUs or CPU portability; Zeno is built from first principles for Apple's GPU and memory architecture.
 
 The name references Zeno of Elea, whose paradoxes on motion and infinity are foundational to physics and mathematics — fitting for a simulation engine that discretizes continuous motion into parallel computation.
+
+## Project Status
+
+Zeno is a **research engine, not a validated MuJoCo replacement**. Honest framing of where things stand:
+
+- **Solid**: the staged Metal compute pipeline, batched SoA state layout, unified-memory zero-copy access, MJCF loading, Python/Gymnasium bindings, and the XPBD solver skeleton with graph-coloring parallelism.
+- **Implemented but not rigorously validated**: contact stability under stacking, friction behavior, joint drift over long horizons, energy conservation, and agreement with trusted reference simulators. "Runs and looks plausible" is a much lower bar than "production-correct physics," and Zeno has not yet earned the higher one.
+- **Experimental**: soft bodies (PBD cloth/volumetric), SPH fluids, PBR materials/rendering, tendons, and the swarm platform. These exist behind the Zig API and have unit tests, but should be treated as prototypes.
+
+If you need physics you can trust unconditionally today, use MuJoCo. If you want high-throughput batched rollouts on a Mac and can tolerate a young engine, Zeno is for you.
 
 ## Features
 
 ### Core Engine
-- **Native Metal Compute** — Hand-written MSL shaders, 8-stage compute pipeline
+- **Native Metal Compute** — Hand-written MSL shaders, staged compute pipeline (actions → forces → integrate → collision → constraint solve → sensors)
 - **Unified Memory** — Zero-copy CPU↔GPU via Apple Silicon shared memory
 - **Batched Simulation** — 1,024 to 16,384+ parallel environments
 - **SoA Memory Layout** — float4-aligned, coalesced GPU access
@@ -23,53 +35,47 @@ The name references Zeno of Elea, whose paradoxes on motion and infinity are fou
 - **Collision Detection** — Spatial hashing broad phase, GJK+EPA for convex hulls, sphere/capsule/box/plane/mesh/heightfield primitives
 - **Contact Resolution** — XPBD contact solver with warm starting and contact caching for temporal coherence
 - **Adaptive Substeps** — Dynamic substep adjustment based on constraint violation
-- **Soft Bodies** — PBD deformable cloth and volumetric bodies
-- **Fluids** — SPH fluid simulation with spatial hashing
-- **Materials** — PBR materials with texture support
 
 ### Integration
 - **MJCF Parser** — Bodies, joints, geoms, actuators, sensors, defaults, inertia (explicit and shape-based)
 - **Python Bindings** — cffi-based, zero-copy numpy arrays via unified memory
-- **Gymnasium API** — Full API compliance with vectorized environment support
+- **Gymnasium API** — Vectorized environment support
 - **Stable-Baselines3** — Direct integration with SB3 and other RL libraries
-- **C ABI** — Full FFI for custom language bindings
-- **CI/CD** — GitHub Actions with Zig build, tests, and Python integration tests
+- **C ABI** — FFI surface for custom language bindings
 
-### Environments
-- **Pendulum** — 3 bodies, 1 joint, 1 actuator
-- **Cartpole** — 3 bodies, 2 joints, 1 actuator
-- **Ant** — 9 bodies, 9 joints, 8 actuators
-- **Humanoid** — 14 bodies, 14 joints, 13 actuators
-- **HalfCheetah** — 8 bodies, 6 joints, 6 actuators
-- **Hopper** — 5 bodies, 3 joints, 3 actuators
-- **Walker2d** — 8 bodies, 6 joints, 6 actuators
-- **Swimmer** — 4 bodies, 2 joints, 2 actuators
-- **Reacher** — 5 bodies, 2 joints, 2 actuators
-- **Pusher** — 6 bodies, 5 joints, 3 actuators
+### Experimental (Zig API only, prototype quality)
+- **Soft Bodies** — PBD deformable cloth and volumetric bodies
+- **Fluids** — SPH fluid simulation with spatial hashing
+- **Materials** — PBR material definitions (texture decoding is stubbed)
+- **Swarm** — multi-agent grid/graph/message-bus layer on top of the physics world
 
 ## Performance
 
-Benchmarked on Apple M4 Pro (14-core CPU, 20-core GPU) with real MJCF models:
+**What these numbers are:** wall-clock throughput of Zeno's own pipeline on its supported workload subset, measured on an Apple M4 Pro (14-core CPU, 20-core GPU). They are **not** a semantics-matched comparison with MuJoCo: MuJoCo does richer physics per step (different solver, contact model, and numerical tolerances), and Zeno's benchmark harness includes simplified kernel paths. A GPU engine stepping thousands of simplified environments will always look dramatically faster than a CPU engine doing more work per step — treat cross-simulator ratios as throughput ratios, not physics-equivalence claims.
 
-| Environment | 1024 envs × 1000 steps | vs MuJoCo | Throughput |
-|-------------|------------------------|-----------|------------|
-| Pendulum    | 206 ms                 | **9.7x**  | 4.97M steps/sec |
-| Cartpole    | 157 ms                 | **19.1x** | 6.52M steps/sec |
-| Ant         | 174 ms                 | **258x**  | 5.89M steps/sec |
-| Humanoid    | 172 ms                 | **697x**  | 5.95M steps/sec |
+### Engine pipeline throughput (real MJCF models, full `World.step`)
 
-**Average speedup: 246x faster than MuJoCo**
+| Environment | 1024 envs × 1000 steps | Throughput |
+|-------------|------------------------|-----------------|
+| Pendulum    | 206 ms                 | 4.97M steps/sec |
+| Cartpole    | 157 ms                 | 6.52M steps/sec |
+| Ant         | 174 ms                 | 5.89M steps/sec |
+| Humanoid    | 172 ms                 | 5.95M steps/sec |
 
-### Scaling Performance (GPU Benchmark)
+For reference, single-threaded MuJoCo on the same machine steps these models 10–700× slower in wall-clock terms — but see the caveat above before quoting that as a physics speedup.
 
-| Environment | Envs | Time | Target | Speedup |
-|-------------|------|------|--------|---------|
-| Pendulum    | 1024 | 15ms | 50ms   | 3.4x ✓ |
-| Cartpole    | 1024 | 50ms | 80ms   | 1.6x ✓ |
-| Ant         | 1024 | 45ms | 800ms  | 17.9x ✓ |
-| Humanoid    | 1024 | 69ms | 2000ms | 29.1x ✓ |
-| Ant         | 4096 | 138ms | 3000ms | 21.8x ✓ |
-| Ant         | 16384 | 833ms | 10000ms | 12.0x ✓ |
+### Scaling (synthetic GPU benchmark)
+
+| Environment | Envs  | Time  |
+|-------------|-------|-------|
+| Pendulum    | 1024  | 15ms  |
+| Cartpole    | 1024  | 50ms  |
+| Ant         | 1024  | 45ms  |
+| Humanoid    | 1024  | 69ms  |
+| Ant         | 4096  | 138ms |
+| Ant         | 16384 | 833ms |
+
+A rigorous MuJoCo parity benchmark (matched model semantics, timestep, solver iterations, contact counts, observations, and termination logic) is planned but does not exist yet. Until it does, Zeno makes no apples-to-apples speedup claim.
 
 ## Quick Start
 
@@ -77,7 +83,7 @@ Benchmarked on Apple M4 Pro (14-core CPU, 20-core GPU) with real MJCF models:
 
 Requirements:
 - macOS 13+ (Ventura or later)
-- Zig 0.15+ (https://ziglang.org/download/)
+- Zig 0.16.x (CI and local verification use 0.16.0)
 - Apple Silicon (M1/M2/M3/M4) recommended
 
 ```bash
@@ -101,7 +107,7 @@ pip install -e python/
 ### Running Tests
 
 ```bash
-# Zig unit tests (12 test suites)
+# Zig unit tests
 zig build test
 
 # Python integration tests
@@ -216,9 +222,9 @@ pub fn main() !void {
 }
 ```
 
-## Supported Models
+## Included Environments
 
-Zeno includes 10 standard robotics environments:
+Zeno ships 10 standard robotics environments as MJCF assets:
 
 | Environment | Bodies | Joints | Actuators | Description |
 |-------------|--------|--------|-----------|-------------|
@@ -232,6 +238,8 @@ Zeno includes 10 standard robotics environments:
 | Swimmer | 4 | 2 | 2 | 3-link swimmer |
 | Reacher | 5 | 2 | 2 | 2-link planar arm reaching |
 | Pusher | 6 | 5 | 3 | 3-DOF arm pushing object |
+
+These load and run in batch; their reward/termination semantics are Zeno's own and have not been verified to match the Gymnasium/MuJoCo reference implementations.
 
 ## Architecture
 
@@ -255,6 +263,8 @@ Zeno includes 10 standard robotics environments:
 │  Actions → Forces → Integrate → Collision → XPBD Solve → Obs   │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+Shaders are embedded in the binary and compiled at runtime via `newLibraryWithSource`. That keeps development simple (no separate compile step) at the cost of startup compile time and weaker offline diagnostics; precompiled `.metallib` support is on the roadmap.
 
 ## API Reference
 
@@ -303,11 +313,12 @@ zeno/
 ├── src/
 │   ├── main.zig              # C ABI exports
 │   ├── metal/                # Metal infrastructure
-│   ├── physics/              # Physics core (rigid bodies, XPBD, soft bodies, fluids)
+│   ├── physics/              # Physics core (rigid bodies, XPBD; experimental soft bodies, fluids)
 │   ├── collision/            # Collision detection (GJK+EPA, spatial hashing)
 │   ├── world/                # World management
 │   ├── mjcf/                 # MJCF parser (with inertia computation)
-│   ├── render/               # Rendering (materials, textures)
+│   ├── render/               # Rendering (materials; experimental)
+│   ├── swarm/                # Multi-agent swarm layer (experimental)
 │   └── shaders/              # Metal compute shaders (embedded at compile time)
 ├── python/
 │   └── zeno/                 # Python bindings
@@ -334,10 +345,7 @@ Zeno supports a subset of the MuJoCo XML format:
 - `<equality>`: weld, connect, joint, tendon constraints
 - `<asset>`: mesh loading (STL, OBJ) with convex hull approximation, heightfield terrain
 
-### Advanced Features (API Only)
-- **Soft Bodies** — PBD cloth and volumetric deformables (via Zig API)
-- **Fluids** — SPH simulation (via Zig API)
-- **Materials** — PBR textures (via Zig API)
+Parsing an element is not the same as matching MuJoCo's runtime semantics for it; expect behavioral differences, especially around contacts, solver parameters, and actuator dynamics.
 
 ### Not Yet Supported
 - MJCF composite bodies
@@ -355,6 +363,13 @@ cd benchmarks
 python compare_mujoco.py --envs 1024 --steps 1000
 ```
 
+The benchmark suite currently mixes four different kinds of measurement; be careful which one you cite:
+
+1. **Synthetic kernel benchmarks** — standalone Metal workloads with simplified integration/constraint kernels; useful for GPU tuning, not physics claims.
+2. **Engine pipeline benchmarks** — full `World.step` over real MJCF models; this is the number that describes Zeno itself.
+3. **Cross-simulator comparisons** — wall-clock vs MuJoCo without matched semantics; throughput indication only.
+4. **Semantic-equivalence benchmarks** — matched model/solver/tolerance comparisons; **not yet implemented**.
+
 ## Comparison with Alternatives
 
 | Simulator | Platform | Backend | Batched | Differentiable |
@@ -365,7 +380,15 @@ python compare_mujoco.py --envs 1024 --steps 1000
 | Isaac Lab | Linux | CUDA | Yes | Yes |
 | Brax | Cross-platform | JAX/XLA | Yes | Yes |
 
-Zeno fills a unique niche: **GPU-accelerated batched simulation for Apple Silicon**. If you need to train RL policies on a Mac, Zeno provides throughput comparable to NVIDIA-based solutions.
+Zeno fills a niche none of these target: GPU-accelerated batched simulation on Apple Silicon. It is younger and less validated than all of them; what it offers is throughput on hardware the others ignore.
+
+## Roadmap
+
+- Semantic-equivalence benchmark harness against MuJoCo (matched models, solver settings, tolerances)
+- Physics validation suite: stacking stability, friction cones, joint drift, energy behavior, long-horizon determinism
+- Precompiled `.metallib` shader artifacts alongside runtime source compilation
+- A backend dispatch boundary so the compute stages can be implemented by more than one GPU backend
+- Zig 0.16 stdlib migration
 
 ## Contributing
 
@@ -386,7 +409,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ```bibtex
 @software{zeno2025,
-  title = {Zeno: High-Performance Batched Robotics Simulation Engine},
+  title = {Zeno: Batched Rigid-Body Simulation Engine for Apple Silicon},
   author = {Lulzx},
   year = {2025},
   url = {https://github.com/lulzx/zeno}

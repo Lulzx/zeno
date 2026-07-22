@@ -11,13 +11,13 @@ const constants = @import("../physics/constants.zig");
 /// Complete scene description.
 pub const Scene = struct {
     /// Body definitions.
-    bodies: std.ArrayListUnmanaged(body_mod.BodyDef) = .{},
+    bodies: std.ArrayListUnmanaged(body_mod.BodyDef) = .empty,
     /// Joint definitions.
-    joints: std.ArrayListUnmanaged(joint_mod.JointDef) = .{},
+    joints: std.ArrayListUnmanaged(joint_mod.JointDef) = .empty,
     /// Geometry definitions.
-    geoms: std.ArrayListUnmanaged(primitives.Geom) = .{},
+    geoms: std.ArrayListUnmanaged(primitives.Geom) = .empty,
     /// Actuator definitions.
-    actuators: std.ArrayListUnmanaged(joint_mod.ActuatorDef) = .{},
+    actuators: std.ArrayListUnmanaged(joint_mod.ActuatorDef) = .empty,
     /// Sensor configuration.
     sensor_config: sensors.SensorConfig = .{},
 
@@ -25,10 +25,10 @@ pub const Scene = struct {
     physics_config: constants.PhysicsConfig = .{},
 
     /// Name to index mappings.
-    body_names: std.StringHashMapUnmanaged(u32) = .{},
-    joint_names: std.StringHashMapUnmanaged(u32) = .{},
-    geom_names: std.StringHashMapUnmanaged(u32) = .{},
-    actuator_names: std.StringHashMapUnmanaged(u32) = .{},
+    body_names: std.StringHashMapUnmanaged(u32) = .empty,
+    joint_names: std.StringHashMapUnmanaged(u32) = .empty,
+    geom_names: std.StringHashMapUnmanaged(u32) = .empty,
+    actuator_names: std.StringHashMapUnmanaged(u32) = .empty,
 
     /// Allocator.
     allocator: std.mem.Allocator,

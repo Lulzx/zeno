@@ -38,7 +38,7 @@ fn benchmarkBufferAlloc(device: *Device) void {
     std.debug.print("Buffer Allocation:\n", .{});
 
     for (sizes) |size| {
-        var timer = std.time.Timer.start() catch unreachable;
+        var timer = zeno.Timer.start() catch unreachable;
 
         for (0..iterations) |_| {
             var buffer = Buffer.init(device.device, size, .{}) catch continue;
@@ -64,7 +64,7 @@ fn benchmarkBufferFill(device: *Device) void {
 
     std.debug.print("Buffer Fill ({} MB):\n", .{size / (1024 * 1024)});
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = zeno.Timer.start() catch unreachable;
 
     for (0..iterations) |_| {
         buffer.fill(0) catch {};
@@ -92,7 +92,7 @@ fn benchmarkDataTransfer(device: *Device) void {
 
     std.debug.print("Data Write ({} MB):\n", .{size / (1024 * 1024)});
 
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = zeno.Timer.start() catch unreachable;
 
     for (0..iterations) |_| {
         buffer.write(data, 0) catch {};

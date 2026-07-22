@@ -543,7 +543,7 @@ pub fn colorConstraints(constraints: []XPBDConstraint, num_bodies: u32, allocato
         allocator.free(body_constraints);
     }
     for (body_constraints) |*list| {
-        list.* = .{};
+        list.* = .empty;
     }
 
     // Populate body -> constraint mappings
