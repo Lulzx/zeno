@@ -73,6 +73,9 @@ pub const swarm = struct {
     pub const attacks = @import("swarm/attacks.zig");
     pub const replay = @import("swarm/replay.zig");
 };
+pub const render = struct {
+    pub const material = @import("render/material.zig");
+};
 
 // Re-exports for convenience
 pub const World = world.world_mod.World;

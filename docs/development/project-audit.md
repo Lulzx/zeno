@@ -59,5 +59,5 @@ This audit reflects the repository state after the recent physics, swarm, and vi
 3. Add a CI step that runs `scripts/test_python.sh` so helper scripts cannot silently rot.
 4. Add a dedicated Zig 0.16 migration branch if newer compiler support matters. Treat it as a real migration because filesystem I/O, time APIs, allocators, and list initialization all changed.
 5. Re-baseline performance tables after the swarm and broad-phase changes, and store the hardware/compiler metadata with the benchmark output.
-6. Replace the placeholder texture loader in `src/render/material.zig` with a real image decoder or remove the claim until it is implemented.
+6. ~~Replace the placeholder texture loader in `src/render/material.zig` with a real image decoder.~~ Done: ImageIO-backed decoding now produces validated RGBA8 data and is covered by decode and Metal-upload tests.
 7. Add smoke tests for visualization scripts that at least import and create their output paths without requiring long video rendering.

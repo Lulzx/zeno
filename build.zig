@@ -5,11 +5,15 @@ fn linkAppleRuntime(artifact: *std.Build.Step.Compile) void {
         artifact.linkFramework("Metal");
         artifact.linkFramework("Foundation");
         artifact.linkFramework("QuartzCore");
+        artifact.linkFramework("CoreGraphics");
+        artifact.linkFramework("ImageIO");
         artifact.linkLibC();
     } else {
         artifact.root_module.linkFramework("Metal", .{});
         artifact.root_module.linkFramework("Foundation", .{});
         artifact.root_module.linkFramework("QuartzCore", .{});
+        artifact.root_module.linkFramework("CoreGraphics", .{});
+        artifact.root_module.linkFramework("ImageIO", .{});
         artifact.root_module.link_libc = true;
     }
 }
@@ -89,6 +93,7 @@ pub fn build(b: *std.Build) void {
         "tests/test_sensors.zig",
         "tests/test_tendon.zig",
         "tests/test_swarm.zig",
+        "tests/test_material.zig",
     };
 
     for (test_files) |test_file| {

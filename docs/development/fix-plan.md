@@ -12,9 +12,8 @@
 > impulses, but float addition order is nondeterministic at ULP level;
 > bit-exact contact determinism needs contact graph coloring or a per-body
 > gather pass. (2) Per-stage profiling timers still measure CPU encode time,
-> not GPU time. (3) P2 items (perf re-baseline, `.metallib` artifacts,
-> texture decoder) remain open. Performance tables in the README predate the
-> broad-phase fixes and must be re-measured.
+> not GPU time. (3) The performance re-baseline and texture decoder are done;
+> optional precompiled `.metallib` artifacts remain open.
 
 Findings from a full review of the working tree, the swarm platform, the FFI boundary, and the GPU pipeline. Ordered by priority. Items marked **CONFIRMED** were verified by reading the code paths end-to-end (and, for P0-A, by direct reproduction); the rest were reported by review with quoted code and are high-confidence.
 
@@ -68,7 +67,7 @@ Also in this area (lower severity): `sort_contacts` key ignores geom IDs so same
 - ~~Re-baseline the performance tables after the P0-B fixes land~~ **DONE (2026-07-22).** README + `docs/index.md` tables re-measured on M4 Pro post-fix (medians of 5 runs): Pendulum 2.97M, Cartpole 2.73M, Ant 1.47M, Humanoid 0.75M env-steps/sec — ~40–75% below the pre-fix figures, which had been inflated by the broad-phase bugs skipping collision work. Timers still measure CPU encode time (see below). Also fixed a bench-scene bug where capsule-capsule was placed 0.212 apart with combined radius 0.2, reporting a misleading 0 collisions.
 - Benchmarks: label synthetic vs engine-pipeline numbers in the bench output itself, and store hardware/compiler metadata with results.
 - Add CI steps for `scripts/test_python.sh` and a Metal API-validation (debug) test run, which would have caught the zero-thread dispatch and barrier issues.
-- `src/render/material.zig` texture loading is stubbed — either implement or stop claiming PBR texture support (README already softened).
+- ~~`src/render/material.zig` texture loading is stubbed.~~ **DONE (2026-09-01).** Native ImageIO decoding produces straight-alpha RGBA8, validates upload sizes, and has decode plus Metal-upload coverage.
 - Precompiled `.metallib` artifact support alongside runtime `newLibraryWithSource`.
 
 ## Suggested execution order for Opus

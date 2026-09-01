@@ -4,6 +4,102 @@
 const std = @import("std");
 const objc = @import("../objc.zig");
 
+const CFDataRef = ?*const anyopaque;
+const CGImageSourceRef = ?*anyopaque;
+const CGImageRef = ?*anyopaque;
+const CGColorSpaceRef = ?*anyopaque;
+const CGContextRef = ?*anyopaque;
+
+const CGRect = extern struct {
+    origin: extern struct { x: f64, y: f64 },
+    size: extern struct { width: f64, height: f64 },
+};
+
+extern "c" fn CFDataCreate(allocator: ?*const anyopaque, bytes: [*]const u8, length: isize) CFDataRef;
+extern "c" fn CFRelease(object: *const anyopaque) void;
+extern "c" fn CGImageSourceCreateWithData(data: CFDataRef, options: ?*const anyopaque) CGImageSourceRef;
+extern "c" fn CGImageSourceCreateImageAtIndex(source: CGImageSourceRef, index: usize, options: ?*const anyopaque) CGImageRef;
+extern "c" fn CGImageGetWidth(image: CGImageRef) usize;
+extern "c" fn CGImageGetHeight(image: CGImageRef) usize;
+extern "c" fn CGColorSpaceCreateDeviceRGB() CGColorSpaceRef;
+extern "c" fn CGBitmapContextCreate(data: *anyopaque, width: usize, height: usize, bits_per_component: usize, bytes_per_row: usize, color_space: CGColorSpaceRef, bitmap_info: u32) CGContextRef;
+extern "c" fn CGContextSetInterpolationQuality(context: CGContextRef, quality: i32) void;
+extern "c" fn CGContextSetShouldAntialias(context: CGContextRef, should_antialias: bool) void;
+extern "c" fn CGContextClearRect(context: CGContextRef, rect: CGRect) void;
+extern "c" fn CGContextDrawImage(context: CGContextRef, rect: CGRect, image: CGImageRef) void;
+
+pub const DecodedImage = struct {
+    pixels: []u8,
+    width: u32,
+    height: u32,
+
+    pub fn deinit(self: *DecodedImage, allocator: std.mem.Allocator) void {
+        allocator.free(self.pixels);
+        self.* = undefined;
+    }
+};
+
+fn releaseCF(object: *const anyopaque) void {
+    CFRelease(object);
+}
+
+/// Decode any image format supported by ImageIO into straight-alpha RGBA8.
+pub fn decodeImage(allocator: std.mem.Allocator, encoded: []const u8) !DecodedImage {
+    if (encoded.len == 0 or encoded.len > std.math.maxInt(isize)) return error.InvalidImageData;
+
+    const cf_data = CFDataCreate(null, encoded.ptr, @intCast(encoded.len)) orelse return error.InvalidImageData;
+    defer releaseCF(cf_data);
+
+    const source = CGImageSourceCreateWithData(cf_data, null) orelse return error.UnsupportedImageFormat;
+    defer releaseCF(source);
+
+    const image = CGImageSourceCreateImageAtIndex(source, 0, null) orelse return error.UnsupportedImageFormat;
+    defer releaseCF(image);
+
+    const width = CGImageGetWidth(image);
+    const height = CGImageGetHeight(image);
+    if (width == 0 or height == 0 or width > std.math.maxInt(u32) or height > std.math.maxInt(u32)) {
+        return error.InvalidImageDimensions;
+    }
+    if (width > std.math.maxInt(usize) / height) return error.ImageTooLarge;
+    const pixel_count = width * height;
+    if (pixel_count > std.math.maxInt(usize) / 4) return error.ImageTooLarge;
+
+    const pixels = try allocator.alloc(u8, pixel_count * 4);
+    errdefer allocator.free(pixels);
+
+    const color_space = CGColorSpaceCreateDeviceRGB() orelse return error.ImageDecodeFailed;
+    defer releaseCF(color_space);
+
+    // kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big gives RGBA8.
+    const context = CGBitmapContextCreate(pixels.ptr, width, height, 8, width * 4, color_space, 1 | (4 << 12)) orelse
+        return error.ImageDecodeFailed;
+    defer releaseCF(context);
+
+    const bounds = CGRect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = @floatFromInt(width), .height = @floatFromInt(height) },
+    };
+    CGContextClearRect(context, bounds);
+    CGContextSetInterpolationQuality(context, 1); // kCGInterpolationNone
+    CGContextSetShouldAntialias(context, false);
+    CGContextDrawImage(context, bounds, image);
+
+    // Core Graphics renders premultiplied alpha; textures expose straight alpha.
+    for (0..pixel_count) |i| {
+        const offset = i * 4;
+        const alpha = pixels[offset + 3];
+        if (alpha != 0 and alpha != 255) {
+            for (0..3) |channel| {
+                const premultiplied: u32 = pixels[offset + channel];
+                pixels[offset + channel] = @intCast(@min(255, (premultiplied * 255 + alpha / 2) / alpha));
+            }
+        }
+    }
+
+    return .{ .pixels = pixels, .width = @intCast(width), .height = @intCast(height) };
+}
+
 /// Texture format.
 pub const TextureFormat = enum {
     rgba8,
@@ -46,7 +142,7 @@ pub const Texture = struct {
 
     pub fn init(device: objc.id, def: TextureDef, data: ?[]const u8) !Texture {
         // Create texture descriptor
-        const desc_class = objc.objc_getClass("MTLTextureDescriptor") orelse return error.NoTextureDescriptor;
+        const desc_class = objc.getClass("MTLTextureDescriptor") orelse return error.NoTextureDescriptor;
         const desc = objc.msgSend(desc_class, objc.sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), .{
             formatToMTL(def.format),
             @as(u64, def.width),
@@ -120,7 +216,7 @@ const MTLSize = extern struct {
 
 fn formatToMTL(format: TextureFormat) u64 {
     return switch (format) {
-        .rgba8 => 80, // BGRA8Unorm
+        .rgba8 => 70, // RGBA8Unorm
         .rgba16f => 115, // RGBA16Float
         .r8 => 10, // R8Unorm
         .rg8 => 30, // RG8Unorm
@@ -227,10 +323,10 @@ pub const MaterialLibrary = struct {
         return .{
             .allocator = allocator,
             .device = device,
-            .materials = .{},
-            .material_map = .{},
-            .textures = .{},
-            .texture_map = .{},
+            .materials = .empty,
+            .material_map = .empty,
+            .textures = .empty,
+            .texture_map = .empty,
         };
     }
 
@@ -301,6 +397,19 @@ pub const MaterialLibrary = struct {
         height: u32,
         format: TextureFormat,
     ) !u32 {
+        if (width == 0 or height == 0) return error.InvalidTextureDimensions;
+        const bytes_per_pixel: usize = switch (format) {
+            .rgba8 => 4,
+            .rgba16f => 8,
+            .r8 => 1,
+            .rg8 => 2,
+            .depth32f => 4,
+        };
+        const pixel_count = @as(usize, width) * @as(usize, height);
+        if (pixel_count > std.math.maxInt(usize) / bytes_per_pixel or data.len != pixel_count * bytes_per_pixel) {
+            return error.InvalidTextureDataLength;
+        }
+
         const idx: u32 = @intCast(self.textures.items.len);
 
         const texture = try Texture.init(self.device, .{
@@ -310,6 +419,10 @@ pub const MaterialLibrary = struct {
         }, data);
 
         try self.textures.append(self.allocator, texture);
+        errdefer {
+            var removed = self.textures.pop().?;
+            removed.deinit();
+        }
 
         if (name.len > 0) {
             try self.texture_map.put(self.allocator, name, idx);
@@ -318,22 +431,17 @@ pub const MaterialLibrary = struct {
         return idx;
     }
 
-    /// Load texture from file (PNG).
+    /// Load an ImageIO-supported image file and upload it as RGBA8.
     pub fn loadTexture(self: *MaterialLibrary, name: []const u8, path: []const u8) !u32 {
-        // Read file
         var threaded: std.Io.Threaded = .init(self.allocator, .{});
         defer threaded.deinit();
         const io = threaded.io();
         const data = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(64 * 1024 * 1024));
         defer self.allocator.free(data);
 
-        // Simple PNG decoder would go here
-        // For now, assume raw RGBA data
-        // In production, use a proper PNG decoder
-
-        // Placeholder: create 1x1 texture
-        const white = [_]u8{ 255, 255, 255, 255 };
-        return try self.addTextureFromData(name, &white, 1, 1, .rgba8);
+        var decoded = try decodeImage(self.allocator, data);
+        defer decoded.deinit(self.allocator);
+        return self.addTextureFromData(name, decoded.pixels, decoded.width, decoded.height, .rgba8);
     }
 
     /// Get texture count.

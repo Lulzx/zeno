@@ -46,7 +46,7 @@ If you need physics you can trust unconditionally today, use MuJoCo. If you want
 ### Experimental (Zig API only, prototype quality)
 - **Soft Bodies** — PBD deformable cloth and volumetric bodies
 - **Fluids** — SPH fluid simulation with spatial hashing
-- **Materials** — PBR material definitions (texture decoding is stubbed)
+- **Materials** — PBR material definitions with native ImageIO texture decoding
 - **Swarm** — multi-agent grid/graph/message-bus layer on top of the physics world
 
 ## Performance
