@@ -12,8 +12,8 @@
 > impulses, but float addition order is nondeterministic at ULP level;
 > bit-exact contact determinism needs contact graph coloring or a per-body
 > gather pass. (2) Per-stage profiling timers still measure CPU encode time,
-> not GPU time. (3) The performance re-baseline and texture decoder are done;
-> optional precompiled `.metallib` artifacts remain open.
+> not GPU time. (3) The performance re-baseline, texture decoder, and optional
+> precompiled `.metallib` artifact target are done.
 
 Findings from a full review of the working tree, the swarm platform, the FFI boundary, and the GPU pipeline. Ordered by priority. Items marked **CONFIRMED** were verified by reading the code paths end-to-end (and, for P0-A, by direct reproduction); the rest were reported by review with quoted code and are high-confidence.
 
@@ -68,7 +68,8 @@ Also in this area (lower severity): `sort_contacts` key ignores geom IDs so same
 - Benchmarks: label synthetic vs engine-pipeline numbers in the bench output itself, and store hardware/compiler metadata with results.
 - Add CI steps for `scripts/test_python.sh` and a Metal API-validation (debug) test run, which would have caught the zero-thread dispatch and barrier issues.
 - ~~`src/render/material.zig` texture loading is stubbed.~~ **DONE (2026-09-01).** Native ImageIO decoding produces straight-alpha RGBA8, validates upload sizes, and has decode plus Metal-upload coverage.
-- Precompiled `.metallib` artifact support alongside runtime `newLibraryWithSource`.
+- ~~Precompiled `.metallib` artifact support alongside runtime
+  `newLibraryWithSource`.~~ **DONE (2026-09-01)** via `zig build metallib` and CI.
 
 ## Suggested execution order for Opus
 

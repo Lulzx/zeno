@@ -264,7 +264,7 @@ These load and run in batch; their reward/termination semantics are Zeno's own a
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Shaders are embedded in the binary and compiled at runtime via `newLibraryWithSource`. That keeps development simple (no separate compile step) at the cost of startup compile time and weaker offline diagnostics; precompiled `.metallib` support is on the roadmap.
+Shaders are embedded in the binary and compiled at runtime via `newLibraryWithSource`. That keeps development builds self-contained. `zig build metallib` also compiles and installs `zig-out/lib/zeno.metallib` for offline validation and deployments that prefer a precompiled artifact.
 
 ## API Reference
 
@@ -359,8 +359,8 @@ Parsing an element is not the same as matching MuJoCo's runtime semantics for it
 zig build bench
 
 # Run Python comparison
-cd benchmarks
-python compare_mujoco.py --envs 1024 --steps 1000
+python benchmarks/compare_mujoco.py --envs 1024 --steps 1000
+python benchmarks/validate_physics.py
 ```
 
 The benchmark suite currently mixes four different kinds of measurement; be careful which one you cite:
@@ -368,7 +368,8 @@ The benchmark suite currently mixes four different kinds of measurement; be care
 1. **Synthetic kernel benchmarks** — standalone Metal workloads with simplified integration/constraint kernels; useful for GPU tuning, not physics claims.
 2. **Engine pipeline benchmarks** — full `World.step` over real MJCF models; this is the number that describes Zeno itself.
 3. **Cross-simulator comparisons** — wall-clock vs MuJoCo without matched semantics; throughput indication only.
-4. **Semantic-equivalence benchmarks** — matched model/solver/tolerance comparisons; **not yet implemented**.
+4. **Bounded validation** — the live ballistic comparison has a declared error
+   threshold; it validates only that free-body case, not general parity.
 
 ## Comparison with Alternatives
 
@@ -384,11 +385,9 @@ Zeno fills a niche none of these target: GPU-accelerated batched simulation on A
 
 ## Roadmap
 
-- Semantic-equivalence benchmark harness against MuJoCo (matched models, solver settings, tolerances)
+- Expand the bounded MuJoCo validation matrix beyond the current ballistic case
 - Physics validation suite: stacking stability, friction cones, joint drift, energy behavior, long-horizon determinism
-- Precompiled `.metallib` shader artifacts alongside runtime source compilation
 - A backend dispatch boundary so the compute stages can be implemented by more than one GPU backend
-- Zig 0.16 stdlib migration
 
 ## Contributing
 

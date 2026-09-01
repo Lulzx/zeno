@@ -1,4 +1,4 @@
-//! Environment benchmarks matching tech spec section 7.1
+//! Synthetic Metal-kernel scaling benchmark.
 //!
 //! Tests throughput for standard RL environments at various batch sizes
 //! using actual Metal GPU compute shaders.
@@ -62,8 +62,6 @@ const BenchResult = struct {
     num_steps: u32,
     total_time_ms: f64,
     steps_per_sec: f64,
-    target_time_ms: f64,
-    speedup_vs_target: f64,
 };
 
 /// Metal compute shader source for XPBD physics simulation
@@ -500,7 +498,6 @@ fn runBenchmark(
     config: EnvConfig,
     num_envs: u32,
     num_steps: u32,
-    target_time_ms: f64,
 ) !BenchResult {
     const total_bodies = num_envs * config.num_bodies;
     const total_joints = num_envs * config.num_joints;
@@ -604,7 +601,8 @@ fn runBenchmark(
 
     const elapsed_ns = timer.read();
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
-    const steps_per_sec = @as(f64, @floatFromInt(num_steps)) / (elapsed_ms / 1000.0);
+    const env_steps = @as(f64, @floatFromInt(num_envs)) * @as(f64, @floatFromInt(num_steps));
+    const steps_per_sec = env_steps / (elapsed_ms / 1000.0);
 
     return BenchResult{
         .env_name = config.name,
@@ -612,8 +610,6 @@ fn runBenchmark(
         .num_steps = num_steps,
         .total_time_ms = elapsed_ms,
         .steps_per_sec = steps_per_sec,
-        .target_time_ms = target_time_ms,
-        .speedup_vs_target = target_time_ms / elapsed_ms,
     };
 }
 
@@ -812,32 +808,26 @@ fn dispatchThreads(encoder: objc.id, pipeline: objc.id, count: u32) void {
 fn printHeader() void {
     std.debug.print("\n", .{});
     std.debug.print("╔══════════════════════════════════════════════════════════════════════════════╗\n", .{});
-    std.debug.print("║          Zeno Environment Benchmarks — Tech Spec 7.1 (Metal GPU)            ║\n", .{});
+    std.debug.print("║                Zeno Synthetic Metal-Kernel Scaling Benchmark                ║\n", .{});
     std.debug.print("╚══════════════════════════════════════════════════════════════════════════════╝\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("{s:<12} {s:>8} {s:>8} {s:>12} {s:>12} {s:>12} {s:>10}\n", .{
+    std.debug.print("{s:<12} {s:>8} {s:>8} {s:>12} {s:>16}\n", .{
         "Environment",
         "Envs",
         "Steps",
         "Time (ms)",
-        "Target (ms)",
-        "Steps/sec",
-        "vs Target",
+        "Env steps/sec",
     });
     std.debug.print("─" ** 78 ++ "\n", .{});
 }
 
 fn printResult(result: BenchResult) void {
-    const status = if (result.speedup_vs_target >= 1.0) "✓" else "✗";
-    std.debug.print("{s:<12} {d:>8} {d:>8} {d:>12.1} {d:>12.0} {d:>12.0} {d:>8.1}x {s}\n", .{
+    std.debug.print("{s:<12} {d:>8} {d:>8} {d:>12.1} {d:>16.0}\n", .{
         result.env_name,
         result.num_envs,
         result.num_steps,
         result.total_time_ms,
-        result.target_time_ms,
         result.steps_per_sec,
-        result.speedup_vs_target,
-        status,
     });
 }
 
@@ -860,14 +850,13 @@ pub fn main() !void {
 
     printHeader();
 
-    // Benchmark configurations from tech spec 7.1
-    const benchmarks = [_]struct { config: EnvConfig, num_envs: u32, target_ms: f64 }{
-        .{ .config = PENDULUM, .num_envs = 1024, .target_ms = 50 },
-        .{ .config = CARTPOLE, .num_envs = 1024, .target_ms = 80 },
-        .{ .config = ANT, .num_envs = 1024, .target_ms = 800 },
-        .{ .config = HUMANOID, .num_envs = 1024, .target_ms = 2000 },
-        .{ .config = ANT, .num_envs = 4096, .target_ms = 3000 },
-        .{ .config = ANT, .num_envs = 16384, .target_ms = 10000 },
+    const benchmarks = [_]struct { config: EnvConfig, num_envs: u32 }{
+        .{ .config = PENDULUM, .num_envs = 1024 },
+        .{ .config = CARTPOLE, .num_envs = 1024 },
+        .{ .config = ANT, .num_envs = 1024 },
+        .{ .config = HUMANOID, .num_envs = 1024 },
+        .{ .config = ANT, .num_envs = 4096 },
+        .{ .config = ANT, .num_envs = 16384 },
     };
 
     const num_steps = 1000;
@@ -878,7 +867,6 @@ pub fn main() !void {
             bench.config,
             bench.num_envs,
             num_steps,
-            bench.target_ms,
         ) catch |err| {
             std.debug.print("{s:<12} {d:>8} {d:>8} FAILED: {}\n", .{
                 bench.config.name,
@@ -892,6 +880,5 @@ pub fn main() !void {
     }
 
     std.debug.print("─" ** 78 ++ "\n", .{});
-    std.debug.print("\nNote: Benchmarks use actual Metal GPU compute shaders.\n", .{});
-    std.debug.print("Target times are from tech spec 7.1 (MuJoCo baseline comparisons).\n", .{});
+    std.debug.print("\nSynthetic kernels exercise a simplified workload, not World.step or another simulator's semantics.\n", .{});
 }

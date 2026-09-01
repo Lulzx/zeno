@@ -40,7 +40,7 @@ for n in agent_counts:
 
     print(f"{n:>8}  {step_ms:>10.2f}  {steps_per_sec:>10.0f}  {metrics.total_edges:>8}")
 
-    del swarm
-    del world
+    swarm.close()
+    world.close()
 
 print("\nDone.")

@@ -590,17 +590,19 @@ pub fn colorConstraints(constraints: []XPBDConstraint, num_bodies: u32, allocato
         }
 
         // Find smallest available color
-        var color: u8 = 0;
-        while (color < 255 and neighbor_colors[color]) {
+        var color: u16 = 0;
+        while (color < 256 and neighbor_colors[color]) {
             color += 1;
         }
+        if (color == 256) return error.TooManyConstraintColors;
 
-        c.setColor(color);
+        c.setColor(@intCast(color));
         if (color > max_color) {
-            max_color = color;
+            max_color = @intCast(color);
         }
     }
 
+    if (max_color == 255) return error.TooManyConstraintColors;
     return max_color + 1;
 }
 

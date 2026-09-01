@@ -45,6 +45,10 @@ from pathlib import Path
 
 def get_asset_directory() -> Path:
     """Get the path to the assets directory."""
+    installed_assets = Path(__file__).parent.parent / "assets"
+    if installed_assets.exists():
+        return installed_assets
+
     # Check relative to this file first
     pkg_assets = Path(__file__).parent.parent.parent.parent / "assets"
     if pkg_assets.exists():

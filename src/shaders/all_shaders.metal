@@ -382,7 +382,8 @@ kernel void compute_forces(
     float mass = 1.0 / inv_mass;
 
     // Gravity (add to existing forces from apply_joint_forces for prismatic joints)
-    float3 gravity = float3(params.gravity_x, params.gravity_y, params.gravity_z);
+    float gravity_scale = body_data[body_id].params.z;
+    float3 gravity = float3(params.gravity_x, params.gravity_y, params.gravity_z) * gravity_scale;
     float3 force = gravity * mass;
 
     forces[gid] = float4(force, 0);
@@ -410,10 +411,12 @@ kernel void integrate(
     device const float4* torques [[buffer(5)]],
     device const float4* inv_mass_inertia [[buffer(6)]],
     constant SimParams& params [[buffer(7)]],
+    device const BodyData* body_data [[buffer(8)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint env_id = gid / params.num_bodies;
     if (env_id >= params.num_envs) return;
+    uint body_id = gid % params.num_bodies;
 
     float4 inv_mi = inv_mass_inertia[gid];
     float inv_mass = inv_mi.x;
@@ -432,8 +435,10 @@ kernel void integrate(
     float3 accel = force * inv_mass;
     vel += accel * dt;
 
-    // Velocity damping
-    vel *= 0.999;
+    // Per-body damping is expressed as a rate, so its effect is stable across
+    // timestep/substep changes. Clamp malformed negative values to zero.
+    float linear_damping = max(body_data[body_id].params.w, 0.0f);
+    vel *= max(0.0f, 1.0f - linear_damping * dt);
 
     // x(t+dt) = x(t) + v(t+dt) * dt
     pos += vel * dt;
@@ -449,7 +454,8 @@ kernel void integrate(
 
     // ω(t+dt) = ω(t) + I⁻¹ * τ * dt
     omega += inv_inertia * torque * dt;
-    omega *= 0.999; // Damping
+    float angular_damping = max(body_data[body_id].com_offset.w, 0.0f);
+    omega *= max(0.0f, 1.0f - angular_damping * dt);
 
     // Quaternion integration: q(t+dt) = q(t) + 0.5 * ω_quat * q(t) * dt
     float4 omega_quat = float4(omega * dt * 0.5, 0);
@@ -1024,8 +1030,6 @@ kernel void solve_joints(
     float alpha_tilde = compliance / (dt * dt);
     
     float C = 0.0;
-    float3 grad_a = float3(0);
-    float3 grad_b = float3(0);
     
     // --- Positional Constraint (Point-to-Point) ---
     if (type == 2) { // positional
@@ -1735,8 +1739,6 @@ kernel void solve_contacts(
     // Get current state
     float3 pos_a = positions[idx_a].xyz;
     float3 pos_b = positions[idx_b].xyz;
-    float4 quat_a = quaternions[idx_a];
-    float4 quat_b = quaternions[idx_b];
 
     // Compute contact point relative to body centers
     float3 r_a = contact_point - pos_a;
@@ -1868,7 +1870,6 @@ kernel void read_sensors(
     SensorData sensor = sensors[sensor_id];
     uint sensor_type = sensor.type_object.x;
     uint object_id = sensor.type_object.y;
-    uint dim = sensor.type_object.z;
     uint output_offset = uint(sensor.params.w);
 
     uint obs_base = env_id * params.obs_dim;

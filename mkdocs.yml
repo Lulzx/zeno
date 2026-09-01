@@ -80,14 +80,19 @@ nav:
     - Project Audit: development/project-audit.md
     - Fix Plan: development/fix-plan.md
   - User Guide:
+    - Python Overview: guide/python.md
     - Python API: guide/python-api.md
     - Zig API: guide/zig-api.md
     - MJCF Models: guide/mjcf.md
     - Gymnasium Integration: guide/gymnasium.md
+    - Swarm: guide/swarm.md
+    - Profiling: guide/profiling.md
+    - Advanced Patterns: guide/advanced-patterns.md
   - Technical Reference:
     - Architecture: reference/architecture.md
     - Physics Model: reference/physics.md
     - Performance: reference/performance.md
+    - Swarm API: reference/swarm-api.md
   - Examples:
     - Basic Usage: examples/basic.md
     - RL Training: examples/rl-training.md

@@ -6,6 +6,23 @@ const testing = std.testing;
 const parser = @import("zeno").mjcf.parser;
 const schema = @import("zeno").mjcf.schema;
 
+test "parse freejoint shorthand" {
+    const xml =
+        \\<mujoco><worldbody>
+        \\  <body name="agent" pos="0 0 1">
+        \\    <freejoint name="root"/>
+        \\    <geom type="sphere" size="0.1"/>
+        \\  </body>
+        \\</worldbody></mujoco>
+    ;
+
+    var scene = try parser.parseString(testing.allocator, xml);
+    defer scene.deinit();
+
+    try testing.expectEqual(@as(u32, 1), scene.numJoints());
+    try testing.expectEqual(@import("zeno").physics.joint.JointType.free, scene.joints.items[0].joint_type);
+}
+
 const simple_mjcf =
     \\<mujoco model="test">
     \\    <option timestep="0.01" gravity="0 0 -10"/>

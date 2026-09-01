@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "cffi>=1.15.0"]
+requires = ["setuptools>=61.0", "wheel>=0.41", "cffi>=1.15.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -23,6 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Physics",
 ]
@@ -34,11 +35,12 @@ dependencies = [
 
 [project.optional-dependencies]
 gymnasium = ["gymnasium>=0.29.0"]
+sb3 = ["stable-baselines3>=2.7,<3"]
 dev = [
     "pytest>=7.0.0",
     "pytest-benchmark>=4.0.0",
 ]
-all = ["zeno-physics[gymnasium,dev]"]
+all = ["zeno-physics[gymnasium,sb3,dev]"]
 
 [project.urls]
 Homepage = "https://github.com/lulzx/zeno"

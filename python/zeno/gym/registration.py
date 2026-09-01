@@ -20,6 +20,11 @@ try:
     import gymnasium as gym
     from gymnasium import spaces
     from gymnasium.vector import VectorEnv
+    from gymnasium.vector.utils import batch_space
+    try:
+        from gymnasium.vector import AutoresetMode
+    except ImportError:  # Gymnasium 0.29-1.0
+        AutoresetMode = None
     from gymnasium.envs.registration import EnvSpec
     HAS_GYMNASIUM = True
 except ImportError:
@@ -27,6 +32,8 @@ except ImportError:
     gym = None
     spaces = None
     VectorEnv = object
+    batch_space = None
+    AutoresetMode = None
     EnvSpec = None
 
 from ..env import ZenoEnv
@@ -99,7 +106,7 @@ class ZenoGymnasiumEnv(gym.Env if HAS_GYMNASIUM else object):
     mjcf_path : str
         Path to MJCF file or model name.
     render_mode : str, optional
-        Rendering mode ("rgb_array" or "human").
+        Rendering mode (currently only ``"rgb_array"``).
     max_episode_steps : int, optional
         Maximum steps per episode (default: 1000).
     **kwargs
@@ -117,7 +124,7 @@ class ZenoGymnasiumEnv(gym.Env if HAS_GYMNASIUM else object):
     """
 
     metadata = {
-        "render_modes": ["rgb_array", "human"],
+        "render_modes": ["rgb_array"],
         "render_fps": 60,
     }
 
@@ -135,6 +142,12 @@ class ZenoGymnasiumEnv(gym.Env if HAS_GYMNASIUM else object):
             )
 
         super().__init__()
+
+        if render_mode not in (None, "rgb_array"):
+            raise ValueError(
+                f"Unsupported render_mode {render_mode!r}; "
+                "Zeno currently supports only 'rgb_array'"
+            )
 
         # Force single environment
         kwargs["num_envs"] = 1
@@ -284,12 +297,10 @@ class ZenoGymnasiumEnv(gym.Env if HAS_GYMNASIUM else object):
             RGB frame if render_mode is "rgb_array", None otherwise.
         """
         if self.render_mode == "rgb_array":
-            # Get body positions and quaternions for rendering
+            # Render a deliberately simple orthographic body-center view. This
+            # is a diagnostic observation renderer, not the native Metal scene
+            # renderer exposed by the core rendering API.
             positions = self._env.get_body_positions()[0]  # First env
-            quaternions = self._env.get_body_quaternions()[0]
-
-            # Create simple visualization (placeholder)
-            # In production, this would use Metal rendering
             width, height = 640, 480
             frame = np.zeros((height, width, 3), dtype=np.uint8)
             frame[:] = [135, 206, 235]  # Sky blue background
@@ -309,10 +320,6 @@ class ZenoGymnasiumEnv(gym.Env if HAS_GYMNASIUM else object):
                                     frame[py, px] = [255, 100, 100]
 
             return frame
-
-        elif self.render_mode == "human":
-            # Would display using a window
-            pass
 
         return None
 
@@ -396,11 +403,27 @@ class ZenoVectorEnv(VectorEnv if HAS_GYMNASIUM else object):
             dtype=np.float32,
         )
 
-        super().__init__(
-            num_envs=num_envs,
-            observation_space=single_observation_space,
-            action_space=single_action_space,
-        )
+        # Gymnasium 1.x removed VectorEnv.__init__; 0.29 still requires it.
+        # Populate the documented attributes directly on 1.x while retaining
+        # compatibility with the older constructor.
+        if VectorEnv.__init__ is object.__init__:
+            self.num_envs = num_envs
+            self.single_observation_space = single_observation_space
+            self.single_action_space = single_action_space
+            self.observation_space = batch_space(single_observation_space, num_envs)
+            self.action_space = batch_space(single_action_space, num_envs)
+            self.closed = False
+            self.metadata = {
+                "autoreset_mode": (
+                    AutoresetMode.NEXT_STEP if AutoresetMode is not None else "NextStep"
+                )
+            }
+        else:
+            super().__init__(
+                num_envs=num_envs,
+                observation_space=single_observation_space,
+                action_space=single_action_space,
+            )
 
         # Auto-reset tracking
         self._autoreset_envs = np.zeros(num_envs, dtype=bool)
@@ -591,7 +614,7 @@ class ZenoVectorEnv(VectorEnv if HAS_GYMNASIUM else object):
 
     def close(self) -> None:
         """Close the environment."""
-        self.close_extras()
+        super().close()
 
     # Additional methods for RL compatibility
 
@@ -677,6 +700,7 @@ def make_vec(
     path = Path(model)
     if not path.exists():
         asset_dirs = [
+            Path(__file__).parent.parent / "assets",  # Installed wheel
             Path(__file__).parent.parent.parent.parent / "assets",
             Path.cwd() / "assets",
             Path.home() / ".zeno" / "assets",
@@ -703,7 +727,7 @@ def make_sb3_env(
     model: str,
     num_envs: int = 1,
     **kwargs
-) -> ZenoVectorEnv:
+):
     """
     Create a Zeno environment compatible with Stable-Baselines3.
 
@@ -733,7 +757,9 @@ def make_sb3_env(
     >>> model = PPO("MlpPolicy", env, verbose=1)
     >>> model.learn(total_timesteps=100000)
     """
-    return make_vec(model, num_envs=num_envs, **kwargs)
+    from .sb3 import ZenoSB3VecEnv
+
+    return ZenoSB3VecEnv(make_vec(model, num_envs=num_envs, **kwargs))
 
 
 def check_env(env: Union[ZenoGymnasiumEnv, ZenoVectorEnv]) -> bool:

@@ -231,7 +231,7 @@ pub const World = struct {
         var pipelines = PipelineManager.init(allocator, device.device, device.library);
 
         // Preload compute pipelines
-        try pipelines.preload(&.{
+        pipelines.preload(&.{
             "apply_actions",
             "apply_joint_forces",
             "forward_kinematics",
@@ -257,7 +257,10 @@ pub const World = struct {
             "match_cached_contacts",
             "save_prev_state",
             "xpbd_update_velocities",
-        });
+        }) catch |err| {
+            std.log.err("World initialization failed while preloading pipelines: {}", .{err});
+            return err;
+        };
 
         // Calculate dimensions
         const num_bodies = scene.numBodies();
@@ -320,7 +323,10 @@ pub const World = struct {
 
         for (scene.joints.items) |joint| {
             // Decompose joint into primitives
-            const primitives_list = try joint_mod.decomposeJoint(&joint, allocator);
+            const primitives_list = joint_mod.decomposeJoint(&joint, allocator) catch |err| {
+                std.log.err("World initialization failed while decomposing joints: {}", .{err});
+                return err;
+            };
             defer allocator.free(primitives_list);
 
             for (primitives_list) |jc| {
@@ -630,7 +636,10 @@ pub const World = struct {
         try world.initializeState();
 
         // Capture initial state for reset
-        world.initial_state = try InitialState.capture(allocator, &world.state);
+        world.initial_state = InitialState.capture(allocator, &world.state) catch |err| {
+            std.log.err("World initialization failed while capturing initial state: {}", .{err});
+            return err;
+        };
 
         return world;
     }
@@ -1077,6 +1086,7 @@ pub const World = struct {
             encoder.setBuffer(&self.state.torques_buffer, 0, 5);
             encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 6);
             encoder.setBuffer(&self.params_buffer, 0, 7);
+            encoder.setBuffer(&self.body_data_buffer, 0, 8);
             encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
         }
         if (profile) |p| {
@@ -1651,7 +1661,7 @@ const BodyDataGPU = extern struct {
                 def.gravity_scale,
                 def.linear_damping,
             },
-            .com_offset = .{ def.com_offset[0], def.com_offset[1], def.com_offset[2], 0 },
+            .com_offset = .{ def.com_offset[0], def.com_offset[1], def.com_offset[2], def.angular_damping },
         };
     }
 };

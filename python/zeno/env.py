@@ -203,8 +203,7 @@ class ZenoEnv:
 
     def close(self) -> None:
         """Release resources."""
-        # World cleanup is handled by __del__
-        pass
+        self._world.close()
 
     def __enter__(self):
         return self
@@ -247,6 +246,7 @@ def make(
 
     # Check standard asset locations
     asset_dirs = [
+        Path(__file__).parent / "assets",  # Installed wheel
         Path(__file__).parent.parent.parent / "assets",  # ../../../assets
         Path.cwd() / "assets",
         Path.home() / ".zeno" / "assets",

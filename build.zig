@@ -1,6 +1,13 @@
 const std = @import("std");
 
-fn linkAppleRuntime(artifact: *std.Build.Step.Compile) void {
+fn linkAppleRuntime(b: *std.Build, artifact: *std.Build.Step.Compile) void {
+    // Explicit-target builds need the SDK framework search path; native builds
+    // obtain it from the host toolchain automatically.
+    if (b.sysroot) |sysroot| {
+        artifact.root_module.addFrameworkPath(.{
+            .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }),
+        });
+    }
     if (@hasDecl(std.Build.Step.Compile, "linkFramework")) {
         artifact.linkFramework("Metal");
         artifact.linkFramework("Foundation");
@@ -34,7 +41,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Link against Metal and Foundation frameworks.
-    linkAppleRuntime(lib);
+    linkAppleRuntime(b, lib);
 
     // Install the library
     b.installArtifact(lib);
@@ -49,7 +56,7 @@ pub fn build(b: *std.Build) void {
         }),
         .linkage = .static,
     });
-    linkAppleRuntime(static_lib);
+    linkAppleRuntime(b, static_lib);
 
     // Bandwidth benchmark (standalone)
     const bandwidth_bench = b.addExecutable(.{
@@ -60,15 +67,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
         }),
     });
-    if (@hasDecl(std.Build.Step.Compile, "linkFramework")) {
-        bandwidth_bench.linkFramework("Metal");
-        bandwidth_bench.linkFramework("Foundation");
-        bandwidth_bench.linkLibC();
-    } else {
-        bandwidth_bench.root_module.linkFramework("Metal", .{});
-        bandwidth_bench.root_module.linkFramework("Foundation", .{});
-        bandwidth_bench.root_module.link_libc = true;
-    }
+    linkAppleRuntime(b, bandwidth_bench);
 
     b.installArtifact(bandwidth_bench);
 
@@ -107,7 +106,7 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
-        linkAppleRuntime(unit_test);
+        linkAppleRuntime(b, unit_test);
 
         const run_test = b.addRunArtifact(unit_test);
         test_step.dependOn(&run_test.step);
@@ -136,14 +135,26 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
-        linkAppleRuntime(bench);
+        linkAppleRuntime(b, bench);
 
         const run_bench = b.addRunArtifact(bench);
         bench_step.dependOn(&run_bench.step);
     }
 
-    // Note: Metal shaders are embedded at compile time via @embedFile in
-    // src/world/world.zig. No separate shader compilation step is needed.
-    // The shaders are loaded from source at runtime using Metal's
-    // newLibraryWithSource API.
+    // Runtime source compilation remains the default so development builds are
+    // self-contained. This optional target also validates the source with the
+    // offline compiler and installs a deployable metallib artifact.
+    const metal_compile = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metal", "-c" });
+    metal_compile.addFileArg(b.path("src/shaders/all_shaders.metal"));
+    metal_compile.addArg("-o");
+    const air = metal_compile.addOutputFileArg("all_shaders.air");
+
+    const metal_link = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metallib" });
+    metal_link.addFileArg(air);
+    metal_link.addArg("-o");
+    const metallib = metal_link.addOutputFileArg("zeno.metallib");
+
+    const install_metallib = b.addInstallFile(metallib, "lib/zeno.metallib");
+    const metallib_step = b.step("metallib", "Compile and install the Metal shader library");
+    metallib_step.dependOn(&install_metallib.step);
 }

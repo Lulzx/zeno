@@ -126,8 +126,23 @@ class ZenoSwarm:
         _lib.zeno_swarm_set_body_offset(self._handle, body_offset)
 
     def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            # Module globals may already be cleared during interpreter exit.
+            pass
+
+    def close(self) -> None:
+        """Release the native swarm immediately; safe to call more than once."""
         if hasattr(self, "_handle") and self._handle != ffi.NULL:
             _lib.zeno_swarm_destroy(self._handle)
+            self._handle = ffi.NULL
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
     @property
     def num_agents(self) -> int:

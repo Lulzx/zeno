@@ -554,8 +554,24 @@ class ZenoWorld:
         self._cached_arrays: Dict[str, ZeroCopyArray] = {}
 
     def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            # Module globals may already be cleared during interpreter exit.
+            pass
+
+    def close(self) -> None:
+        """Release the native world immediately; safe to call more than once."""
         if hasattr(self, "_handle") and self._handle != ffi.NULL:
             _lib.zeno_world_destroy(self._handle)
+            self._handle = ffi.NULL
+            self._cached_arrays = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
     @property
     def num_envs(self) -> int:

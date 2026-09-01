@@ -26,6 +26,9 @@ zig build
 
 # Optimized release build (recommended)
 zig build -Doptimize=ReleaseFast
+
+# Optional: validate shaders offline and install zig-out/lib/zeno.metallib
+zig build metallib
 ```
 
 ### Run Tests
@@ -43,8 +46,9 @@ Ensure you have Python 3.9+ and pip installed.
 ### Install from Source
 
 ```bash
-cd python
-pip install -e .
+# The native library must be built from the repository root first.
+zig build -Doptimize=ReleaseFast
+pip install -e 'python[gymnasium]'
 ```
 
 This installs Zeno in editable mode, allowing you to modify the source and see changes immediately.
@@ -72,11 +76,12 @@ The Python bindings require:
 Optional dependencies:
 
 - `gymnasium` - For Gym-compatible environments
+- `stable-baselines3` - For the `make_sb3_env` adapter
 
 Install all dependencies:
 
 ```bash
-pip install numpy cffi gymnasium
+pip install -e 'python[all]'
 ```
 
 ## Benchmarks
@@ -88,10 +93,14 @@ To run the performance benchmarks:
 zig build bench
 
 # Python comparison with MuJoCo
-cd benchmarks
 pip install mujoco  # Optional, for comparison
-python compare_mujoco.py --envs 1024 --steps 1000
+python benchmarks/compare_mujoco.py --envs 1024 --steps 1000
 ```
+
+The comparison reports a same-machine throughput ratio. It is not a simulator
+speedup or physics-parity claim because model and solver semantics are not
+matched. Use `python benchmarks/validate_physics.py` for the bounded ballistic
+trajectory validation.
 
 ## Troubleshooting
 

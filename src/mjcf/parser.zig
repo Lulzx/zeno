@@ -360,6 +360,10 @@ fn parseBodyContent(
             } else if (std.mem.eql(u8, token.name, "joint")) {
                 const joint = parseJointWithDefaults(token.attrs, defaults, parent_class);
                 try body.joints.append(allocator, joint);
+            } else if (std.mem.eql(u8, token.name, "freejoint")) {
+                var joint = schema.MjcfJoint{ .joint_type = .free };
+                joint.name = getAttr(token.attrs, "name") orelse "";
+                try body.joints.append(allocator, joint);
             } else if (std.mem.eql(u8, token.name, "geom")) {
                 const geom = parseGeomWithDefaults(token.attrs, defaults, parent_class);
                 try body.geoms.append(allocator, geom);

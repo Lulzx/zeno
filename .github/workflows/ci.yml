@@ -20,6 +20,9 @@ jobs:
       - name: Build
         run: zig build -Doptimize=ReleaseFast
 
+      - name: Compile offline Metal shader artifact
+        run: zig build metallib
+
       - name: Zig tests
         run: zig build test
         env:
@@ -34,14 +37,25 @@ jobs:
       - name: ABI contract check
         run: python tests/check_abi_contract.py
 
-      - name: Install Python package
-        run: pip install -e python/
+      - name: Install Python package and all test integrations
+        run: pip install -e 'python[all]'
 
-      - name: Install test dependencies
-        run: pip install pytest numpy
+      - name: Python, Gymnasium, and SB3 integration tests
+        run: ./scripts/test_python.sh
 
-      - name: Python integration tests
-        run: python -m pytest tests/test_python_integration.py -v
+      - name: Build and smoke-test distributable wheel
+        run: |
+          mkdir -p dist
+          python -m pip wheel ./python --no-deps --wheel-dir dist
+          python -m venv /tmp/zeno-wheel-smoke
+          /tmp/zeno-wheel-smoke/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/zeno-wheel-smoke/bin/python -c 'import zeno; env = zeno.make("pendulum", num_envs=2); env.reset(); env.close()'
+
+      - name: Build documentation strictly
+        run: |
+          pip install -r docs/requirements.txt
+          python -m mkdocs build --strict
 
   benchmarks:
     runs-on: macos-14

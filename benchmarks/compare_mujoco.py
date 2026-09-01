@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Benchmark comparing Zeno vs MuJoCo performance.
+Measure Zeno and sequential MuJoCo throughput on one machine.
+
+This is not a physics-equivalence benchmark: the engines use different model
+semantics, solvers, and execution strategies. The ratio is throughput only.
 
 Usage:
     python compare_mujoco.py [--envs 1024] [--steps 1000]
@@ -165,10 +168,13 @@ def main():
     print("=" * 60)
 
     if "error" not in zeno_results and "error" not in mujoco_results:
-        speedup = mujoco_results["total_time"] / zeno_results["total_time"]
-        print(f"\nZeno speedup: {speedup:.1f}x faster than MuJoCo")
+        throughput_ratio = (
+            zeno_results["steps_per_sec"] / mujoco_results["steps_per_sec"]
+        )
+        print(f"\nObserved throughput ratio (Zeno/MuJoCo): {throughput_ratio:.3g}x")
         print(f"\nZeno:   {zeno_results['steps_per_sec']:>12,.0f} steps/sec")
         print(f"MuJoCo: {mujoco_results['steps_per_sec']:>12,.0f} steps/sec")
+        print("Not a speedup or parity claim: simulator semantics are not matched.")
     else:
         if "error" in zeno_results:
             print(f"Zeno error: {zeno_results['error']}")

@@ -93,6 +93,37 @@ class TestFFISmokeTest:
         assert world.action_dim > 0
         del world  # triggers __del__ -> zeno_world_destroy
 
+    def test_world_close_is_idempotent(self):
+        _skip_if_no_lib()
+        from zeno._ffi import ZenoWorld
+
+        world = ZenoWorld(mjcf_string=PENDULUM_MJCF, num_envs=1)
+        world.close()
+        world.close()
+
+    def test_free_body_matches_semi_implicit_ballistic_solution(self):
+        _skip_if_no_lib()
+        from zeno._ffi import ZenoWorld
+
+        dt = 0.002
+        steps = 100
+        xml = f"""<mujoco>
+        <option timestep="{dt}" gravity="0 0 -9.81"/>
+        <worldbody><body pos="0 0 10"><freejoint/>
+        <geom type="sphere" size="0.1" mass="1" contype="0" conaffinity="0"/>
+        </body></worldbody></mujoco>"""
+        world = ZenoWorld(mjcf_string=xml, timestep=dt)
+        try:
+            world.reset()
+            actions = np.zeros((1, world.action_dim), dtype=np.float32)
+            for _ in range(steps):
+                world.step(actions)
+            actual_z = float(world.get_body_positions()[0, 1, 2])
+            expected_z = 10.0 - 9.81 * dt * dt * steps * (steps + 1) / 2
+            assert actual_z == pytest.approx(expected_z, abs=1e-3)
+        finally:
+            world.close()
+
     def test_create_requires_mjcf(self):
         _skip_if_no_lib()
         from zeno._ffi import ZenoWorld
@@ -319,6 +350,32 @@ class TestGymnasiumAPI:
             assert env.action_space.contains(action)
         env.close()
 
+    def test_rgb_array_render_contract(self):
+        _skip_if_no_lib()
+        from zeno.gym import ZenoGymnasiumEnv
+
+        env = ZenoGymnasiumEnv(
+            mjcf_path=str(ASSETS_DIR / "pendulum.xml"),
+            render_mode="rgb_array",
+        )
+        try:
+            env.reset()
+            frame = env.render()
+            assert frame.shape == (480, 640, 3)
+            assert frame.dtype == np.uint8
+        finally:
+            env.close()
+
+    def test_unsupported_human_render_rejected(self):
+        _skip_if_no_lib()
+        from zeno.gym import ZenoGymnasiumEnv
+
+        with pytest.raises(ValueError, match="only 'rgb_array'"):
+            ZenoGymnasiumEnv(
+                mjcf_path=str(ASSETS_DIR / "pendulum.xml"),
+                render_mode="human",
+            )
+
     def test_vectorized_env_reset_step(self):
         _skip_if_no_lib()
         from zeno.gym import ZenoVectorEnv
@@ -332,8 +389,10 @@ class TestGymnasiumAPI:
         obs, info = env.reset()
         assert obs.shape[0] == num_envs
         assert obs.dtype == np.float32
+        assert env.single_observation_space.shape == obs.shape[1:]
 
         actions = env.action_space.sample()
+        assert actions.shape == (num_envs, env.single_action_space.shape[0])
         obs, rewards, terminated, truncated, info = env.step(actions)
         assert obs.shape[0] == num_envs
         assert rewards.shape == (num_envs,)
@@ -341,6 +400,7 @@ class TestGymnasiumAPI:
         assert truncated.shape == (num_envs,)
 
         env.close()
+        assert getattr(env, "closed", True) is True
 
     def test_vectorized_env_5_step_return_types(self):
         """Gymnasium v0.29+ vector envs return (obs, rew, term, trunc, info)."""
@@ -377,6 +437,18 @@ class TestGymnasiumAPI:
         with ZenoEnv(mjcf_string=PENDULUM_MJCF, num_envs=1) as env:
             obs = env.reset()
             assert obs is not None
+
+    def test_stable_baselines3_ppo_smoke(self):
+        pytest.importorskip("stable_baselines3")
+        from stable_baselines3 import PPO
+        from zeno.gym import make_sb3_env
+
+        env = make_sb3_env("pendulum", num_envs=2)
+        try:
+            model = PPO("MlpPolicy", env, n_steps=2, batch_size=4, verbose=0)
+            model.learn(total_timesteps=4)
+        finally:
+            env.close()
 
 
 # ===================================================================

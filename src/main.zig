@@ -208,7 +208,8 @@ export fn zeno_world_create_from_string(
     const allocator = gpa.allocator();
 
     const xml = std.mem.span(mjcf_string);
-    const scene = mjcf.parser.parseString(allocator, xml) catch {
+    const scene = mjcf.parser.parseString(allocator, xml) catch |err| {
+        std.log.err("Failed to parse MJCF string: {}", .{err});
         return null;
     };
 
@@ -229,7 +230,8 @@ export fn zeno_world_create_from_string(
         return null;
     };
 
-    world_ptr.* = World.init(allocator, scene, world_config) catch {
+    world_ptr.* = World.init(allocator, scene, world_config) catch |err| {
+        std.log.err("Failed to create world from MJCF string: {}", .{err});
         allocator.destroy(world_ptr);
         return null;
     };
