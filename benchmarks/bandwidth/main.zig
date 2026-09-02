@@ -16,21 +16,24 @@ fn nowNanos() i128 {
 
 // Objective-C runtime
 const objc = struct {
-    const c = @cImport({
-        @cInclude("objc/runtime.h");
-        @cInclude("objc/message.h");
-    });
-
     const id = *anyopaque;
     const Class = *anyopaque;
     const SEL = *anyopaque;
 
+    // Declare only the Objective-C runtime symbols this benchmark uses. Pulling
+    // in objc/runtime.h makes Zig's C translator parse Apple block declarations,
+    // which is unnecessary here and fails on some hosted-runner SDKs unless
+    // blocks support is explicitly enabled.
+    extern "c" fn objc_getClass(name: [*:0]const u8) ?Class;
+    extern "c" fn sel_registerName(name: [*:0]const u8) SEL;
+    extern "c" fn objc_msgSend() void;
+
     fn getClass(name: [*:0]const u8) ?Class {
-        return @ptrCast(c.objc_getClass(name));
+        return objc_getClass(name);
     }
 
     fn sel(name: [*:0]const u8) SEL {
-        return @ptrCast(c.sel_registerName(name));
+        return sel_registerName(name);
     }
 
     fn msgSend(comptime RetType: type, target: anytype, selector: SEL, args: anytype) RetType {
@@ -40,19 +43,19 @@ const objc = struct {
 
         if (args_info.@"struct".fields.len == 0) {
             const FnType = *const fn (?*anyopaque, SEL) callconv(.c) RetType;
-            const func: FnType = @ptrCast(&c.objc_msgSend);
+            const func: FnType = @ptrCast(&objc_msgSend);
             return func(target_ptr, selector);
         } else if (args_info.@"struct".fields.len == 1) {
             const FnType = *const fn (?*anyopaque, SEL, @TypeOf(args[0])) callconv(.c) RetType;
-            const func: FnType = @ptrCast(&c.objc_msgSend);
+            const func: FnType = @ptrCast(&objc_msgSend);
             return func(target_ptr, selector, args[0]);
         } else if (args_info.@"struct".fields.len == 2) {
             const FnType = *const fn (?*anyopaque, SEL, @TypeOf(args[0]), @TypeOf(args[1])) callconv(.c) RetType;
-            const func: FnType = @ptrCast(&c.objc_msgSend);
+            const func: FnType = @ptrCast(&objc_msgSend);
             return func(target_ptr, selector, args[0], args[1]);
         } else if (args_info.@"struct".fields.len == 3) {
             const FnType = *const fn (?*anyopaque, SEL, @TypeOf(args[0]), @TypeOf(args[1]), @TypeOf(args[2])) callconv(.c) RetType;
-            const func: FnType = @ptrCast(&c.objc_msgSend);
+            const func: FnType = @ptrCast(&objc_msgSend);
             return func(target_ptr, selector, args[0], args[1], args[2]);
         } else {
             @compileError("Too many arguments");
