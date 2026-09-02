@@ -33,6 +33,38 @@ struct SimParams {
     uint obs_dim;           // Observation dimension per environment
 };
 
+struct EnvDispatchParams {
+    uint num_envs;
+    uint dispatch_envs;
+    uint use_active_env_ids;
+    uint _pad;
+};
+
+struct TaskParams {
+    uint enabled;
+    uint root_body;
+    uint forward_axis;
+    uint max_episode_steps;
+    float forward_reward_weight;
+    float control_cost_weight;
+    float healthy_bonus;
+    float healthy_z_min;
+    float healthy_z_max;
+    uint terminate_when_unhealthy;
+    uint _pad0;
+    uint _pad1;
+};
+
+inline uint physical_env_id(
+    uint dispatch_env_id,
+    constant EnvDispatchParams& dispatch,
+    device const uint* active_env_ids
+) {
+    return dispatch.use_active_env_ids != 0
+        ? active_env_ids[dispatch_env_id]
+        : dispatch_env_id;
+}
+
 struct BodyData {
     float4 position;
     float4 quaternion;
@@ -99,6 +131,171 @@ float4 quat_normalize(float4 q) {
     return len > 1e-8 ? q / len : float4(0, 0, 0, 1);
 }
 
+float3 geom_world_position(float4 body_position, float4 body_quat, GeomData geom) {
+    return body_position.xyz + rotate_by_quat(geom.pos_size0.xyz, body_quat);
+}
+
+float4 geom_world_quat(float4 body_quat, GeomData geom) {
+    return quat_normalize(quat_multiply(body_quat, geom.quat));
+}
+
+float geom_bounding_radius(GeomData geom) {
+    uint type = geom.type_body.x;
+    float x = geom.pos_size0.w;
+    if (type == 0) return x;                         // sphere
+    if (type == 1) return x + geom.params.x;         // capsule
+    if (type == 2) return length(float3(x, geom.params.x, geom.params.y)); // box
+    if (type == 4) return length(float2(x, geom.params.x)); // cylinder
+    return x; // mesh/heightfield placeholders; planes bypass finite tests
+}
+
+float3 contact_tangent(float3 normal) {
+    float3 reference = abs(normal.z) < 0.9f
+        ? float3(0, 0, 1)
+        : float3(0, 1, 0);
+    return normalize(cross(reference, normal));
+}
+
+float3 closest_point_on_segment(float3 point, float3 a, float3 b) {
+    float3 ab = b - a;
+    float denom = dot(ab, ab);
+    if (denom < 1e-12f) return a;
+    float t = clamp(dot(point - a, ab) / denom, 0.0f, 1.0f);
+    return a + t * ab;
+}
+
+struct SegmentClosestPoints {
+    float3 a;
+    float3 b;
+};
+
+SegmentClosestPoints closest_points_on_segments(
+    float3 p1, float3 q1, float3 p2, float3 q2
+) {
+    float3 d1 = q1 - p1;
+    float3 d2 = q2 - p2;
+    float3 r = p1 - p2;
+    float a = dot(d1, d1);
+    float e = dot(d2, d2);
+    float f = dot(d2, r);
+    float s = 0.0f;
+    float t = 0.0f;
+
+    if (a <= 1e-12f && e <= 1e-12f) {
+        return {p1, p2};
+    }
+    if (a <= 1e-12f) {
+        t = clamp(f / e, 0.0f, 1.0f);
+    } else {
+        float c = dot(d1, r);
+        if (e <= 1e-12f) {
+            s = clamp(-c / a, 0.0f, 1.0f);
+        } else {
+            float b = dot(d1, d2);
+            float denom = a * e - b * b;
+            if (abs(denom) > 1e-12f) s = clamp((b * f - c * e) / denom, 0.0f, 1.0f);
+            t = (b * s + f) / e;
+            if (t < 0.0f) {
+                t = 0.0f;
+                s = clamp(-c / a, 0.0f, 1.0f);
+            } else if (t > 1.0f) {
+                t = 1.0f;
+                s = clamp((b - c) / a, 0.0f, 1.0f);
+            }
+        }
+    }
+    return {p1 + d1 * s, p2 + d2 * t};
+}
+
+struct SegmentBoxClosestPoints {
+    float3 segment;
+    float3 box;
+    float distance_sq;
+};
+
+float3 nearest_aabb_face_normal(float3 point, float3 extents) {
+    float3 clearance = extents - abs(point);
+    uint axis = clearance.y < clearance.x ? 1u : 0u;
+    if (clearance.z < clearance[axis]) axis = 2u;
+    float3 normal = float3(0.0f);
+    normal[axis] = point[axis] >= 0.0f ? 1.0f : -1.0f;
+    return normal;
+}
+
+// Exact closest points between a segment and an axis-aligned box. Squared
+// distance is piecewise quadratic in segment t; slab crossings partition the
+// pieces, then each interval's analytic minimum is evaluated.
+SegmentBoxClosestPoints closest_points_segment_aabb(
+    float3 start, float3 end, float3 extents
+) {
+    float3 direction = end - start;
+    float breaks[8];
+    uint break_count = 2;
+    breaks[0] = 0.0f;
+    breaks[1] = 1.0f;
+    for (uint axis = 0; axis < 3; ++axis) {
+        if (abs(direction[axis]) <= 1e-12f) continue;
+        float low_t = (-extents[axis] - start[axis]) / direction[axis];
+        float high_t = (extents[axis] - start[axis]) / direction[axis];
+        if (low_t > 0.0f && low_t < 1.0f) breaks[break_count++] = low_t;
+        if (high_t > 0.0f && high_t < 1.0f) breaks[break_count++] = high_t;
+    }
+    for (uint i = 1; i < break_count; ++i) {
+        float key = breaks[i];
+        int j = int(i) - 1;
+        while (j >= 0 && breaks[uint(j)] > key) {
+            breaks[uint(j) + 1] = breaks[uint(j)];
+            --j;
+        }
+        breaks[uint(j + 1)] = key;
+    }
+
+    SegmentBoxClosestPoints best;
+    best.segment = start;
+    best.box = clamp(start, -extents, extents);
+    best.distance_sq = dot(best.segment - best.box, best.segment - best.box);
+
+    for (uint i = 0; i < break_count; ++i) {
+        float t = breaks[i];
+        float3 segment_point = start + direction * t;
+        float3 box_point = clamp(segment_point, -extents, extents);
+        float distance_sq = dot(segment_point - box_point, segment_point - box_point);
+        if (distance_sq < best.distance_sq) {
+            best = {segment_point, box_point, distance_sq};
+        }
+    }
+
+    for (uint i = 0; i + 1 < break_count; ++i) {
+        float lo = breaks[i];
+        float hi = breaks[i + 1];
+        if (hi - lo <= 1e-12f) continue;
+        float3 midpoint = start + direction * ((lo + hi) * 0.5f);
+        float numerator = 0.0f;
+        float denominator = 0.0f;
+        for (uint axis = 0; axis < 3; ++axis) {
+            float bound;
+            if (midpoint[axis] < -extents[axis]) {
+                bound = -extents[axis];
+            } else if (midpoint[axis] > extents[axis]) {
+                bound = extents[axis];
+            } else {
+                continue;
+            }
+            numerator += direction[axis] * (start[axis] - bound);
+            denominator += direction[axis] * direction[axis];
+        }
+        if (denominator <= 1e-12f) continue;
+        float t = clamp(-numerator / denominator, lo, hi);
+        float3 segment_point = start + direction * t;
+        float3 box_point = clamp(segment_point, -extents, extents);
+        float distance_sq = dot(segment_point - box_point, segment_point - box_point);
+        if (distance_sq < best.distance_sq) {
+            best = {segment_point, box_point, distance_sq};
+        }
+    }
+    return best;
+}
+
 // Atomic float add helper
 void atomic_add_float(device float* address, float val) {
     device atomic_uint* atom = (device atomic_uint*)address;
@@ -136,14 +333,15 @@ kernel void apply_joint_forces(
     device const float4* quaternions [[buffer(3)]],
     constant SimParams& params [[buffer(4)]],
     device float4* forces [[buffer(5)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.num_joints;
+    uint dispatch_env_id = gid / params.num_joints;
     uint joint_id = gid % params.num_joints;
-
-    if (env_id >= params.num_envs) return;
-
-    uint joint_idx = gid;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+    uint joint_idx = env_id * params.num_joints + joint_id;
     JointData joint = joints[joint_id];
 
     float applied_force = joint_torques[joint_idx];
@@ -208,15 +406,17 @@ kernel void apply_actions(
     device float* joint_torques [[buffer(1)]],
     device const ActuatorData* actuators [[buffer(2)]],
     constant SimParams& params [[buffer(3)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint num_actuators = params.num_actuators;
     if (num_actuators == 0) return;
 
-    uint env_id = gid / num_actuators;
+    uint dispatch_env_id = gid / num_actuators;
     uint act_id = gid % num_actuators;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     ActuatorData act = actuators[act_id];
     uint joint_id = uint(act.params.x);
@@ -224,7 +424,7 @@ kernel void apply_actions(
     float ctrl_max = act.params.z;
     float gear = act.params.w;
 
-    float ctrl = actions[gid];
+    float ctrl = actions[env_id * num_actuators + act_id];
     ctrl = clamp(ctrl, ctrl_min, ctrl_max);
 
     float torque = ctrl * gear;
@@ -249,12 +449,15 @@ kernel void forward_kinematics(
     device const JointData* joints [[buffer(3)]],
     device const BodyData* bodies [[buffer(4)]],
     constant SimParams& params [[buffer(5)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.num_bodies;
+    uint dispatch_env_id = gid / params.num_bodies;
     uint body_id = gid % params.num_bodies;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+    gid = env_id * params.num_bodies + body_id;
 
     BodyData body = bodies[body_id];
     int parent_id = int(body.params.x);
@@ -318,12 +521,15 @@ kernel void update_kinematic(
     device const float4* angular_velocities [[buffer(3)]],
     device const BodyData* bodies [[buffer(4)]],
     constant SimParams& params [[buffer(5)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.num_bodies;
+    uint dispatch_env_id = gid / params.num_bodies;
     uint body_id = gid % params.num_bodies;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+    gid = env_id * params.num_bodies + body_id;
 
     BodyData body = bodies[body_id];
     uint body_type = uint(body.params.y);
@@ -362,12 +568,15 @@ kernel void compute_forces(
     constant SimParams& params [[buffer(6)]],
     device const float4* quaternions [[buffer(7)]],
     device const BodyData* body_data [[buffer(8)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.num_bodies;
+    uint dispatch_env_id = gid / params.num_bodies;
     uint body_id = gid % params.num_bodies;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+    gid = env_id * params.num_bodies + body_id;
 
     float4 inv_mi = inv_mass_inertia[gid];
     float inv_mass = inv_mi.x;
@@ -412,11 +621,15 @@ kernel void integrate(
     device const float4* inv_mass_inertia [[buffer(6)]],
     constant SimParams& params [[buffer(7)]],
     device const BodyData* body_data [[buffer(8)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.num_bodies;
-    if (env_id >= params.num_envs) return;
+    uint dispatch_env_id = gid / params.num_bodies;
     uint body_id = gid % params.num_bodies;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+    gid = env_id * params.num_bodies + body_id;
 
     float4 inv_mi = inv_mass_inertia[gid];
     float inv_mass = inv_mi.x;
@@ -492,6 +705,20 @@ kernel void clear_uint_buffer(
     if (gid < count) buf[gid] = 0;
 }
 
+kernel void clear_active_uint_slices(
+    device uint* buffer [[buffer(0)]],
+    constant uint& elements_per_env [[buffer(1)]],
+    constant EnvDispatchParams& dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint dispatch_env_id = gid / elements_per_env;
+    if (dispatch_env_id >= dispatch.dispatch_envs) return;
+    uint element_id = gid % elements_per_env;
+    uint env_id = physical_env_id(dispatch_env_id, dispatch, active_env_ids);
+    buffer[env_id * elements_per_env + element_id] = 0;
+}
+
 kernel void broad_phase(
     device const float4* positions [[buffer(0)]],
     device const float4* quaternions [[buffer(1)]],
@@ -499,19 +726,21 @@ kernel void broad_phase(
     device Contact* contacts [[buffer(3)]],
     device atomic_uint* contact_counts [[buffer(4)]],
     constant SimParams& params [[buffer(5)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.num_geoms;
+    uint dispatch_env_id = gid / params.num_geoms;
     uint geom_id = gid % params.num_geoms;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     GeomData geom_a = geoms[geom_id];
     uint body_a = geom_a.type_body.y;
     uint body_idx_a = env_id * params.num_bodies + body_a;
 
-    float3 pos_a = positions[body_idx_a].xyz + geom_a.pos_size0.xyz;
-    float radius_a = geom_a.pos_size0.w;
+    float3 pos_a = geom_world_position(positions[body_idx_a], quaternions[body_idx_a], geom_a);
+    float radius_a = geom_bounding_radius(geom_a);
 
     uint type_a = geom_a.type_body.x;
     uint group_a = geom_a.type_body.w;  // contype
@@ -533,8 +762,8 @@ kernel void broad_phase(
         if ((group_a & mask_b) == 0 && (group_b & mask_a) == 0) continue;
 
         uint body_idx_b = env_id * params.num_bodies + body_b;
-        float3 pos_b = positions[body_idx_b].xyz + geom_b.pos_size0.xyz;
-        float radius_b = geom_b.pos_size0.w;
+        float3 pos_b = geom_world_position(positions[body_idx_b], quaternions[body_idx_b], geom_b);
+        float radius_b = geom_bounding_radius(geom_b);
 
         // Plane bypass — planes are infinite, always emit candidate
         bool is_plane_pair = (type_a == 3 || type_b == 3);
@@ -588,17 +817,20 @@ kernel void broad_phase_count_cells(
     device uint* cell_ids [[buffer(3)]],
     constant SpatialHashParams& grid [[buffer(4)]],
     constant SimParams& params [[buffer(5)]],
+    device const float4* quaternions [[buffer(6)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / grid.num_geoms;
+    uint dispatch_env_id = gid / grid.num_geoms;
     uint geom_id = gid % grid.num_geoms;
-
-    if (env_id >= grid.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     GeomData geom = geoms[geom_id];
     uint body_id = geom.type_body.y;
     uint body_idx = env_id * params.num_bodies + body_id;
-    float3 pos = positions[body_idx].xyz + geom.pos_size0.xyz;
+    float3 pos = geom_world_position(positions[body_idx], quaternions[body_idx], geom);
 
     // Compute cell coordinates relative to grid origin (clamped to grid bounds)
     float3 grid_origin = float3(grid.origin_x, grid.origin_y, grid.origin_z);
@@ -622,9 +854,12 @@ kernel void broad_phase_prefix_sum(
     device uint* cell_counts [[buffer(0)]],
     device uint* cell_offsets [[buffer(1)]],
     constant SpatialHashParams& grid [[buffer(2)]],
-    uint env_id [[thread_position_in_grid]]
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
+    uint dispatch_env_id [[thread_position_in_grid]]
 ) {
-    if (env_id >= grid.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     uint base = env_id * grid.total_cells;
     uint sum = 0;
@@ -645,12 +880,14 @@ kernel void broad_phase_scatter(
     device atomic_uint* cell_counts [[buffer(2)]],
     device uint* sorted_geoms [[buffer(3)]],
     constant SpatialHashParams& grid [[buffer(4)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / grid.num_geoms;
+    uint dispatch_env_id = gid / grid.num_geoms;
     uint geom_id = gid % grid.num_geoms;
-
-    if (env_id >= grid.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     uint env_cell_base = env_id * grid.total_cells;
     uint env_geom_base = env_id * grid.num_geoms;
@@ -674,12 +911,15 @@ kernel void broad_phase_detect(
     device atomic_uint* contact_counts [[buffer(7)]],
     constant SpatialHashParams& grid [[buffer(8)]],
     constant SimParams& params [[buffer(9)]],
+    device const float4* quaternions [[buffer(10)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / grid.num_geoms;
+    uint dispatch_env_id = gid / grid.num_geoms;
     uint geom_id = gid % grid.num_geoms;
-
-    if (env_id >= grid.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     uint env_cell_base = env_id * grid.total_cells;
     uint env_geom_base = env_id * grid.num_geoms;
@@ -688,11 +928,15 @@ kernel void broad_phase_detect(
     GeomData geom_a = geoms[geom_id];
     uint body_a = geom_a.type_body.y;
     uint body_idx_a = env_id * params.num_bodies + body_a;
-    float3 pos_a = positions[body_idx_a].xyz + geom_a.pos_size0.xyz;
-    float radius_a = geom_a.pos_size0.w;
+    float3 pos_a = geom_world_position(positions[body_idx_a], quaternions[body_idx_a], geom_a);
+    float radius_a = geom_bounding_radius(geom_a);
     uint type_a = geom_a.type_body.x;
     uint group_a = geom_a.type_body.w;
     uint mask_a = geom_a.type_body.z;
+
+    // Infinite planes are paired explicitly by each finite geom below. A
+    // plane cannot be represented by one spatial-hash cell.
+    if (type_a == 3) return;
 
     float3 grid_origin = float3(grid.origin_x, grid.origin_y, grid.origin_z);
     int3 center = int3(floor((pos_a - grid_origin) * grid.inv_cell_size));
@@ -722,18 +966,15 @@ kernel void broad_phase_detect(
                     if ((group_a & mask_b) == 0 && (group_b & mask_a) == 0) continue;
 
                     uint type_b = geom_b.type_body.x;
+                    if (type_b == 3) continue;
                     uint body_idx_b = env_id * params.num_bodies + body_b;
-                    float3 pos_b = positions[body_idx_b].xyz + geom_b.pos_size0.xyz;
-                    float radius_b = geom_b.pos_size0.w;
+                    float3 pos_b = geom_world_position(positions[body_idx_b], quaternions[body_idx_b], geom_b);
+                    float radius_b = geom_bounding_radius(geom_b);
 
-                    bool is_plane_pair = (type_a == 3 || type_b == 3);
-
-                    if (!is_plane_pair) {
-                        float3 diff = pos_b - pos_a;
-                        float dist_sq = dot(diff, diff);
-                        float min_dist = radius_a + radius_b + 0.1;
-                        if (dist_sq >= min_dist * min_dist) continue;
-                    }
+                    float3 diff = pos_b - pos_a;
+                    float dist_sq = dot(diff, diff);
+                    float min_dist = radius_a + radius_b + 0.1;
+                    if (dist_sq >= min_dist * min_dist) continue;
 
                     uint count = atomic_fetch_add_explicit(
                         &contact_counts[env_id], 1, memory_order_relaxed);
@@ -743,6 +984,33 @@ kernel void broad_phase_detect(
                         contacts[contact_idx].indices = uint4(body_a, body_b, geom_id, other);
                     }
                 }
+            }
+        }
+    }
+
+    // Emit each compatible infinite-plane pair exactly once from the finite
+    // geom's thread, regardless of cell distance.
+    for (uint plane_id = 0; plane_id < grid.num_geoms; ++plane_id) {
+        GeomData plane = geoms[plane_id];
+        if (plane.type_body.x != 3) continue;
+        uint plane_body = plane.type_body.y;
+        if (plane_body == body_a) continue;
+        uint plane_group = plane.type_body.w;
+        uint plane_mask = plane.type_body.z;
+        if ((group_a & plane_mask) == 0 && (plane_group & mask_a) == 0) continue;
+
+        uint count = atomic_fetch_add_explicit(
+            &contact_counts[env_id], 1, memory_order_relaxed);
+        if (count < params.max_contacts) {
+            uint contact_idx = env_id * params.max_contacts + count;
+            if (plane_id < geom_id) {
+                contacts[contact_idx].indices = uint4(
+                    plane_body, body_a, plane_id, geom_id
+                );
+            } else {
+                contacts[contact_idx].indices = uint4(
+                    body_a, plane_body, geom_id, plane_id
+                );
             }
         }
     }
@@ -758,9 +1026,12 @@ kernel void sort_contacts(
     device Contact* contacts [[buffer(0)]],
     device const uint* contact_counts [[buffer(1)]],
     constant SimParams& params [[buffer(2)]],
-    uint env_id [[thread_position_in_grid]]
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
+    uint dispatch_env_id [[thread_position_in_grid]]
 ) {
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     uint count = min(contact_counts[env_id], params.max_contacts);
     if (count <= 1) return;
@@ -807,12 +1078,14 @@ kernel void narrow_phase(
     device Contact* contacts [[buffer(3)]],
     device const uint* contact_counts [[buffer(4)]],
     constant SimParams& params [[buffer(5)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.max_contacts;
+    uint dispatch_env_id = gid / params.max_contacts;
     uint contact_id = gid % params.max_contacts;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     uint count = min(contact_counts[env_id], params.max_contacts);
     if (contact_id >= count) return;
@@ -831,8 +1104,10 @@ kernel void narrow_phase(
     uint body_idx_a = env_id * params.num_bodies + body_a;
     uint body_idx_b = env_id * params.num_bodies + body_b;
 
-    float3 pos_a = positions[body_idx_a].xyz + geom_a.pos_size0.xyz;
-    float3 pos_b = positions[body_idx_b].xyz + geom_b.pos_size0.xyz;
+    float3 pos_a = geom_world_position(positions[body_idx_a], quaternions[body_idx_a], geom_a);
+    float3 pos_b = geom_world_position(positions[body_idx_b], quaternions[body_idx_b], geom_b);
+    float4 quat_a = geom_world_quat(quaternions[body_idx_a], geom_a);
+    float4 quat_b = geom_world_quat(quaternions[body_idx_b], geom_b);
 
     uint type_a = geom_a.type_body.x;
     uint type_b = geom_b.type_body.x;
@@ -848,14 +1123,16 @@ kernel void narrow_phase(
         float radius_a = geom_a.pos_size0.w;
         float radius_b = geom_b.pos_size0.w;
 
-        float3 diff = pos_b - pos_a;
+        // Contact normals point from body B toward body A because the solver
+        // applies +normal to A and -normal to B.
+        float3 diff = pos_a - pos_b;
         float dist = length(diff);
         float min_dist = radius_a + radius_b;
 
-        if (dist < min_dist && dist > 1e-6) {
-            normal = diff / dist;
+        if (dist < min_dist) {
+            normal = dist > 1e-6 ? diff / dist : float3(1, 0, 0);
             penetration = min_dist - dist;
-            contact_point = pos_a + normal * (radius_a - penetration * 0.5);
+            contact_point = pos_a - normal * (radius_a - penetration * 0.5);
             has_contact = true;
         }
     }
@@ -870,12 +1147,12 @@ kernel void narrow_phase(
             sphere_pos = pos_a;
             sphere_radius = geom_a.pos_size0.w;
             plane_pos = pos_b;
-            plane_normal = float3(0, 0, 1); // Assume Z-up plane
+            plane_normal = rotate_by_quat(float3(0, 0, 1), quat_b);
         } else {
             sphere_pos = pos_b;
             sphere_radius = geom_b.pos_size0.w;
             plane_pos = pos_a;
-            plane_normal = float3(0, 0, 1);
+            plane_normal = rotate_by_quat(float3(0, 0, 1), quat_a);
         }
 
         float signed_dist = dot(sphere_pos - plane_pos, plane_normal);
@@ -898,18 +1175,20 @@ kernel void narrow_phase(
         float capsule_radius;
         float capsule_half_len;
         float4 capsule_quat;
-        float3 plane_normal = float3(0, 0, 1);
+        float3 plane_normal;
 
         if (type_a == 1) {
             capsule_pos = pos_a;
             capsule_radius = geom_a.pos_size0.w;
             capsule_half_len = geom_a.params.x;
-            capsule_quat = geom_a.quat;
+            capsule_quat = quat_a;
+            plane_normal = rotate_by_quat(float3(0, 0, 1), quat_b);
         } else {
             capsule_pos = pos_b;
             capsule_radius = geom_b.pos_size0.w;
             capsule_half_len = geom_b.params.x;
-            capsule_quat = geom_b.quat;
+            capsule_quat = quat_b;
+            plane_normal = rotate_by_quat(float3(0, 0, 1), quat_a);
         }
 
         // Capsule axis
@@ -918,8 +1197,9 @@ kernel void narrow_phase(
         float3 p2 = capsule_pos + axis * capsule_half_len;
 
         // Check both endpoints
-        float d1 = p1.z - capsule_radius;
-        float d2 = p2.z - capsule_radius;
+        float3 plane_pos = type_a == 3 ? pos_a : pos_b;
+        float d1 = dot(p1 - plane_pos, plane_normal) - capsule_radius;
+        float d2 = dot(p2 - plane_pos, plane_normal) - capsule_radius;
 
         if (d1 < 0 || d2 < 0) {
             float3 deepest = d1 < d2 ? p1 : p2;
@@ -927,8 +1207,353 @@ kernel void narrow_phase(
 
             normal = type_a == 1 ? plane_normal : -plane_normal;
             penetration = -dist;
-            contact_point = deepest;
-            contact_point.z = 0;
+            contact_point = deepest - plane_normal * dot(deepest - plane_pos, plane_normal);
+            has_contact = true;
+        }
+    }
+    // Sphere-capsule (type 0-1), with fully composed capsule orientation.
+    else if ((type_a == 0 && type_b == 1) || (type_a == 1 && type_b == 0)) {
+        float3 sphere_pos = type_a == 0 ? pos_a : pos_b;
+        float sphere_radius = type_a == 0 ? geom_a.pos_size0.w : geom_b.pos_size0.w;
+        GeomData capsule = type_a == 1 ? geom_a : geom_b;
+        float3 capsule_pos = type_a == 1 ? pos_a : pos_b;
+        float4 capsule_quat = type_a == 1 ? quat_a : quat_b;
+        float capsule_radius = capsule.pos_size0.w;
+        float capsule_half_len = capsule.params.x;
+        float3 axis = rotate_by_quat(float3(0, 0, 1), capsule_quat);
+        float3 closest = closest_point_on_segment(
+            sphere_pos,
+            capsule_pos - axis * capsule_half_len,
+            capsule_pos + axis * capsule_half_len
+        );
+        float3 capsule_to_sphere = sphere_pos - closest;
+        float distance = length(capsule_to_sphere);
+        float radius_sum = sphere_radius + capsule_radius;
+        if (distance < radius_sum) {
+            float3 outward = distance > 1e-6
+                ? capsule_to_sphere / distance
+                : float3(1, 0, 0);
+            normal = type_a == 0 ? outward : -outward;
+            penetration = radius_sum - distance;
+            contact_point = sphere_pos - outward * (sphere_radius - penetration * 0.5f);
+            has_contact = true;
+        }
+    }
+    // Sphere-box (type 0-2), evaluated in the oriented box's local frame.
+    else if ((type_a == 0 && type_b == 2) || (type_a == 2 && type_b == 0)) {
+        float3 sphere_pos = type_a == 0 ? pos_a : pos_b;
+        float sphere_radius = type_a == 0 ? geom_a.pos_size0.w : geom_b.pos_size0.w;
+        GeomData box = type_a == 2 ? geom_a : geom_b;
+        float3 box_pos = type_a == 2 ? pos_a : pos_b;
+        float4 box_quat = type_a == 2 ? quat_a : quat_b;
+        float3 extents = float3(box.pos_size0.w, box.params.x, box.params.y);
+        float3 sphere_local = rotate_by_quat(
+            sphere_pos - box_pos,
+            quat_conjugate(box_quat)
+        );
+        float3 box_local = clamp(sphere_local, -extents, extents);
+        float3 delta_local = sphere_local - box_local;
+        float distance = length(delta_local);
+
+        if (distance < sphere_radius) {
+            float3 outward_local;
+            float3 sphere_surface_local;
+            if (distance > 1e-6f) {
+                outward_local = delta_local / distance;
+                penetration = sphere_radius - distance;
+                sphere_surface_local = sphere_local - outward_local * sphere_radius;
+            } else {
+                outward_local = nearest_aabb_face_normal(sphere_local, extents);
+                float face_clearance = dot(extents - abs(sphere_local), abs(outward_local));
+                penetration = sphere_radius + face_clearance;
+                box_local = sphere_local + outward_local * face_clearance;
+                sphere_surface_local = sphere_local + outward_local * sphere_radius;
+            }
+            float3 outward = rotate_by_quat(outward_local, box_quat);
+            normal = type_a == 0 ? outward : -outward;
+            float3 box_surface = box_pos + rotate_by_quat(box_local, box_quat);
+            float3 sphere_surface = box_pos + rotate_by_quat(sphere_surface_local, box_quat);
+            contact_point = (box_surface + sphere_surface) * 0.5f;
+            has_contact = true;
+        }
+    }
+    // Sphere-cylinder (type 0-4), evaluated against the exact finite cylinder
+    // in its oriented local frame.
+    else if ((type_a == 0 && type_b == 4) || (type_a == 4 && type_b == 0)) {
+        float3 sphere_pos = type_a == 0 ? pos_a : pos_b;
+        float sphere_radius = type_a == 0 ? geom_a.pos_size0.w : geom_b.pos_size0.w;
+        GeomData cylinder = type_a == 4 ? geom_a : geom_b;
+        float3 cylinder_pos = type_a == 4 ? pos_a : pos_b;
+        float4 cylinder_quat = type_a == 4 ? quat_a : quat_b;
+        float cylinder_radius = cylinder.pos_size0.w;
+        float cylinder_half_height = cylinder.params.x;
+        float3 sphere_local = rotate_by_quat(
+            sphere_pos - cylinder_pos,
+            quat_conjugate(cylinder_quat)
+        );
+        float radial_length = length(sphere_local.xy);
+        float2 radial_direction = radial_length > 1e-6f
+            ? sphere_local.xy / radial_length
+            : float2(1, 0);
+        float3 cylinder_surface_local = float3(
+            radial_direction * min(radial_length, cylinder_radius),
+            clamp(sphere_local.z, -cylinder_half_height, cylinder_half_height)
+        );
+        float3 delta_local = sphere_local - cylinder_surface_local;
+        float distance = length(delta_local);
+
+        if (distance < sphere_radius) {
+            float3 outward_local;
+            float3 sphere_surface_local;
+            if (distance > 1e-6f) {
+                outward_local = delta_local / distance;
+                penetration = sphere_radius - distance;
+                sphere_surface_local = sphere_local - outward_local * sphere_radius;
+            } else {
+                float side_clearance = cylinder_radius - radial_length;
+                float cap_clearance = cylinder_half_height - abs(sphere_local.z);
+                if (side_clearance < cap_clearance) {
+                    outward_local = float3(radial_direction, 0);
+                    penetration = sphere_radius + side_clearance;
+                    cylinder_surface_local = sphere_local + outward_local * side_clearance;
+                } else {
+                    outward_local = float3(0, 0, sphere_local.z >= 0.0f ? 1.0f : -1.0f);
+                    penetration = sphere_radius + cap_clearance;
+                    cylinder_surface_local = sphere_local + outward_local * cap_clearance;
+                }
+                sphere_surface_local = sphere_local + outward_local * sphere_radius;
+            }
+            float3 outward = rotate_by_quat(outward_local, cylinder_quat);
+            normal = type_a == 0 ? outward : -outward;
+            float3 cylinder_surface = cylinder_pos + rotate_by_quat(
+                cylinder_surface_local, cylinder_quat
+            );
+            float3 sphere_surface = cylinder_pos + rotate_by_quat(
+                sphere_surface_local, cylinder_quat
+            );
+            contact_point = (cylinder_surface + sphere_surface) * 0.5f;
+            has_contact = true;
+        }
+    }
+    // Capsule-capsule (type 1-1), using closest points on oriented segments.
+    else if (type_a == 1 && type_b == 1) {
+        float3 axis_a = rotate_by_quat(float3(0, 0, 1), quat_a);
+        float3 axis_b = rotate_by_quat(float3(0, 0, 1), quat_b);
+        float half_a = geom_a.params.x;
+        float half_b = geom_b.params.x;
+        SegmentClosestPoints closest = closest_points_on_segments(
+            pos_a - axis_a * half_a,
+            pos_a + axis_a * half_a,
+            pos_b - axis_b * half_b,
+            pos_b + axis_b * half_b
+        );
+        float3 b_to_a = closest.a - closest.b;
+        float distance = length(b_to_a);
+        float radius_a = geom_a.pos_size0.w;
+        float radius_b = geom_b.pos_size0.w;
+        float radius_sum = radius_a + radius_b;
+        if (distance < radius_sum) {
+            if (distance > 1e-6f) {
+                normal = b_to_a / distance;
+            } else {
+                float3 center_delta = pos_a - pos_b;
+                normal = length(center_delta) > 1e-6f
+                    ? normalize(center_delta)
+                    : float3(1, 0, 0);
+            }
+            penetration = radius_sum - distance;
+            float3 surface_a = closest.a - normal * radius_a;
+            float3 surface_b = closest.b + normal * radius_b;
+            contact_point = (surface_a + surface_b) * 0.5f;
+            has_contact = true;
+        }
+    }
+    // Capsule-box (type 1-2). Transform the capsule segment into box-local
+    // space and solve the exact piecewise-quadratic segment/AABB distance.
+    else if ((type_a == 1 && type_b == 2) || (type_a == 2 && type_b == 1)) {
+        GeomData capsule = type_a == 1 ? geom_a : geom_b;
+        float3 capsule_pos = type_a == 1 ? pos_a : pos_b;
+        float4 capsule_quat = type_a == 1 ? quat_a : quat_b;
+        GeomData box = type_a == 2 ? geom_a : geom_b;
+        float3 box_pos = type_a == 2 ? pos_a : pos_b;
+        float4 box_quat = type_a == 2 ? quat_a : quat_b;
+        float3 extents = float3(box.pos_size0.w, box.params.x, box.params.y);
+        float capsule_radius = capsule.pos_size0.w;
+        float3 capsule_axis = rotate_by_quat(float3(0, 0, 1), capsule_quat);
+        float3 segment_start = capsule_pos - capsule_axis * capsule.params.x;
+        float3 segment_end = capsule_pos + capsule_axis * capsule.params.x;
+        float4 box_inverse = quat_conjugate(box_quat);
+        float3 start_local = rotate_by_quat(segment_start - box_pos, box_inverse);
+        float3 end_local = rotate_by_quat(segment_end - box_pos, box_inverse);
+        SegmentBoxClosestPoints closest = closest_points_segment_aabb(
+            start_local, end_local, extents
+        );
+        float distance = sqrt(max(closest.distance_sq, 0.0f));
+
+        if (distance < capsule_radius) {
+            float3 outward_local;
+            float3 capsule_surface_local;
+            if (distance > 1e-6f) {
+                outward_local = (closest.segment - closest.box) / distance;
+                penetration = capsule_radius - distance;
+                capsule_surface_local = closest.segment - outward_local * capsule_radius;
+            } else {
+                outward_local = nearest_aabb_face_normal(closest.segment, extents);
+                float face_clearance = dot(extents - abs(closest.segment), abs(outward_local));
+                penetration = capsule_radius + face_clearance;
+                closest.box = closest.segment + outward_local * face_clearance;
+                capsule_surface_local = closest.segment + outward_local * capsule_radius;
+            }
+            float3 outward = rotate_by_quat(outward_local, box_quat);
+            normal = type_a == 1 ? outward : -outward;
+            float3 box_surface = box_pos + rotate_by_quat(closest.box, box_quat);
+            float3 capsule_surface = box_pos + rotate_by_quat(capsule_surface_local, box_quat);
+            contact_point = (box_surface + capsule_surface) * 0.5f;
+            has_contact = true;
+        }
+    }
+    // Oriented box-box (type 2-2), using all 15 separating axes. The current
+    // contact representation stores one support-point contact rather than a
+    // clipped face manifold.
+    else if (type_a == 2 && type_b == 2) {
+        float3 extents_a = float3(geom_a.pos_size0.w, geom_a.params.x, geom_a.params.y);
+        float3 extents_b = float3(geom_b.pos_size0.w, geom_b.params.x, geom_b.params.y);
+        float3 axes_a[3] = {
+            rotate_by_quat(float3(1, 0, 0), quat_a),
+            rotate_by_quat(float3(0, 1, 0), quat_a),
+            rotate_by_quat(float3(0, 0, 1), quat_a)
+        };
+        float3 axes_b[3] = {
+            rotate_by_quat(float3(1, 0, 0), quat_b),
+            rotate_by_quat(float3(0, 1, 0), quat_b),
+            rotate_by_quat(float3(0, 0, 1), quat_b)
+        };
+        float3 center_delta = pos_b - pos_a;
+        float minimum_overlap = INFINITY;
+        float3 minimum_normal = float3(1, 0, 0);
+        bool separated = false;
+
+        for (uint i = 0; i < 3 && !separated; ++i) {
+            float3 axis = axes_a[i];
+            float radius_a = extents_a[i];
+            float radius_b = 0.0f;
+            for (uint j = 0; j < 3; ++j) {
+                radius_b += extents_b[j] * abs(dot(axis, axes_b[j]));
+            }
+            float signed_distance = dot(center_delta, axis);
+            float overlap = radius_a + radius_b - abs(signed_distance);
+            if (overlap <= 0.0f) {
+                separated = true;
+            } else if (overlap < minimum_overlap) {
+                minimum_overlap = overlap;
+                minimum_normal = signed_distance >= 0.0f ? -axis : axis;
+            }
+        }
+        for (uint i = 0; i < 3 && !separated; ++i) {
+            float3 axis = axes_b[i];
+            float radius_a = 0.0f;
+            for (uint j = 0; j < 3; ++j) {
+                radius_a += extents_a[j] * abs(dot(axis, axes_a[j]));
+            }
+            float radius_b = extents_b[i];
+            float signed_distance = dot(center_delta, axis);
+            float overlap = radius_a + radius_b - abs(signed_distance);
+            if (overlap <= 0.0f) {
+                separated = true;
+            } else if (overlap < minimum_overlap) {
+                minimum_overlap = overlap;
+                minimum_normal = signed_distance >= 0.0f ? -axis : axis;
+            }
+        }
+        for (uint i = 0; i < 3 && !separated; ++i) {
+            for (uint j = 0; j < 3 && !separated; ++j) {
+                float3 raw_axis = cross(axes_a[i], axes_b[j]);
+                float axis_length = length(raw_axis);
+                if (axis_length <= 1e-6f) continue;
+                float3 axis = raw_axis / axis_length;
+                float radius_a = 0.0f;
+                float radius_b = 0.0f;
+                for (uint k = 0; k < 3; ++k) {
+                    radius_a += extents_a[k] * abs(dot(axis, axes_a[k]));
+                    radius_b += extents_b[k] * abs(dot(axis, axes_b[k]));
+                }
+                float signed_distance = dot(center_delta, axis);
+                float overlap = radius_a + radius_b - abs(signed_distance);
+                if (overlap <= 0.0f) {
+                    separated = true;
+                } else if (overlap < minimum_overlap) {
+                    minimum_overlap = overlap;
+                    minimum_normal = signed_distance >= 0.0f ? -axis : axis;
+                }
+            }
+        }
+
+        if (!separated) {
+            normal = minimum_normal;
+            penetration = minimum_overlap;
+            float3 support_a = pos_a;
+            float3 support_b = pos_b;
+            for (uint i = 0; i < 3; ++i) {
+                float sign_a = dot(-normal, axes_a[i]) >= 0.0f ? 1.0f : -1.0f;
+                float sign_b = dot(normal, axes_b[i]) >= 0.0f ? 1.0f : -1.0f;
+                support_a += axes_a[i] * extents_a[i] * sign_a;
+                support_b += axes_b[i] * extents_b[i] * sign_b;
+            }
+            contact_point = (support_a + support_b) * 0.5f;
+            has_contact = true;
+        }
+    }
+    // Oriented box-plane (type 2-3). Project the box half extents onto the
+    // plane normal, then use the deepest support point as the contact anchor.
+    else if ((type_a == 2 && type_b == 3) || (type_a == 3 && type_b == 2)) {
+        GeomData box = type_a == 2 ? geom_a : geom_b;
+        float3 box_pos = type_a == 2 ? pos_a : pos_b;
+        float4 box_quat = type_a == 2 ? quat_a : quat_b;
+        float3 plane_pos = type_a == 3 ? pos_a : pos_b;
+        float4 plane_quat = type_a == 3 ? quat_a : quat_b;
+        float3 plane_normal = rotate_by_quat(float3(0, 0, 1), plane_quat);
+        float3 normal_local = rotate_by_quat(plane_normal, quat_conjugate(box_quat));
+        float3 half_extents = float3(box.pos_size0.w, box.params.x, box.params.y);
+        float projected_extent = dot(abs(normal_local), half_extents);
+        float signed_center_distance = dot(box_pos - plane_pos, plane_normal);
+
+        if (signed_center_distance < projected_extent) {
+            penetration = projected_extent - signed_center_distance;
+            contact_point = box_pos - plane_normal * projected_extent;
+            normal = type_a == 2 ? plane_normal : -plane_normal;
+            has_contact = true;
+        }
+    }
+    // Oriented finite cylinder-plane (type 4-3). The support radius along the
+    // plane normal is r*|n_xy| + h*|n_z| in cylinder-local coordinates.
+    else if ((type_a == 4 && type_b == 3) || (type_a == 3 && type_b == 4)) {
+        GeomData cylinder = type_a == 4 ? geom_a : geom_b;
+        float3 cylinder_pos = type_a == 4 ? pos_a : pos_b;
+        float4 cylinder_quat = type_a == 4 ? quat_a : quat_b;
+        float3 plane_pos = type_a == 3 ? pos_a : pos_b;
+        float4 plane_quat = type_a == 3 ? quat_a : quat_b;
+        float3 plane_normal = rotate_by_quat(float3(0, 0, 1), plane_quat);
+        float3 normal_local = rotate_by_quat(
+            plane_normal, quat_conjugate(cylinder_quat)
+        );
+        float cylinder_radius = cylinder.pos_size0.w;
+        float cylinder_half_height = cylinder.params.x;
+        float radial_normal_length = length(normal_local.xy);
+        float projected_extent = cylinder_radius * radial_normal_length
+            + cylinder_half_height * abs(normal_local.z);
+        float signed_center_distance = dot(cylinder_pos - plane_pos, plane_normal);
+
+        if (signed_center_distance < projected_extent) {
+            float2 radial_support = radial_normal_length > 1e-6f
+                ? -normal_local.xy * (cylinder_radius / radial_normal_length)
+                : float2(0);
+            float z_support = normal_local.z >= 0.0f
+                ? -cylinder_half_height
+                : cylinder_half_height;
+            float3 support_local = float3(radial_support, z_support);
+            penetration = projected_extent - signed_center_distance;
+            contact_point = cylinder_pos + rotate_by_quat(support_local, cylinder_quat);
+            normal = type_a == 4 ? plane_normal : -plane_normal;
             has_contact = true;
         }
     }
@@ -967,6 +1592,8 @@ kernel void solve_joints(
     device const float4* inv_mass_inertia [[buffer(5)]],
     constant SimParams& params [[buffer(6)]],
     device const BodyData* body_data [[buffer(7)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
     // Graph coloring dispatch: each color group is dispatched separately
@@ -983,10 +1610,10 @@ kernel void solve_joints(
     uint count = params.num_constraints;
     if (count == 0) return;
 
-    uint env_id = gid / count;
+    uint dispatch_env_id = gid / count;
     uint local_idx = gid % count;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     // Total constraints per env (needed to compute actual buffer index)
     // We pass this as constraint_offset's high bits or compute from context
@@ -1459,15 +2086,17 @@ kernel void warm_start_constraints(
     device XPBDConstraint* constraints [[buffer(0)]],
     constant SimParams& params [[buffer(1)]],
     constant float& warm_start_factor [[buffer(2)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint constraints_per_env = params.target_color; // Repurposed field
     if (constraints_per_env == 0) return;
 
-    uint env_id = gid / constraints_per_env;
+    uint dispatch_env_id = gid / constraints_per_env;
     uint local_idx = gid % constraints_per_env;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     uint idx = env_id * constraints_per_env + local_idx;
     // state.x = lambda, state.y = lambda_prev
@@ -1478,15 +2107,17 @@ kernel void warm_start_constraints(
 kernel void store_lambda_prev(
     device XPBDConstraint* constraints [[buffer(0)]],
     constant SimParams& params [[buffer(1)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint constraints_per_env = params.target_color; // Repurposed field
     if (constraints_per_env == 0) return;
 
-    uint env_id = gid / constraints_per_env;
+    uint dispatch_env_id = gid / constraints_per_env;
     uint local_idx = gid % constraints_per_env;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     uint idx = env_id * constraints_per_env + local_idx;
     // Copy current lambda to lambda_prev for next frame's warm starting
@@ -1507,12 +2138,14 @@ kernel void cache_contacts(
     device const uint* contact_counts [[buffer(2)]],
     device uint* prev_contact_counts [[buffer(3)]],
     constant SimParams& params [[buffer(4)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.max_contacts;
+    uint dispatch_env_id = gid / params.max_contacts;
     uint contact_id = gid % params.max_contacts;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     uint count = min(contact_counts[env_id], params.max_contacts);
 
@@ -1536,12 +2169,14 @@ kernel void match_cached_contacts(
     device const uint* contact_counts [[buffer(2)]],
     device const uint* prev_contact_counts [[buffer(3)]],
     constant SimParams& params [[buffer(4)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.max_contacts;
+    uint dispatch_env_id = gid / params.max_contacts;
     uint contact_id = gid % params.max_contacts;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     uint count = min(contact_counts[env_id], params.max_contacts);
     if (contact_id >= count) return;
@@ -1606,14 +2241,15 @@ kernel void update_joint_states(
     device float* joint_positions [[buffer(5)]],
     device float* joint_velocities [[buffer(6)]],
     constant SimParams& params [[buffer(7)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.num_joints;
+    uint dispatch_env_id = gid / params.num_joints;
     uint joint_id = gid % params.num_joints;
-    
-    if (env_id >= params.num_envs) return;
-    
-    uint joint_idx = gid;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+    uint joint_idx = env_id * params.num_joints + joint_id;
     JointData joint = joints[joint_id];
     uint type = uint(joint.params.x);
     
@@ -1700,12 +2336,14 @@ kernel void solve_contacts(
     device const uint* contact_counts [[buffer(5)]],
     device const float4* inv_mass_inertia [[buffer(6)]],
     constant SimParams& params [[buffer(7)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.max_contacts;
+    uint dispatch_env_id = gid / params.max_contacts;
     uint contact_id = gid % params.max_contacts;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     uint count = min(contact_counts[env_id], params.max_contacts);
     if (contact_id >= count) return;
@@ -1733,114 +2371,167 @@ kernel void solve_contacts(
 
     float3 normal = c.normal_friction.xyz;
     float penetration = c.position_pen.w;
-    float friction = c.normal_friction.w;
-    float3 contact_point = c.position_pen.xyz;
 
-    // Get current state
-    float3 pos_a = positions[idx_a].xyz;
-    float3 pos_b = positions[idx_b].xyz;
-
-    // Compute contact point relative to body centers
-    float3 r_a = contact_point - pos_a;
-    float3 r_b = contact_point - pos_b;
-
-    // Get angular velocities
-    float3 omega_a = angular_velocities[idx_a].xyz;
-    float3 omega_b = angular_velocities[idx_b].xyz;
-
-    // Compute full contact velocity including rotation: v = v_cm + ω × r
-    float3 vel_a = velocities[idx_a].xyz + cross(omega_a, r_a);
-    float3 vel_b = velocities[idx_b].xyz + cross(omega_b, r_b);
-    float3 rel_vel = vel_a - vel_b;
-
-    // Normal and tangential components
-    float vel_normal = dot(rel_vel, normal);
-    float3 vel_tangent = rel_vel - vel_normal * normal;
-    float tangent_speed = length(vel_tangent);
-
-    // Compute generalized inverse mass for normal direction
-    float3 rn_a = cross(r_a, normal);
-    float3 rn_b = cross(r_b, normal);
-    float w_n_a = inv_mass_a + dot(rn_a * inv_mi_a.yzw, rn_a);
-    float w_n_b = inv_mass_b + dot(rn_b * inv_mi_b.yzw, rn_b);
-    float w_normal = w_n_a + w_n_b;
-
-    if (w_normal < 1e-8) return;
-
-    // Baumgarte stabilization
-    float bias = params.baumgarte * max(penetration - params.slop, 0.0f) / params.dt;
-
-    // Restitution (only applied for separating velocity)
-    float restitution = c.impulses.w;
-    float vel_restitution = vel_normal < -0.5 ? restitution * vel_normal : 0.0;
-
-    // Normal impulse magnitude
-    float j_n = (-(vel_normal + vel_restitution) + bias) / w_normal;
-    j_n = max(j_n, 0.0f); // Only push apart (unilateral constraint)
-
-    // Apply normal impulse
-    float3 impulse_n = j_n * normal;
-
-    // Position correction: only fix penetration beyond slop, scaled by baumgarte
-    float pos_correction = params.baumgarte * max(penetration - params.slop, 0.0f);
+    // Narrow phase computes penetration once per substep. Position correction
+    // is dispatched once; repeating this stale correction per solver iteration
+    // injects artificial velocity when the XPBD velocity update runs.
+    float pos_correction = params.baumgarte
+        * max(penetration - params.slop, 0.0f);
 
     // Atomic adds: several contacts in one env can share a body, and each
     // contact runs on its own thread — plain += loses impulses.
     if (inv_mass_a > 1e-8) {
-        atomic_add_float3(&velocities[idx_a], impulse_n * inv_mass_a);
-        atomic_add_float3(&angular_velocities[idx_a], cross(r_a, impulse_n) * inv_mi_a.yzw);
-
         float mass_ratio_a = inv_mass_a / inv_mass_sum;
         atomic_add_float3(&positions[idx_a], pos_correction * mass_ratio_a * normal);
     }
 
     if (inv_mass_b > 1e-8) {
-        atomic_add_float3(&velocities[idx_b], -(impulse_n * inv_mass_b));
-        atomic_add_float3(&angular_velocities[idx_b], -(cross(r_b, impulse_n) * inv_mi_b.yzw));
-
         float mass_ratio_b = inv_mass_b / inv_mass_sum;
         atomic_add_float3(&positions[idx_b], -(pos_correction * mass_ratio_b * normal));
     }
+}
 
-    // Friction (Coulomb friction cone)
-    // Use accumulated normal impulse for friction cone, not just this iteration's delta
-    float j_n_accumulated = contacts[contact_idx].impulses.x + j_n;
+// Apply cached impulses only after XPBD has reconstructed velocities from the
+// corrected poses; doing it before that update discards the warm start.
+kernel void warm_start_contacts(
+    device float4* positions [[buffer(0)]],
+    device float4* velocities [[buffer(1)]],
+    device float4* quaternions [[buffer(2)]],
+    device float4* angular_velocities [[buffer(3)]],
+    device Contact* contacts [[buffer(4)]],
+    device const uint* contact_counts [[buffer(5)]],
+    device const float4* inv_mass_inertia [[buffer(6)]],
+    constant SimParams& params [[buffer(7)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint dispatch_env_id = gid / params.max_contacts;
+    uint contact_id = gid % params.max_contacts;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+    if (contact_id >= min(contact_counts[env_id], params.max_contacts)) return;
+    uint contact_idx = env_id * params.max_contacts + contact_id;
+    Contact c = contacts[contact_idx];
+    if (c.position_pen.w < 0) return;
 
-    if (tangent_speed > 1e-6 && j_n_accumulated > 1e-6) {
-        float3 tangent = vel_tangent / tangent_speed;
-
-        // Compute generalized inverse mass for tangent direction
-        float3 rt_a = cross(r_a, tangent);
-        float3 rt_b = cross(r_b, tangent);
-        float w_t_a = inv_mass_a + dot(rt_a * inv_mi_a.yzw, rt_a);
-        float w_t_b = inv_mass_b + dot(rt_b * inv_mi_b.yzw, rt_b);
-        float w_tangent = w_t_a + w_t_b;
-
-        if (w_tangent > 1e-8) {
-            // Desired friction impulse to stop tangential motion
-            float j_t_desired = tangent_speed / w_tangent;
-
-            // Friction cone limit: |j_t| ≤ μ * j_n_accumulated
-            float j_t_max = friction * j_n_accumulated;
-            float j_t = min(j_t_desired, j_t_max);
-
-            // Apply friction impulse
-            float3 impulse_t = j_t * tangent;
-
-            if (inv_mass_a > 1e-8) {
-                atomic_add_float3(&velocities[idx_a], -(impulse_t * inv_mass_a));
-                atomic_add_float3(&angular_velocities[idx_a], -(cross(r_a, impulse_t) * inv_mi_a.yzw));
-            }
-            if (inv_mass_b > 1e-8) {
-                atomic_add_float3(&velocities[idx_b], impulse_t * inv_mass_b);
-                atomic_add_float3(&angular_velocities[idx_b], cross(r_b, impulse_t) * inv_mi_b.yzw);
-            }
-        }
+    uint idx_a = env_id * params.num_bodies + c.indices.x;
+    uint idx_b = env_id * params.num_bodies + c.indices.y;
+    float4 inv_mi_a = inv_mass_inertia[idx_a];
+    float4 inv_mi_b = inv_mass_inertia[idx_b];
+    float3 normal = c.normal_friction.xyz;
+    float3 tangent_a = contact_tangent(normal);
+    float3 tangent_b = cross(normal, tangent_a);
+    float3 impulse = normal * c.impulses.x
+        + tangent_a * c.impulses.y
+        + tangent_b * c.impulses.z;
+    float3 r_a = c.position_pen.xyz - positions[idx_a].xyz;
+    float3 r_b = c.position_pen.xyz - positions[idx_b].xyz;
+    if (inv_mi_a.x > 1e-8f) {
+        atomic_add_float3(&velocities[idx_a], impulse * inv_mi_a.x);
+        atomic_add_float3(&angular_velocities[idx_a], cross(r_a, impulse) * inv_mi_a.yzw);
     }
+    if (inv_mi_b.x > 1e-8f) {
+        atomic_add_float3(&velocities[idx_b], -impulse * inv_mi_b.x);
+        atomic_add_float3(&angular_velocities[idx_b], -cross(r_b, impulse) * inv_mi_b.yzw);
+    }
+}
 
-    // Store accumulated normal impulse for warm starting (the running sum
-    // across iterations, not just this iteration's delta).
-    contacts[contact_idx].impulses.x = j_n_accumulated;
+// Projected Gauss-Seidel velocity solve with accumulated normal and two-axis
+// Coulomb impulses. Position correction is deliberately separate so this work
+// survives XPBD velocity reconstruction.
+kernel void solve_contact_velocities(
+    device float4* positions [[buffer(0)]],
+    device float4* velocities [[buffer(1)]],
+    device float4* quaternions [[buffer(2)]],
+    device float4* angular_velocities [[buffer(3)]],
+    device Contact* contacts [[buffer(4)]],
+    device const uint* contact_counts [[buffer(5)]],
+    device const float4* inv_mass_inertia [[buffer(6)]],
+    constant SimParams& params [[buffer(7)]],
+    constant uint& iteration [[buffer(8)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint dispatch_env_id = gid / params.max_contacts;
+    uint contact_id = gid % params.max_contacts;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+    if (contact_id >= min(contact_counts[env_id], params.max_contacts)) return;
+    uint contact_idx = env_id * params.max_contacts + contact_id;
+    Contact c = contacts[contact_idx];
+    if (c.position_pen.w < 0) return;
+
+    uint idx_a = env_id * params.num_bodies + c.indices.x;
+    uint idx_b = env_id * params.num_bodies + c.indices.y;
+    float4 inv_mi_a = inv_mass_inertia[idx_a];
+    float4 inv_mi_b = inv_mass_inertia[idx_b];
+    if (inv_mi_a.x + inv_mi_b.x < 1e-8f) return;
+    float3 r_a = c.position_pen.xyz - positions[idx_a].xyz;
+    float3 r_b = c.position_pen.xyz - positions[idx_b].xyz;
+    float3 vel_a = velocities[idx_a].xyz + cross(angular_velocities[idx_a].xyz, r_a);
+    float3 vel_b = velocities[idx_b].xyz + cross(angular_velocities[idx_b].xyz, r_b);
+    float3 relative_velocity = vel_a - vel_b;
+    float3 normal = c.normal_friction.xyz;
+    float normal_velocity = dot(relative_velocity, normal);
+    float3 rn_a = cross(r_a, normal);
+    float3 rn_b = cross(r_b, normal);
+    float normal_mass = inv_mi_a.x + dot(rn_a * inv_mi_a.yzw, rn_a)
+        + inv_mi_b.x + dot(rn_b * inv_mi_b.yzw, rn_b);
+    if (normal_mass < 1e-8f) return;
+
+    float target_normal_velocity;
+    if (iteration == 0) {
+        target_normal_velocity = normal_velocity < -0.5f
+            ? -c.impulses.w * normal_velocity
+            : 0.0f;
+        contacts[contact_idx].impulses.w = target_normal_velocity;
+    } else {
+        target_normal_velocity = c.impulses.w;
+    }
+    float old_normal_impulse = c.impulses.x;
+    float new_normal_impulse = max(
+        old_normal_impulse + (target_normal_velocity - normal_velocity) / normal_mass,
+        0.0f
+    );
+    float3 normal_impulse = normal * (new_normal_impulse - old_normal_impulse);
+
+    float3 tangent_a = contact_tangent(normal);
+    float3 tangent_b = cross(normal, tangent_a);
+    float tangent_velocity_a = dot(relative_velocity, tangent_a);
+    float tangent_velocity_b = dot(relative_velocity, tangent_b);
+    float3 rt1_a = cross(r_a, tangent_a);
+    float3 rt1_b = cross(r_b, tangent_a);
+    float3 rt2_a = cross(r_a, tangent_b);
+    float3 rt2_b = cross(r_b, tangent_b);
+    float tangent_mass_a = inv_mi_a.x + dot(rt1_a * inv_mi_a.yzw, rt1_a)
+        + inv_mi_b.x + dot(rt1_b * inv_mi_b.yzw, rt1_b);
+    float tangent_mass_b = inv_mi_a.x + dot(rt2_a * inv_mi_a.yzw, rt2_a)
+        + inv_mi_b.x + dot(rt2_b * inv_mi_b.yzw, rt2_b);
+    float2 old_tangent_impulse = c.impulses.yz;
+    float2 new_tangent_impulse = old_tangent_impulse;
+    if (tangent_mass_a > 1e-8f) new_tangent_impulse.x -= tangent_velocity_a / tangent_mass_a;
+    if (tangent_mass_b > 1e-8f) new_tangent_impulse.y -= tangent_velocity_b / tangent_mass_b;
+    float friction_limit = c.normal_friction.w * new_normal_impulse;
+    float tangent_magnitude = length(new_tangent_impulse);
+    if (tangent_magnitude > friction_limit && tangent_magnitude > 1e-8f) {
+        new_tangent_impulse *= friction_limit / tangent_magnitude;
+    }
+    float2 tangent_delta = new_tangent_impulse - old_tangent_impulse;
+    float3 impulse = normal_impulse
+        + tangent_a * tangent_delta.x
+        + tangent_b * tangent_delta.y;
+    if (inv_mi_a.x > 1e-8f) {
+        atomic_add_float3(&velocities[idx_a], impulse * inv_mi_a.x);
+        atomic_add_float3(&angular_velocities[idx_a], cross(r_a, impulse) * inv_mi_a.yzw);
+    }
+    if (inv_mi_b.x > 1e-8f) {
+        atomic_add_float3(&velocities[idx_b], -impulse * inv_mi_b.x);
+        atomic_add_float3(&angular_velocities[idx_b], -cross(r_b, impulse) * inv_mi_b.yzw);
+    }
+    contacts[contact_idx].impulses.x = new_normal_impulse;
+    contacts[contact_idx].impulses.yz = new_tangent_impulse;
 }
 
 // ============================================================================
@@ -1857,15 +2548,17 @@ kernel void read_sensors(
     device const SensorData* sensors [[buffer(6)]],
     device float* observations [[buffer(7)]],
     constant SimParams& params [[buffer(8)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
     uint num_sensors = params.num_sensors;
     if (num_sensors == 0) return;
 
-    uint env_id = gid / num_sensors;
+    uint dispatch_env_id = gid / num_sensors;
     uint sensor_id = gid % num_sensors;
-
-    if (env_id >= params.num_envs) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
 
     SensorData sensor = sensors[sensor_id];
     uint sensor_type = sensor.type_object.x;
@@ -1946,6 +2639,8 @@ kernel void read_sensors(
 // XPBD Save Previous State
 // ============================================================================
 // Save positions and quaternions before integration for XPBD velocity update.
+// On the first substep, also snapshot the full-step starting velocity without
+// adding another body-wide dispatch.
 
 kernel void save_prev_state(
     device const float4* positions [[buffer(0)]],
@@ -1953,13 +2648,24 @@ kernel void save_prev_state(
     device float4* prev_positions [[buffer(2)]],
     device float4* prev_quaternions [[buffer(3)]],
     constant SimParams& params [[buffer(4)]],
+    device const float4* velocities [[buffer(5)]],
+    device float4* step_start_velocities [[buffer(6)]],
+    constant uint& snapshot_full_step [[buffer(7)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.num_bodies;
-    if (env_id >= params.num_envs) return;
+    uint dispatch_env_id = gid / params.num_bodies;
+    uint body_id = gid % params.num_bodies;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+    gid = env_id * params.num_bodies + body_id;
 
     prev_positions[gid] = positions[gid];
     prev_quaternions[gid] = quaternions[gid];
+    if (snapshot_full_step != 0) {
+        step_start_velocities[gid] = velocities[gid];
+    }
 }
 
 // ============================================================================
@@ -1978,16 +2684,28 @@ kernel void xpbd_update_velocities(
     device const float4* prev_quaternions [[buffer(5)]],
     device const float4* inv_mass_inertia [[buffer(6)]],
     constant SimParams& params [[buffer(7)]],
+    device const float4* step_start_velocities [[buffer(8)]],
+    device float4* accelerations [[buffer(9)]],
+    constant float& inv_full_step [[buffer(10)]],
+    constant uint& derive_acceleration [[buffer(11)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.num_bodies;
-    if (env_id >= params.num_envs) return;
+    uint dispatch_env_id = gid / params.num_bodies;
+    uint body_id = gid % params.num_bodies;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+    gid = env_id * params.num_bodies + body_id;
 
     float4 inv_mi = inv_mass_inertia[gid];
     float inv_mass = inv_mi.x;
 
     // Skip static/kinematic bodies
-    if (inv_mass < 1e-8) return;
+    if (inv_mass < 1e-8) {
+        if (derive_acceleration != 0) accelerations[gid] = float4(0.0f);
+        return;
+    }
 
     float dt = params.dt;
     float inv_dt = 1.0 / dt;
@@ -1996,6 +2714,13 @@ kernel void xpbd_update_velocities(
     float3 pos = positions[gid].xyz;
     float3 prev_pos = prev_positions[gid].xyz;
     velocities[gid] = float4((pos - prev_pos) * inv_dt, 0);
+
+    if (derive_acceleration != 0) {
+        accelerations[gid] = float4(
+            (velocities[gid].xyz - step_start_velocities[gid].xyz) * inv_full_step,
+            0.0f
+        );
+    }
 
     // Angular velocity from quaternion change
     // dq = q * q_prev^-1
@@ -2010,32 +2735,197 @@ kernel void xpbd_update_velocities(
     angular_velocities[gid] = float4(2.0 * dq.xyz * inv_dt, 0);
 }
 
+// Derive the public full-step acceleration only after all contact impulses have
+// updated velocity. Running this inside xpbd_update_velocities omits the
+// post-XPBD normal and friction response.
+kernel void derive_accelerations(
+    device const float4* velocities [[buffer(0)]],
+    device const float4* step_start_velocities [[buffer(1)]],
+    device float4* accelerations [[buffer(2)]],
+    device const float4* inv_mass_inertia [[buffer(3)]],
+    constant SimParams& params [[buffer(4)]],
+    constant float& inv_full_step [[buffer(5)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint dispatch_env_id = gid / params.num_bodies;
+    uint body_id = gid % params.num_bodies;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+    uint body_index = env_id * params.num_bodies + body_id;
+    if (inv_mass_inertia[body_index].x < 1e-8f) {
+        accelerations[body_index] = float4(0.0f);
+        return;
+    }
+    accelerations[body_index] = float4(
+        (velocities[body_index].xyz - step_start_velocities[body_index].xyz)
+            * inv_full_step,
+        0.0f
+    );
+}
+
+// ============================================================================
+// GPU Task Evaluation
+// ============================================================================
+
+kernel void compute_task_outputs(
+    device const float4* positions [[buffer(0)]],
+    device const float4* velocities [[buffer(1)]],
+    device const float* actions [[buffer(2)]],
+    device float* rewards [[buffer(3)]],
+    device uchar* dones [[buffer(4)]],
+    device uint* episode_steps [[buffer(5)]],
+    constant TaskParams& task [[buffer(6)]],
+    constant SimParams& params [[buffer(7)]],
+    constant EnvDispatchParams& dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
+    uint dispatch_env_id [[thread_position_in_grid]]
+) {
+    if (dispatch_env_id >= dispatch.dispatch_envs || task.enabled == 0) return;
+
+    uint env_id = physical_env_id(dispatch_env_id, dispatch, active_env_ids);
+    uint root_index = env_id * params.num_bodies + task.root_body;
+    float3 root_position = positions[root_index].xyz;
+    float3 root_velocity = velocities[root_index].xyz;
+    bool valid = all(isfinite(root_position)) && all(isfinite(root_velocity));
+
+    float control_cost = 0.0f;
+    uint action_start = env_id * params.num_actuators;
+    for (uint actuator = 0; actuator < params.num_actuators; ++actuator) {
+        float action = actions[action_start + actuator];
+        if (!isfinite(action)) {
+            valid = false;
+        } else {
+            control_cost += action * action;
+        }
+    }
+
+    bool healthy = valid &&
+        root_position.z >= task.healthy_z_min &&
+        root_position.z <= task.healthy_z_max;
+    float reward = task.forward_reward_weight * root_velocity[task.forward_axis]
+        - task.control_cost_weight * control_cost
+        + (healthy ? task.healthy_bonus : 0.0f);
+    rewards[env_id] = valid && isfinite(reward) ? reward : 0.0f;
+
+    uint next_step = episode_steps[env_id];
+    if (next_step != 0xffffffffu) next_step += 1;
+    episode_steps[env_id] = next_step;
+    bool horizon_reached = task.max_episode_steps != 0 &&
+        next_step >= task.max_episode_steps;
+    dones[env_id] = uchar(horizon_reached ||
+        (task.terminate_when_unhealthy != 0 && !healthy));
+}
+
 // ============================================================================
 // Environment Reset Kernel
 // ============================================================================
 
-kernel void reset_env(
+kernel void reset_bodies(
     device float4* positions [[buffer(0)]],
     device float4* velocities [[buffer(1)]],
-    device float4* quaternions [[buffer(2)]],
+    device float4* accelerations [[buffer(2)]],
     device float4* angular_velocities [[buffer(3)]],
-    device const float4* initial_positions [[buffer(4)]],
-    device const float4* initial_quaternions [[buffer(5)]],
-    device const uint* reset_mask [[buffer(6)]],
-    constant SimParams& params [[buffer(7)]],
+    device float4* quaternions [[buffer(4)]],
+    device float4* forces [[buffer(5)]],
+    device float4* torques [[buffer(6)]],
+    device float4* prev_positions [[buffer(7)]],
+    device float4* prev_quaternions [[buffer(8)]],
+    device float4* prev_velocities [[buffer(9)]],
+    device const float4* initial_positions [[buffer(10)]],
+    device const float4* initial_velocities [[buffer(11)]],
+    device const float4* initial_quaternions [[buffer(12)]],
+    device const float4* initial_angular_velocities [[buffer(13)]],
+    constant SimParams& params [[buffer(14)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    uint env_id = gid / params.num_bodies;
+    uint dispatch_env_id = gid / params.num_bodies;
     uint body_id = gid % params.num_bodies;
-
-    if (env_id >= params.num_envs) return;
-
-    // Check if this env should be reset
-    if (reset_mask[env_id] == 0) return;
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+    uint body_index = env_id * params.num_bodies + body_id;
 
     // Copy initial state
-    positions[gid] = initial_positions[body_id];
-    velocities[gid] = float4(0);
-    quaternions[gid] = initial_quaternions[body_id];
-    angular_velocities[gid] = float4(0);
+    positions[body_index] = initial_positions[body_id];
+    velocities[body_index] = initial_velocities[body_id];
+    accelerations[body_index] = float4(0);
+    angular_velocities[body_index] = initial_angular_velocities[body_id];
+    quaternions[body_index] = initial_quaternions[body_id];
+    forces[body_index] = float4(0);
+    torques[body_index] = float4(0);
+    prev_positions[body_index] = initial_positions[body_id];
+    prev_quaternions[body_index] = initial_quaternions[body_id];
+    prev_velocities[body_index] = initial_velocities[body_id];
+}
+
+kernel void reset_env_aux(
+    device float* joint_positions [[buffer(0)]],
+    device float* joint_velocities [[buffer(1)]],
+    device float* joint_torques [[buffer(2)]],
+    device float* actions [[buffer(3)]],
+    device float* observations [[buffer(4)]],
+    device float* rewards [[buffer(5)]],
+    device uchar* dones [[buffer(6)]],
+    device Contact* contacts [[buffer(7)]],
+    device uint* contact_counts [[buffer(8)]],
+    device Contact* prev_contacts [[buffer(9)]],
+    device uint* prev_contact_counts [[buffer(10)]],
+    device XPBDConstraint* constraints [[buffer(11)]],
+    device uint* episode_steps [[buffer(12)]],
+    device const float* initial_joint_positions [[buffer(13)]],
+    device const float* initial_joint_velocities [[buffer(14)]],
+    constant SimParams& params [[buffer(15)]],
+    constant EnvDispatchParams& env_dispatch [[buffer(29)]],
+    device const uint* active_env_ids [[buffer(30)]],
+    uint dispatch_env_id [[thread_position_in_grid]]
+) {
+    if (dispatch_env_id >= env_dispatch.dispatch_envs) return;
+    uint env_id = physical_env_id(dispatch_env_id, env_dispatch, active_env_ids);
+
+    uint joint_start = env_id * params.num_joints;
+    for (uint joint = 0; joint < params.num_joints; ++joint) {
+        joint_positions[joint_start + joint] = initial_joint_positions[joint];
+        joint_velocities[joint_start + joint] = initial_joint_velocities[joint];
+        joint_torques[joint_start + joint] = 0.0f;
+    }
+    // constraint_offset is a private reset-dispatch flag here. Fused autoreset
+    // runs after the host has copied the next action batch, so preserve it.
+    if (params.constraint_offset == 0) {
+        uint action_start = env_id * params.num_actuators;
+        for (uint actuator = 0; actuator < params.num_actuators; ++actuator) {
+            actions[action_start + actuator] = 0.0f;
+        }
+    }
+    uint obs_start = env_id * params.obs_dim;
+    for (uint obs = 0; obs < params.obs_dim; ++obs) {
+        observations[obs_start + obs] = 0.0f;
+    }
+
+    uint contact_start = env_id * params.max_contacts;
+    for (uint contact_id = 0; contact_id < params.max_contacts; ++contact_id) {
+        uint index = contact_start + contact_id;
+        contacts[index].position_pen = float4(0, 0, 0, -1);
+        contacts[index].normal_friction = float4(0);
+        contacts[index].indices = uint4(0);
+        contacts[index].impulses = float4(0);
+        prev_contacts[index].position_pen = float4(0, 0, 0, -1);
+        prev_contacts[index].normal_friction = float4(0);
+        prev_contacts[index].indices = uint4(0);
+        prev_contacts[index].impulses = float4(0);
+    }
+
+    uint constraints_per_env = params.target_color;
+    uint constraint_start = env_id * constraints_per_env;
+    for (uint constraint_id = 0; constraint_id < constraints_per_env; ++constraint_id) {
+        constraints[constraint_start + constraint_id].state = float4(0);
+    }
+
+    rewards[env_id] = 0.0f;
+    dones[env_id] = 0;
+    episode_steps[env_id] = 0;
+    contact_counts[env_id] = 0;
+    prev_contact_counts[env_id] = 0;
 }

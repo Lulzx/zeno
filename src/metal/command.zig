@@ -104,7 +104,8 @@ pub const CommandBuffer = struct {
         if (error_obj == null) return null;
 
         const desc = objc.msgSend(error_obj, objc.sel("localizedDescription"), .{});
-        return objc.getNSStringContents(desc);
+        const contents = objc.getNSStringContents(desc) orelse return null;
+        return std.mem.span(contents);
     }
 
     /// Check if execution completed successfully.

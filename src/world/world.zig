@@ -10,7 +10,6 @@ const PipelineManager = @import("../metal/pipeline.zig").PipelineManager;
 const CommandBuffer = @import("../metal/command.zig").CommandBuffer;
 const ComputeEncoder = @import("../metal/command.zig").ComputeEncoder;
 const State = @import("../physics/state.zig").State;
-const InitialState = @import("../physics/state.zig").InitialState;
 const Scene = @import("scene.zig").Scene;
 const constants = @import("../physics/constants.zig");
 const body_mod = @import("../physics/body.zig");
@@ -73,6 +72,31 @@ pub const SpatialHashParamsGPU = extern struct {
     origin_z: f32 = 0,
 };
 
+/// Maps compact dispatch slots to stable physical environment indices.
+pub const EnvDispatchParams = extern struct {
+    num_envs: u32 align(16),
+    dispatch_envs: u32,
+    use_active_env_ids: u32,
+    _pad: u32 = 0,
+};
+
+/// Optional, bounded locomotion task evaluated on the GPU after each world
+/// step. This is a reusable primitive, not a claim of MuJoCo task equivalence.
+pub const TaskParams = extern struct {
+    enabled: u32 align(16) = 0,
+    root_body: u32 = 0,
+    forward_axis: u32 = 0,
+    max_episode_steps: u32 = 0,
+    forward_reward_weight: f32 = 0,
+    control_cost_weight: f32 = 0,
+    healthy_bonus: f32 = 0,
+    healthy_z_min: f32 = -std.math.inf(f32),
+    healthy_z_max: f32 = std.math.inf(f32),
+    terminate_when_unhealthy: u32 = 0,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
 /// Profiling data for the most recent step call.
 pub const ProfilingData = struct {
     integrate_ns: f32 = 0,
@@ -106,6 +130,15 @@ const ProfilingDataRaw = struct {
     }
 };
 
+const PendingStep = struct {
+    command: CommandBuffer,
+    active_env_count: ?u32,
+    dispatch_envs: u32,
+    profile_enabled: bool,
+    submit_elapsed_ns: u64,
+    profile: ProfilingDataRaw,
+};
+
 /// Main simulation world.
 pub const World = struct {
     // Metal resources
@@ -114,7 +147,6 @@ pub const World = struct {
 
     // Simulation state
     state: State,
-    initial_state: ?InitialState,
     scene: Scene,
 
     // Configuration
@@ -150,26 +182,30 @@ pub const World = struct {
     // Warm start factor buffer (single float passed to GPU)
     warm_start_factor_buffer: Buffer,
 
+    // Compact environment dispatch. Full steps use identity indexing without
+    // reading active_env_ids; subset steps populate only active physical IDs.
+    active_env_ids_buffer: Buffer,
+    env_dispatch_params_buffer: Buffer,
+
+    // Optional GPU-side task evaluation and per-environment episode clocks.
+    task_params: TaskParams,
+    task_params_buffer: Buffer,
+    episode_steps_buffer: Buffer,
+
+    // GPU-resident reset templates (one environment, broadcast on reset).
+    initial_positions_buffer: Buffer,
+    initial_quaternions_buffer: Buffer,
+    initial_velocities_buffer: Buffer,
+    initial_angular_velocities_buffer: Buffer,
+    initial_joint_positions_buffer: Buffer,
+    initial_joint_velocities_buffer: Buffer,
+
     // Adaptive substeps state
     adaptive_substeps: u32,
     max_adaptive_substeps: u32,
     violation_threshold: f32,
     profiling: ProfilingDataRaw = .{},
-
-    // Persistent backup buffers for stepSubset (lazily allocated)
-    subset_backup_positions: ?[]align(16) [4]f32 = null,
-    subset_backup_quaternions: ?[]align(16) [4]f32 = null,
-    subset_backup_velocities: ?[]align(16) [4]f32 = null,
-    subset_backup_accelerations: ?[]align(16) [4]f32 = null,
-    subset_backup_angular_velocities: ?[]align(16) [4]f32 = null,
-    subset_backup_joint_positions: ?[]f32 = null,
-    subset_backup_joint_velocities: ?[]f32 = null,
-    subset_backup_joint_torques: ?[]f32 = null,
-    subset_backup_observations: ?[]f32 = null,
-    subset_backup_rewards: ?[]f32 = null,
-    subset_backup_dones: ?[]u8 = null,
-    subset_backup_contact_counts: ?[]u32 = null,
-    subset_backup_contacts: ?[]u8 = null,
+    pending_step: ?PendingStep = null,
 
     // Allocator
     allocator: std.mem.Allocator,
@@ -244,19 +280,25 @@ pub const World = struct {
             "broad_phase_scatter",
             "broad_phase_detect",
             "clear_uint_buffer",
+            "clear_active_uint_slices",
             "sort_contacts",
             "narrow_phase",
             "solve_contacts",
+            "warm_start_contacts",
+            "solve_contact_velocities",
             "solve_joints",
             "update_joint_states",
             "read_sensors",
-            "reset_env",
+            "reset_bodies",
+            "reset_env_aux",
             "warm_start_constraints",
             "store_lambda_prev",
             "cache_contacts",
             "match_cached_contacts",
             "save_prev_state",
             "xpbd_update_velocities",
+            "derive_accelerations",
+            "compute_task_outputs",
         }) catch |err| {
             std.log.err("World initialization failed while preloading pipelines: {}", .{err});
             return err;
@@ -518,6 +560,47 @@ pub const World = struct {
             opts,
         );
 
+        const active_env_ids_buffer = try Buffer.init(
+            device.device,
+            config.num_envs * @sizeOf(u32),
+            opts,
+        );
+        const active_env_ids = active_env_ids_buffer.getSlice(u32);
+        for (active_env_ids, 0..) |*env_id, i| env_id.* = @intCast(i);
+
+        const env_dispatch_params_buffer = try Buffer.init(
+            device.device,
+            @sizeOf(EnvDispatchParams),
+            opts,
+        );
+        env_dispatch_params_buffer.getSlice(EnvDispatchParams)[0] = .{
+            .num_envs = config.num_envs,
+            .dispatch_envs = config.num_envs,
+            .use_active_env_ids = 0,
+        };
+
+        const task_params: TaskParams = .{};
+        const task_params_buffer = try Buffer.init(
+            device.device,
+            @sizeOf(TaskParams),
+            opts,
+        );
+        task_params_buffer.getSlice(TaskParams)[0] = task_params;
+
+        var episode_steps_buffer = try Buffer.init(
+            device.device,
+            config.num_envs * @sizeOf(u32),
+            opts,
+        );
+        try episode_steps_buffer.zero();
+
+        const initial_positions_buffer = try Buffer.init(device.device, @max(num_bodies, 1) * 16, opts);
+        const initial_quaternions_buffer = try Buffer.init(device.device, @max(num_bodies, 1) * 16, opts);
+        const initial_velocities_buffer = try Buffer.init(device.device, @max(num_bodies, 1) * 16, opts);
+        const initial_angular_velocities_buffer = try Buffer.init(device.device, @max(num_bodies, 1) * 16, opts);
+        const initial_joint_positions_buffer = try Buffer.init(device.device, @max(num_joints, 1) * 4, opts);
+        const initial_joint_velocities_buffer = try Buffer.init(device.device, @max(num_joints, 1) * 4, opts);
+
         // Build params
         const params = SimParams{
             .num_envs = config.num_envs,
@@ -567,7 +650,20 @@ pub const World = struct {
             var max_reach: f32 = 0;
             for (scene.geoms.items) |g| {
                 if (g.geom_type == .plane) continue;
-                const reach = g.size[0] + g.size[1];
+                const reach = switch (g.geom_type) {
+                    .sphere => g.size[0],
+                    .capsule => g.size[0] + g.size[1],
+                    .box, .heightfield => @sqrt(
+                        g.size[0] * g.size[0] +
+                            g.size[1] * g.size[1] +
+                            g.size[2] * g.size[2],
+                    ),
+                    .cylinder => @sqrt(
+                        g.size[0] * g.size[0] + g.size[1] * g.size[1],
+                    ),
+                    .mesh => g.size[0],
+                    .plane => unreachable,
+                };
                 max_reach = @max(max_reach, reach);
             }
             const cell_size: f32 = @max(1.0, 2.0 * max_reach + 0.2);
@@ -600,7 +696,6 @@ pub const World = struct {
             .device = device,
             .pipelines = pipelines,
             .state = state,
-            .initial_state = null,
             .scene = scene,
             .config = config,
             .params = params,
@@ -623,6 +718,17 @@ pub const World = struct {
             .prev_contacts_buffer = prev_contacts_buffer,
             .prev_contact_counts_buffer = prev_contact_counts_buffer,
             .warm_start_factor_buffer = warm_start_factor_buffer,
+            .active_env_ids_buffer = active_env_ids_buffer,
+            .env_dispatch_params_buffer = env_dispatch_params_buffer,
+            .task_params = task_params,
+            .task_params_buffer = task_params_buffer,
+            .episode_steps_buffer = episode_steps_buffer,
+            .initial_positions_buffer = initial_positions_buffer,
+            .initial_quaternions_buffer = initial_quaternions_buffer,
+            .initial_velocities_buffer = initial_velocities_buffer,
+            .initial_angular_velocities_buffer = initial_angular_velocities_buffer,
+            .initial_joint_positions_buffer = initial_joint_positions_buffer,
+            .initial_joint_velocities_buffer = initial_joint_velocities_buffer,
             .adaptive_substeps = config.substeps,
             .max_adaptive_substeps = @max(config.substeps * 4, 8),
             .violation_threshold = 0.01,
@@ -635,11 +741,33 @@ pub const World = struct {
         // Initialize state from scene
         try world.initializeState();
 
-        // Capture initial state for reset
-        world.initial_state = InitialState.capture(allocator, &world.state) catch |err| {
-            std.log.err("World initialization failed while capturing initial state: {}", .{err});
-            return err;
-        };
+        // Capture a single-environment template in Metal-visible shared
+        // buffers. Reset kernels broadcast this template without host state
+        // walks, and the template remains stable as environment 0 evolves.
+        @memcpy(
+            world.initial_positions_buffer.getAlignedSlice([4]f32, 16)[0..num_bodies],
+            world.state.getPositions()[0..num_bodies],
+        );
+        @memcpy(
+            world.initial_quaternions_buffer.getAlignedSlice([4]f32, 16)[0..num_bodies],
+            world.state.getQuaternions()[0..num_bodies],
+        );
+        @memcpy(
+            world.initial_velocities_buffer.getAlignedSlice([4]f32, 16)[0..num_bodies],
+            world.state.getVelocities()[0..num_bodies],
+        );
+        @memcpy(
+            world.initial_angular_velocities_buffer.getAlignedSlice([4]f32, 16)[0..num_bodies],
+            world.state.getAngularVelocities()[0..num_bodies],
+        );
+        @memcpy(
+            world.initial_joint_positions_buffer.getSlice(f32)[0..num_joints],
+            world.state.getJointPositions()[0..num_joints],
+        );
+        @memcpy(
+            world.initial_joint_velocities_buffer.getSlice(f32)[0..num_joints],
+            world.state.getJointVelocities()[0..num_joints],
+        );
 
         return world;
     }
@@ -723,32 +851,73 @@ pub const World = struct {
 
     /// Step the simulation with adaptive substeps.
     pub fn step(self: *World, actions: []const f32, substeps: u32) !void {
-        // Copy actions to GPU buffer
-        try self.state.setActions(actions);
+        try self.stepAsync(actions, substeps);
+        try self.waitStep();
+    }
+
+    /// Encode and commit a simulation step without waiting for GPU completion.
+    pub fn stepAsync(self: *World, actions: []const f32, substeps: u32) !void {
+        try self.submitStepInternal(actions, substeps, null, null);
+    }
+
+    /// Commit a full step using actions already written into shared memory.
+    pub fn stepCurrentActionsAsync(self: *World, substeps: u32) !void {
+        try self.submitStepInternal(null, substeps, null, null);
+    }
+
+    fn submitStepInternal(
+        self: *World,
+        actions: ?[]const f32,
+        substeps: u32,
+        active_env_count: ?u32,
+        reset_env_count: ?u32,
+    ) !void {
+        if (self.pending_step != null) return error.StepPending;
+
+        // Callers with a writable unified-memory action view can skip this copy.
+        if (actions) |new_actions| try self.state.setActions(new_actions);
 
         // Use adaptive substep count if no explicit override
         const actual_substeps = if (substeps == 0) self.adaptive_substeps else substeps;
         const dt = self.config.timestep / @as(f32, @floatFromInt(@max(actual_substeps, 1)));
         self.params.dt = dt;
         self.params_buffer.getSlice(SimParams)[0] = self.params;
+        const dispatch_envs = active_env_count orelse self.config.num_envs;
+        self.env_dispatch_params_buffer.getSlice(EnvDispatchParams)[0] = .{
+            .num_envs = self.config.num_envs,
+            .dispatch_envs = dispatch_envs,
+            .use_active_env_ids = @intFromBool(active_env_count != null),
+        };
 
         var step_profile: ProfilingDataRaw = .{};
         const profile_enabled = self.config.enable_profiling;
         const step_start = if (profile_enabled) nowNanos() else 0;
-
-        // Snapshot pre-step velocities ONCE for acceleration computation over the full step.
-        const prev_vel = self.state.prev_velocities_buffer.getAlignedSlice([4]f32, 16);
-        const vel_before = self.state.getVelocities();
-        @memcpy(prev_vel, vel_before);
 
         // ONE command buffer + ONE encoder for ALL substeps — single GPU submission,
         // using memory barriers instead of separate encoder create/destroy per stage.
         var cmd = try CommandBuffer.init(self.device.command_queue);
         var encoder = try cmd.computeEncoder();
 
-        for (0..actual_substeps) |_| {
+        // Gymnasium NEXT_STEP autoreset can restore the selected environments
+        // before physics in the same command buffer. The new actions were copied
+        // above, so the fused reset deliberately preserves the action buffer.
+        if (reset_env_count) |count| {
+            try self.encodeReset(&encoder, count, count != self.config.num_envs, true, false);
+            encoder.memoryBarrier(.buffers);
+        }
+
+        encoder.setBuffer(&self.env_dispatch_params_buffer, 0, 29);
+        encoder.setBuffer(&self.active_env_ids_buffer, 0, 30);
+
+        for (0..actual_substeps) |substep_index| {
             var substep_profile: ProfilingDataRaw = .{};
-            try self.stepOnce(&encoder, if (profile_enabled) &substep_profile else null);
+            try self.stepOnce(
+                &encoder,
+                if (profile_enabled) &substep_profile else null,
+                substep_index == 0,
+                substep_index + 1 == actual_substeps,
+                dispatch_envs,
+            );
 
             if (profile_enabled) {
                 step_profile.integrate_ns += substep_profile.integrate_ns;
@@ -760,33 +929,73 @@ pub const World = struct {
             encoder.memoryBarrier(.buffers); // barrier between substeps
         }
 
-        encoder.endEncoding();
-        cmd.commitAndWait(); // Single GPU-CPU round-trip for all substeps
-
-        // Compute acceleration ONCE from total velocity change over the full step.
-        const inv_step: f32 = if (self.config.timestep > 0) 1.0 / self.config.timestep else 0.0;
-        const vel_after = self.state.getVelocities();
-        const acc = self.state.getAccelerations();
-        for (0..vel_after.len) |i| {
-            acc[i] = .{
-                (vel_after[i][0] - prev_vel[i][0]) * inv_step,
-                (vel_after[i][1] - prev_vel[i][1]) * inv_step,
-                (vel_after[i][2] - prev_vel[i][2]) * inv_step,
-                0,
-            };
+        // Task outputs are derived from the final state once per public step,
+        // not once per physics substep, and stay in shared Metal buffers.
+        if (self.task_params.enabled != 0) {
+            const pipeline = try self.pipelines.getPipeline("compute_task_outputs");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.positions_buffer, 0, 0);
+            encoder.setBuffer(&self.state.velocities_buffer, 0, 1);
+            encoder.setBuffer(&self.state.actions_buffer, 0, 2);
+            encoder.setBuffer(&self.state.rewards_buffer, 0, 3);
+            encoder.setBuffer(&self.state.dones_buffer, 0, 4);
+            encoder.setBuffer(&self.episode_steps_buffer, 0, 5);
+            encoder.setBuffer(&self.task_params_buffer, 0, 6);
+            encoder.setBuffer(&self.params_buffer, 0, 7);
+            encoder.dispatch1D(pipeline, dispatch_envs);
         }
 
+        encoder.endEncoding();
+        // Command buffers returned by Metal are autoreleased. Keep an explicit
+        // reference across the public async boundary, then release in wait.
+        _ = objc.retain(cmd.buffer);
+        cmd.commit();
+        self.pending_step = .{
+            .command = cmd,
+            .active_env_count = active_env_count,
+            .dispatch_envs = dispatch_envs,
+            .profile_enabled = profile_enabled,
+            .submit_elapsed_ns = if (profile_enabled) nowNanos() - step_start else 0,
+            .profile = step_profile,
+        };
+    }
+
+    /// Wait for the in-flight step and make shared-memory outputs safe to read.
+    pub fn waitStep(self: *World) !void {
+        var pending = self.pending_step orelse return error.NoPendingStep;
+        defer {
+            objc.release(pending.command.buffer);
+            self.pending_step = null;
+        }
+
+        const wait_start = nowNanos();
+        pending.command.waitUntilCompleted();
+        const wait_elapsed_ns = nowNanos() - wait_start;
+        if (!pending.command.succeeded()) return error.ExecutionFailed;
+
+        var step_profile = pending.profile;
+        const profile_enabled = pending.profile_enabled;
+        const active_env_count = pending.active_env_count;
+        const dispatch_envs = pending.dispatch_envs;
+
         if (profile_enabled) {
-            step_profile.total_step_ns = nowNanos() - step_start;
+            // Host cost excludes useful CPU work performed between submission
+            // and wait; this remains a host-side metric, not GPU stage timing.
+            step_profile.total_step_ns = pending.submit_elapsed_ns + wait_elapsed_ns;
 
             // Aggregate active contact count across environments.
-            const contact_counts = self.state.contact_counts_buffer.getSlice(u32);
             var total_contacts: u64 = 0;
-            for (contact_counts) |count| {
-                total_contacts += count;
+            const contact_counts = self.state.contact_counts_buffer.getSlice(u32);
+            if (active_env_count) |active_count| {
+                const active_ids = self.active_env_ids_buffer.getSlice(u32);
+                for (active_ids[0..active_count]) |env_id| {
+                    total_contacts += contact_counts[env_id];
+                }
+            } else {
+                for (contact_counts) |count| total_contacts += count;
             }
             step_profile.num_contacts = @intCast(@min(total_contacts, std.math.maxInt(u32)));
-            step_profile.num_active_constraints = self.num_constraints_per_env * self.config.num_envs;
+            step_profile.num_active_constraints = self.num_constraints_per_env * dispatch_envs;
             self.profiling = step_profile;
         } else {
             self.profiling = .{};
@@ -795,14 +1004,20 @@ pub const World = struct {
         // Adaptive substep detection: check max constraint violation after solving.
         // If violations exceed threshold, increase substeps for next frame.
         // If violations are well below threshold, decrease substeps to save compute.
-        if (self.num_constraints_per_env > 0) {
+        if (self.num_constraints_per_env > 0 and dispatch_envs > 0) {
             const constraints_slice = self.constraints_buffer.getSlice(XPBDConstraint);
             var max_violation: f32 = 0.0;
 
-            // Sample a subset of constraints to detect violation level
-            // (checking all would be expensive; sample from env 0 only)
+            // Sample one stepped environment. Checking every environment would
+            // be expensive, but a subset step must not adapt from stale state
+            // in physical environment 0 when that environment was inactive.
+            const sample_env_id: usize = if (active_env_count != null)
+                self.active_env_ids_buffer.getSlice(u32)[0]
+            else
+                0;
+            const constraint_start = sample_env_id * self.num_constraints_per_env;
             for (0..self.num_constraints_per_env) |ci| {
-                const violation = @abs(constraints_slice[ci].state[2]);
+                const violation = @abs(constraints_slice[constraint_start + ci].state[2]);
                 if (violation > max_violation) {
                     max_violation = violation;
                 }
@@ -822,147 +1037,92 @@ pub const World = struct {
         }
     }
 
-    /// Lazily allocate a persistent backup buffer, reusing if already allocated with correct size.
-    fn ensureBackupF4(self: *World, slot: *?[]align(16) [4]f32, len: usize) ![]align(16) [4]f32 {
-        if (slot.*) |buf| {
-            if (buf.len == len) return buf;
-            self.allocator.free(buf);
-        }
-        slot.* = try self.allocator.alignedAlloc([4]f32, .@"16", len);
-        return slot.*.?;
+    pub fn hasPendingStep(self: *const World) bool {
+        return self.pending_step != null;
     }
 
-    fn ensureBackupF32(self: *World, slot: *?[]f32, len: usize) ![]f32 {
-        if (slot.*) |buf| {
-            if (buf.len == len) return buf;
-            self.allocator.free(buf);
+    fn prepareActiveEnvIds(self: *World, env_mask: []const u8) u32 {
+        const ids = self.active_env_ids_buffer.getSlice(u32);
+        var active_count: u32 = 0;
+        for (env_mask, 0..) |active, physical_env_id| {
+            if (active == 0) continue;
+            ids[active_count] = @intCast(physical_env_id);
+            active_count += 1;
         }
-        slot.* = try self.allocator.alloc(f32, len);
-        return slot.*.?;
-    }
-
-    fn ensureBackupU32(self: *World, slot: *?[]u32, len: usize) ![]u32 {
-        if (slot.*) |buf| {
-            if (buf.len == len) return buf;
-            self.allocator.free(buf);
-        }
-        slot.* = try self.allocator.alloc(u32, len);
-        return slot.*.?;
-    }
-
-    fn ensureBackupU8(self: *World, slot: *?[]u8, len: usize) ![]u8 {
-        if (slot.*) |buf| {
-            if (buf.len == len) return buf;
-            self.allocator.free(buf);
-        }
-        slot.* = try self.allocator.alloc(u8, len);
-        return slot.*.?;
+        return active_count;
     }
 
     /// Step only the masked environments while keeping others unchanged.
-    /// Uses persistent backup buffers to avoid per-call allocation overhead.
+    /// The CPU compacts the small mask into active physical environment IDs;
+    /// Metal kernels dispatch only active work while retaining stable state indices.
     pub fn stepSubset(self: *World, actions: []const f32, env_mask: []const u8, substeps: u32) !void {
+        try self.stepSubsetAsync(actions, env_mask, substeps);
+        try self.waitStep();
+    }
+
+    /// Commit a compact masked step without waiting for GPU completion.
+    pub fn stepSubsetAsync(self: *World, actions: []const f32, env_mask: []const u8, substeps: u32) !void {
+        if (self.pending_step != null) return error.StepPending;
         const num_envs: usize = @intCast(self.config.num_envs);
         if (env_mask.len != num_envs) return error.InvalidSize;
 
-        var active_count: usize = 0;
-        for (env_mask) |m| {
-            if (m != 0) active_count += 1;
-        }
+        const compact_count = self.prepareActiveEnvIds(env_mask);
+        if (compact_count == num_envs) return self.submitStepInternal(actions, substeps, null, null);
+        try self.submitStepInternal(actions, substeps, compact_count, null);
+    }
 
-        if (active_count == 0) return;
-        if (active_count == num_envs) return self.step(actions, substeps);
+    /// Reset selected environments and then step the full batch in one Metal
+    /// command buffer. This is intentionally full-step only: the compact ID
+    /// buffer holds the reset selection for the duration of the submission.
+    pub fn stepWithResetAsync(
+        self: *World,
+        actions: []const f32,
+        reset_mask: []const u8,
+        substeps: u32,
+    ) !void {
+        if (self.pending_step != null) return error.StepPending;
+        const num_envs: usize = @intCast(self.config.num_envs);
+        if (reset_mask.len != num_envs) return error.InvalidSize;
 
-        const num_bodies: usize = @intCast(self.params.num_bodies);
-        const num_joints: usize = @intCast(self.params.num_joints);
-        const obs_dim: usize = @intCast(self.state.obs_dim);
-        const max_contacts: usize = @intCast(self.config.max_contacts_per_env);
-        const contact_env_bytes = max_contacts * @sizeOf(contact.ContactGPU);
+        const reset_count = self.prepareActiveEnvIds(reset_mask);
+        try self.submitStepInternal(
+            actions,
+            substeps,
+            null,
+            if (reset_count == 0) null else reset_count,
+        );
+    }
 
-        const positions = self.state.getPositions();
-        const quaternions = self.state.getQuaternions();
-        const velocities = self.state.getVelocities();
-        const accelerations = self.state.getAccelerations();
-        const angular_velocities = self.state.getAngularVelocities();
-        const joint_positions = self.state.getJointPositions();
-        const joint_velocities = self.state.getJointVelocities();
-        const joint_torques = self.state.joint_torques_buffer.getSlice(f32);
-        const observations = self.state.getObservations();
-        const rewards = self.state.getRewards();
-        const dones = self.state.getDones();
-        const contact_counts = self.state.contact_counts_buffer.getSlice(u32);
-        const contacts = self.state.contacts_buffer.getSlice(u8);
+    /// Fused autoreset variant for actions already written into shared memory.
+    pub fn stepWithResetCurrentActionsAsync(
+        self: *World,
+        reset_mask: []const u8,
+        substeps: u32,
+    ) !void {
+        if (self.pending_step != null) return error.StepPending;
+        const num_envs: usize = @intCast(self.config.num_envs);
+        if (reset_mask.len != num_envs) return error.InvalidSize;
 
-        // Lazily allocate persistent backup buffers (reused across calls)
-        const positions_backup = try self.ensureBackupF4(&self.subset_backup_positions, positions.len);
-        const quaternions_backup = try self.ensureBackupF4(&self.subset_backup_quaternions, quaternions.len);
-        const velocities_backup = try self.ensureBackupF4(&self.subset_backup_velocities, velocities.len);
-        const accelerations_backup = try self.ensureBackupF4(&self.subset_backup_accelerations, accelerations.len);
-        const angular_velocities_backup = try self.ensureBackupF4(&self.subset_backup_angular_velocities, angular_velocities.len);
-        const joint_positions_backup = try self.ensureBackupF32(&self.subset_backup_joint_positions, joint_positions.len);
-        const joint_velocities_backup = try self.ensureBackupF32(&self.subset_backup_joint_velocities, joint_velocities.len);
-        const joint_torques_backup = try self.ensureBackupF32(&self.subset_backup_joint_torques, joint_torques.len);
-        const observations_backup = try self.ensureBackupF32(&self.subset_backup_observations, observations.len);
-        const rewards_backup = try self.ensureBackupF32(&self.subset_backup_rewards, rewards.len);
-        const dones_backup = try self.ensureBackupU8(&self.subset_backup_dones, dones.len);
-        const contact_counts_backup = try self.ensureBackupU32(&self.subset_backup_contact_counts, contact_counts.len);
-        const contacts_backup = try self.ensureBackupU8(&self.subset_backup_contacts, contacts.len);
-
-        @memcpy(positions_backup, positions);
-        @memcpy(quaternions_backup, quaternions);
-        @memcpy(velocities_backup, velocities);
-        @memcpy(accelerations_backup, accelerations);
-        @memcpy(angular_velocities_backup, angular_velocities);
-        @memcpy(joint_positions_backup, joint_positions);
-        @memcpy(joint_velocities_backup, joint_velocities);
-        @memcpy(joint_torques_backup, joint_torques);
-        @memcpy(observations_backup, observations);
-        @memcpy(rewards_backup, rewards);
-        @memcpy(dones_backup, dones);
-        @memcpy(contact_counts_backup, contact_counts);
-        @memcpy(contacts_backup, contacts);
-
-        try self.step(actions, substeps);
-
-        for (env_mask, 0..) |should_step, env_id| {
-            if (should_step != 0) continue;
-
-            const body_start = env_id * num_bodies;
-            const body_end = body_start + num_bodies;
-            @memcpy(positions[body_start..body_end], positions_backup[body_start..body_end]);
-            @memcpy(quaternions[body_start..body_end], quaternions_backup[body_start..body_end]);
-            @memcpy(velocities[body_start..body_end], velocities_backup[body_start..body_end]);
-            @memcpy(accelerations[body_start..body_end], accelerations_backup[body_start..body_end]);
-            @memcpy(angular_velocities[body_start..body_end], angular_velocities_backup[body_start..body_end]);
-
-            if (num_joints > 0) {
-                const joint_start = env_id * num_joints;
-                const joint_end = joint_start + num_joints;
-                @memcpy(joint_positions[joint_start..joint_end], joint_positions_backup[joint_start..joint_end]);
-                @memcpy(joint_velocities[joint_start..joint_end], joint_velocities_backup[joint_start..joint_end]);
-                @memcpy(joint_torques[joint_start..joint_end], joint_torques_backup[joint_start..joint_end]);
-            }
-
-            if (obs_dim > 0) {
-                const obs_start = env_id * obs_dim;
-                const obs_end = obs_start + obs_dim;
-                @memcpy(observations[obs_start..obs_end], observations_backup[obs_start..obs_end]);
-            }
-
-            rewards[env_id] = rewards_backup[env_id];
-            dones[env_id] = dones_backup[env_id];
-            contact_counts[env_id] = contact_counts_backup[env_id];
-
-            const contact_start = env_id * contact_env_bytes;
-            const contact_end = contact_start + contact_env_bytes;
-            @memcpy(contacts[contact_start..contact_end], contacts_backup[contact_start..contact_end]);
-        }
+        const reset_count = self.prepareActiveEnvIds(reset_mask);
+        try self.submitStepInternal(
+            null,
+            substeps,
+            null,
+            if (reset_count == 0) null else reset_count,
+        );
     }
 
     /// Execute one physics substep.
     /// Encodes all GPU work into the provided compute encoder using memory barriers
     /// between dependent dispatch groups, instead of creating separate encoders.
-    fn stepOnce(self: *World, encoder: *ComputeEncoder, profile: ?*ProfilingDataRaw) !void {
+    fn stepOnce(
+        self: *World,
+        encoder: *ComputeEncoder,
+        profile: ?*ProfilingDataRaw,
+        first_substep: bool,
+        final_substep: bool,
+        dispatch_envs: u32,
+    ) !void {
 
         // GROUP 0: GPU-side count clears. CPU memsets execute at encode time —
         // before any GPU work runs — so per-substep resets must be GPU kernels:
@@ -970,19 +1130,20 @@ pub const World = struct {
         // saturate max_contacts, and spatial-hash cell counts would double on
         // every substep after the first.
         {
-            const pipeline = try self.pipelines.getPipeline("clear_uint_buffer");
+            const pipeline = try self.pipelines.getPipeline("clear_active_uint_slices");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.contact_counts_buffer, 0, 0);
-            var clear_count: u32 = self.config.num_envs;
-            encoder.setBytes(std.mem.asBytes(&clear_count), 1);
-            encoder.dispatch1D(pipeline, clear_count);
+            var elements_per_env: u32 = 1;
+            encoder.setBytes(std.mem.asBytes(&elements_per_env), 1);
+            encoder.dispatch1D(pipeline, dispatch_envs);
 
             if (self.use_spatial_hash) {
                 var sh_cell_counts = self.spatial_hash_cell_counts.?;
                 const sh_params = self.spatial_hash_params_buffer.?.getSlice(SpatialHashParamsGPU)[0];
-                var cell_clear_count: u32 = sh_params.total_cells * self.config.num_envs;
+                const cell_clear_count: u32 = sh_params.total_cells * dispatch_envs;
                 encoder.setBuffer(&sh_cell_counts, 0, 0);
-                encoder.setBytes(std.mem.asBytes(&cell_clear_count), 1);
+                elements_per_env = sh_params.total_cells;
+                encoder.setBytes(std.mem.asBytes(&elements_per_env), 1);
                 encoder.dispatch1D(pipeline, cell_clear_count);
             }
         }
@@ -1000,7 +1161,7 @@ pub const World = struct {
             encoder.setBuffer(&self.constraints_buffer, 0, 0);
             encoder.setBytes(std.mem.asBytes(&local_params), 1);
             encoder.setBuffer(&self.warm_start_factor_buffer, 0, 2);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.num_constraints_per_env);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.num_constraints_per_env);
         }
 
         {
@@ -1010,7 +1171,7 @@ pub const World = struct {
             encoder.setBuffer(&self.state.joint_torques_buffer, 0, 1);
             encoder.setBuffer(&self.actuator_data_buffer, 0, 2);
             encoder.setBuffer(&self.params_buffer, 0, 3);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_actuators);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_actuators);
         }
 
         encoder.memoryBarrier(.buffers);
@@ -1029,7 +1190,7 @@ pub const World = struct {
             encoder.setBuffer(&self.params_buffer, 0, 6);
             encoder.setBuffer(&self.state.quaternions_buffer, 0, 7);
             encoder.setBuffer(&self.body_data_buffer, 0, 8);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_bodies);
         }
 
         {
@@ -1041,7 +1202,7 @@ pub const World = struct {
             encoder.setBuffer(&self.state.angular_velocities_buffer, 0, 3);
             encoder.setBuffer(&self.body_data_buffer, 0, 4);
             encoder.setBuffer(&self.params_buffer, 0, 5);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_bodies);
         }
 
         encoder.memoryBarrier(.buffers);
@@ -1057,7 +1218,7 @@ pub const World = struct {
             encoder.setBuffer(&self.state.quaternions_buffer, 0, 3);
             encoder.setBuffer(&self.params_buffer, 0, 4);
             encoder.setBuffer(&self.state.forces_buffer, 0, 5);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_joints);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_joints);
         }
 
         {
@@ -1068,7 +1229,11 @@ pub const World = struct {
             encoder.setBuffer(&self.state.prev_positions_buffer, 0, 2);
             encoder.setBuffer(&self.state.prev_quaternions_buffer, 0, 3);
             encoder.setBuffer(&self.params_buffer, 0, 4);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
+            encoder.setBuffer(&self.state.velocities_buffer, 0, 5);
+            encoder.setBuffer(&self.state.prev_velocities_buffer, 0, 6);
+            var snapshot_full_step: u32 = @intFromBool(first_substep);
+            encoder.setBytes(std.mem.asBytes(&snapshot_full_step), 7);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_bodies);
         }
 
         encoder.memoryBarrier(.buffers);
@@ -1087,7 +1252,7 @@ pub const World = struct {
             encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 6);
             encoder.setBuffer(&self.params_buffer, 0, 7);
             encoder.setBuffer(&self.body_data_buffer, 0, 8);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_bodies);
         }
         if (profile) |p| {
             p.integrate_ns += nowNanos() - integrate_start;
@@ -1115,7 +1280,8 @@ pub const World = struct {
                 encoder.setBuffer(&sh_cell_ids, 0, 3);
                 encoder.setBuffer(&sh_params_buf, 0, 4);
                 encoder.setBuffer(&self.params_buffer, 0, 5);
-                encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_geoms);
+                encoder.setBuffer(&self.state.quaternions_buffer, 0, 6);
+                encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_geoms);
             }
 
             encoder.memoryBarrier(.buffers);
@@ -1127,7 +1293,7 @@ pub const World = struct {
                 encoder.setBuffer(&sh_cell_counts, 0, 0);
                 encoder.setBuffer(&sh_cell_offsets, 0, 1);
                 encoder.setBuffer(&sh_params_buf, 0, 2);
-                encoder.dispatch1D(pipeline, self.config.num_envs);
+                encoder.dispatch1D(pipeline, dispatch_envs);
             }
 
             encoder.memoryBarrier(.buffers);
@@ -1143,7 +1309,7 @@ pub const World = struct {
                 encoder.setBuffer(&sh_cell_counts, 0, 2);
                 encoder.setBuffer(&sh_sorted_geoms, 0, 3);
                 encoder.setBuffer(&sh_params_buf, 0, 4);
-                encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_geoms);
+                encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_geoms);
             }
 
             encoder.memoryBarrier(.buffers);
@@ -1162,7 +1328,8 @@ pub const World = struct {
                 encoder.setBuffer(&self.state.contact_counts_buffer, 0, 7);
                 encoder.setBuffer(&sh_params_buf, 0, 8);
                 encoder.setBuffer(&self.params_buffer, 0, 9);
-                encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_geoms);
+                encoder.setBuffer(&self.state.quaternions_buffer, 0, 10);
+                encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_geoms);
             }
         } else {
             // O(n²) fallback for small scenes
@@ -1174,7 +1341,7 @@ pub const World = struct {
             encoder.setBuffer(&self.state.contacts_buffer, 0, 3);
             encoder.setBuffer(&self.state.contact_counts_buffer, 0, 4);
             encoder.setBuffer(&self.params_buffer, 0, 5);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_geoms);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_geoms);
         }
         if (profile) |p| {
             p.collision_broad_ns += nowNanos() - broad_start;
@@ -1189,7 +1356,7 @@ pub const World = struct {
             encoder.setBuffer(&self.state.contacts_buffer, 0, 0);
             encoder.setBuffer(&self.state.contact_counts_buffer, 0, 1);
             encoder.setBuffer(&self.params_buffer, 0, 2);
-            encoder.dispatch1D(pipeline, self.config.num_envs);
+            encoder.dispatch1D(pipeline, dispatch_envs);
         }
 
         encoder.memoryBarrier(.buffers);
@@ -1205,7 +1372,7 @@ pub const World = struct {
             encoder.setBuffer(&self.state.contacts_buffer, 0, 3);
             encoder.setBuffer(&self.state.contact_counts_buffer, 0, 4);
             encoder.setBuffer(&self.params_buffer, 0, 5);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.config.max_contacts_per_env);
         }
         if (profile) |p| {
             p.collision_narrow_ns += nowNanos() - narrow_start;
@@ -1222,7 +1389,7 @@ pub const World = struct {
             encoder.setBuffer(&self.state.contact_counts_buffer, 0, 2);
             encoder.setBuffer(&self.prev_contact_counts_buffer, 0, 3);
             encoder.setBuffer(&self.params_buffer, 0, 4);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.config.max_contacts_per_env);
         }
 
         encoder.memoryBarrier(.buffers);
@@ -1257,16 +1424,17 @@ pub const World = struct {
                     encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 5);
                     encoder.setBytes(std.mem.asBytes(&local_params), 6);
                     encoder.setBuffer(&self.body_data_buffer, 0, 7);
-                    encoder.dispatch1D(pipeline, self.config.num_envs * count);
+                    encoder.dispatch1D(pipeline, dispatch_envs * count);
 
                     encoder.memoryBarrier(.buffers);
                 }
             }
         }
 
-        // GROUP I: solve_contacts loop
-        // (barrier between each iteration)
-        for (0..self.config.contact_iterations) |_| {
+        // GROUP I: one position-correction pass. Narrow phase computes one
+        // penetration depth per substep, so repeating the same correction
+        // would inject energy when velocities are reconstructed below.
+        {
             const pipeline = try self.pipelines.getPipeline("solve_contacts");
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.state.positions_buffer, 0, 0);
@@ -1277,10 +1445,9 @@ pub const World = struct {
             encoder.setBuffer(&self.state.contact_counts_buffer, 0, 5);
             encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 6);
             encoder.setBuffer(&self.params_buffer, 0, 7);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
-
-            encoder.memoryBarrier(.buffers);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.config.max_contacts_per_env);
         }
+        encoder.memoryBarrier(.buffers);
         if (profile) |p| {
             p.constraint_solve_ns += nowNanos() - solve_start;
         }
@@ -1297,10 +1464,70 @@ pub const World = struct {
             encoder.setBuffer(&self.state.prev_quaternions_buffer, 0, 5);
             encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 6);
             encoder.setBuffer(&self.params_buffer, 0, 7);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_bodies);
+            encoder.setBuffer(&self.state.prev_velocities_buffer, 0, 8);
+            encoder.setBuffer(&self.state.accelerations_buffer, 0, 9);
+            const inv_full_step: f32 = if (self.config.timestep > 0) 1.0 / self.config.timestep else 0.0;
+            // Contact impulses run after this kernel, so full-step acceleration
+            // is derived in a dedicated final-substep pass below.
+            var derive_acceleration: u32 = 0;
+            encoder.setBytes(std.mem.asBytes(&inv_full_step), 10);
+            encoder.setBytes(std.mem.asBytes(&derive_acceleration), 11);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_bodies);
         }
 
         encoder.memoryBarrier(.buffers);
+
+        // GROUP J.5: warm start and iteratively solve velocity-level contact
+        // impulses after XPBD velocity reconstruction so normal restitution
+        // and Coulomb friction are not overwritten.
+        {
+            const pipeline = try self.pipelines.getPipeline("warm_start_contacts");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.positions_buffer, 0, 0);
+            encoder.setBuffer(&self.state.velocities_buffer, 0, 1);
+            encoder.setBuffer(&self.state.quaternions_buffer, 0, 2);
+            encoder.setBuffer(&self.state.angular_velocities_buffer, 0, 3);
+            encoder.setBuffer(&self.state.contacts_buffer, 0, 4);
+            encoder.setBuffer(&self.state.contact_counts_buffer, 0, 5);
+            encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 6);
+            encoder.setBuffer(&self.params_buffer, 0, 7);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.config.max_contacts_per_env);
+        }
+        encoder.memoryBarrier(.buffers);
+
+        for (0..self.config.contact_iterations) |iteration_index| {
+            const pipeline = try self.pipelines.getPipeline("solve_contact_velocities");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.positions_buffer, 0, 0);
+            encoder.setBuffer(&self.state.velocities_buffer, 0, 1);
+            encoder.setBuffer(&self.state.quaternions_buffer, 0, 2);
+            encoder.setBuffer(&self.state.angular_velocities_buffer, 0, 3);
+            encoder.setBuffer(&self.state.contacts_buffer, 0, 4);
+            encoder.setBuffer(&self.state.contact_counts_buffer, 0, 5);
+            encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 6);
+            encoder.setBuffer(&self.params_buffer, 0, 7);
+            var velocity_iteration: u32 = @intCast(iteration_index);
+            encoder.setBytes(std.mem.asBytes(&velocity_iteration), 8);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.config.max_contacts_per_env);
+            encoder.memoryBarrier(.buffers);
+        }
+
+        if (final_substep) {
+            const pipeline = try self.pipelines.getPipeline("derive_accelerations");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.velocities_buffer, 0, 0);
+            encoder.setBuffer(&self.state.prev_velocities_buffer, 0, 1);
+            encoder.setBuffer(&self.state.accelerations_buffer, 0, 2);
+            encoder.setBuffer(&self.state.inv_mass_inertia_buffer, 0, 3);
+            encoder.setBuffer(&self.params_buffer, 0, 4);
+            const inv_full_step: f32 = if (self.config.timestep > 0)
+                1.0 / self.config.timestep
+            else
+                0.0;
+            encoder.setBytes(std.mem.asBytes(&inv_full_step), 5);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_bodies);
+            encoder.memoryBarrier(.buffers);
+        }
 
         // GROUP K: update_joint_states
         if (self.params.num_joints > 0) {
@@ -1314,7 +1541,7 @@ pub const World = struct {
             encoder.setBuffer(&self.state.joint_positions_buffer, 0, 5);
             encoder.setBuffer(&self.state.joint_velocities_buffer, 0, 6);
             encoder.setBuffer(&self.params_buffer, 0, 7);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_joints);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_joints);
         }
 
         encoder.memoryBarrier(.buffers);
@@ -1333,7 +1560,7 @@ pub const World = struct {
             encoder.setBuffer(&self.sensor_data_buffer, 0, 6);
             encoder.setBuffer(&self.state.observations_buffer, 0, 7);
             encoder.setBuffer(&self.params_buffer, 0, 8);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.params.num_sensors);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_sensors);
         }
 
         {
@@ -1344,7 +1571,7 @@ pub const World = struct {
             encoder.setBuffer(&self.state.contact_counts_buffer, 0, 2);
             encoder.setBuffer(&self.prev_contact_counts_buffer, 0, 3);
             encoder.setBuffer(&self.params_buffer, 0, 4);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.config.max_contacts_per_env);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.config.max_contacts_per_env);
         }
 
         encoder.memoryBarrier(.buffers);
@@ -1358,29 +1585,136 @@ pub const World = struct {
             encoder.setPipeline(pipeline);
             encoder.setBuffer(&self.constraints_buffer, 0, 0);
             encoder.setBytes(std.mem.asBytes(&local_params), 1);
-            encoder.dispatch1D(pipeline, self.config.num_envs * self.num_constraints_per_env);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.num_constraints_per_env);
         }
     }
 
-    /// Reset specific environments.
-    pub fn reset(self: *World, env_mask: ?[]const u8) void {
-        if (self.initial_state == null) return;
+    fn encodeReset(
+        self: *World,
+        encoder: *ComputeEncoder,
+        dispatch_envs: u32,
+        use_active_ids: bool,
+        preserve_actions: bool,
+        refresh_observations: bool,
+    ) !void {
+        var reset_dispatch: EnvDispatchParams = .{
+            .num_envs = self.config.num_envs,
+            .dispatch_envs = dispatch_envs,
+            .use_active_env_ids = @intFromBool(use_active_ids),
+        };
+        encoder.setBytes(std.mem.asBytes(&reset_dispatch), 29);
+        encoder.setBuffer(&self.active_env_ids_buffer, 0, 30);
 
-        if (env_mask) |mask| {
-            for (mask, 0..) |should_reset, i| {
-                if (should_reset != 0) {
-                    self.initial_state.?.restore(&self.state, @intCast(i));
-                }
-            }
-        } else {
-            // Reset all environments
-            for (0..self.config.num_envs) |i| {
-                self.initial_state.?.restore(&self.state, @intCast(i));
-            }
+        {
+            const pipeline = try self.pipelines.getPipeline("reset_bodies");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.positions_buffer, 0, 0);
+            encoder.setBuffer(&self.state.velocities_buffer, 0, 1);
+            encoder.setBuffer(&self.state.accelerations_buffer, 0, 2);
+            encoder.setBuffer(&self.state.angular_velocities_buffer, 0, 3);
+            encoder.setBuffer(&self.state.quaternions_buffer, 0, 4);
+            encoder.setBuffer(&self.state.forces_buffer, 0, 5);
+            encoder.setBuffer(&self.state.torques_buffer, 0, 6);
+            encoder.setBuffer(&self.state.prev_positions_buffer, 0, 7);
+            encoder.setBuffer(&self.state.prev_quaternions_buffer, 0, 8);
+            encoder.setBuffer(&self.state.prev_velocities_buffer, 0, 9);
+            encoder.setBuffer(&self.initial_positions_buffer, 0, 10);
+            encoder.setBuffer(&self.initial_velocities_buffer, 0, 11);
+            encoder.setBuffer(&self.initial_quaternions_buffer, 0, 12);
+            encoder.setBuffer(&self.initial_angular_velocities_buffer, 0, 13);
+            encoder.setBuffer(&self.params_buffer, 0, 14);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_bodies);
         }
 
-        // Clear contact counts
-        self.state.contact_counts_buffer.zero() catch {};
+        {
+            const pipeline = try self.pipelines.getPipeline("reset_env_aux");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.joint_positions_buffer, 0, 0);
+            encoder.setBuffer(&self.state.joint_velocities_buffer, 0, 1);
+            encoder.setBuffer(&self.state.joint_torques_buffer, 0, 2);
+            encoder.setBuffer(&self.state.actions_buffer, 0, 3);
+            encoder.setBuffer(&self.state.observations_buffer, 0, 4);
+            encoder.setBuffer(&self.state.rewards_buffer, 0, 5);
+            encoder.setBuffer(&self.state.dones_buffer, 0, 6);
+            encoder.setBuffer(&self.state.contacts_buffer, 0, 7);
+            encoder.setBuffer(&self.state.contact_counts_buffer, 0, 8);
+            encoder.setBuffer(&self.prev_contacts_buffer, 0, 9);
+            encoder.setBuffer(&self.prev_contact_counts_buffer, 0, 10);
+            encoder.setBuffer(&self.constraints_buffer, 0, 11);
+            encoder.setBuffer(&self.episode_steps_buffer, 0, 12);
+            encoder.setBuffer(&self.initial_joint_positions_buffer, 0, 13);
+            encoder.setBuffer(&self.initial_joint_velocities_buffer, 0, 14);
+            var reset_params = self.params;
+            reset_params.target_color = self.num_constraints_per_env;
+            // reset_env_aux does not otherwise use constraint_offset. Reuse it
+            // as a private per-dispatch flag without changing the public ABI.
+            reset_params.constraint_offset = @intFromBool(preserve_actions);
+            encoder.setBytes(std.mem.asBytes(&reset_params), 15);
+            encoder.dispatch1D(pipeline, dispatch_envs);
+        }
+
+        if (refresh_observations and self.params.num_sensors > 0) {
+            encoder.memoryBarrier(.buffers);
+            const pipeline = try self.pipelines.getPipeline("read_sensors");
+            encoder.setPipeline(pipeline);
+            encoder.setBuffer(&self.state.positions_buffer, 0, 0);
+            encoder.setBuffer(&self.state.velocities_buffer, 0, 1);
+            encoder.setBuffer(&self.state.quaternions_buffer, 0, 2);
+            encoder.setBuffer(&self.state.angular_velocities_buffer, 0, 3);
+            encoder.setBuffer(&self.state.joint_positions_buffer, 0, 4);
+            encoder.setBuffer(&self.state.joint_velocities_buffer, 0, 5);
+            encoder.setBuffer(&self.sensor_data_buffer, 0, 6);
+            encoder.setBuffer(&self.state.observations_buffer, 0, 7);
+            encoder.setBuffer(&self.params_buffer, 0, 8);
+            encoder.dispatch1D(pipeline, dispatch_envs * self.params.num_sensors);
+        }
+    }
+
+    /// Reset selected environments from GPU-resident templates and refresh
+    /// observations in a single Metal command buffer.
+    pub fn reset(self: *World, env_mask: ?[]const u8) !void {
+        if (self.pending_step != null) return error.StepPending;
+        var dispatch_envs = self.config.num_envs;
+        var use_active_ids = false;
+        if (env_mask) |mask| {
+            if (mask.len != self.config.num_envs) return error.InvalidSize;
+            dispatch_envs = self.prepareActiveEnvIds(mask);
+            if (dispatch_envs == 0) return;
+            use_active_ids = dispatch_envs != self.config.num_envs;
+        }
+
+        var cmd = try CommandBuffer.init(self.device.command_queue);
+        var encoder = try cmd.computeEncoder();
+        try self.encodeReset(&encoder, dispatch_envs, use_active_ids, false, true);
+
+        encoder.endEncoding();
+        cmd.commitAndWait();
+    }
+
+    /// Configure or disable GPU-side locomotion reward and termination.
+    pub fn configureTask(self: *World, params: TaskParams) !void {
+        if (self.pending_step != null) return error.StepPending;
+        if (params.enabled != 0) {
+            if (params.root_body >= self.params.num_bodies or params.forward_axis > 2) {
+                return error.InvalidTaskConfig;
+            }
+            if (!std.math.isFinite(params.forward_reward_weight) or
+                !std.math.isFinite(params.control_cost_weight) or
+                !std.math.isFinite(params.healthy_bonus) or
+                !std.math.isFinite(params.healthy_z_min) or
+                !std.math.isFinite(params.healthy_z_max) or
+                params.healthy_z_min > params.healthy_z_max)
+            {
+                return error.InvalidTaskConfig;
+            }
+        }
+        self.task_params = params;
+        self.task_params.enabled = @intFromBool(params.enabled != 0);
+        self.task_params.terminate_when_unhealthy = @intFromBool(params.terminate_when_unhealthy != 0);
+        self.task_params_buffer.getSlice(TaskParams)[0] = self.task_params;
+        @memset(self.state.getRewards(), 0);
+        @memset(self.state.getDones(), 0);
+        @memset(self.episode_steps_buffer.getSlice(u32), 0);
     }
 
     /// Get observations (zero-copy pointer to GPU buffer).
@@ -1390,7 +1724,17 @@ pub const World = struct {
 
     /// Get observations pointer for FFI.
     pub fn getObservationsPtr(self: *World) ?[*]f32 {
+        if (self.pending_step != null) return null;
         return self.state.getObservationsPtr();
+    }
+
+    /// Writable shared-memory action pointer. It must not be accessed while a
+    /// step is pending because Metal may be consuming it.
+    pub fn getActionsPtr(self: *World) ?[*]f32 {
+        if (self.pending_step != null) return null;
+        const actions = self.state.getActions();
+        if (actions.len == 0) return null;
+        return actions.ptr;
     }
 
     /// Get rewards.
@@ -1400,6 +1744,7 @@ pub const World = struct {
 
     /// Get rewards pointer for FFI.
     pub fn getRewardsPtr(self: *World) ?[*]f32 {
+        if (self.pending_step != null) return null;
         return self.state.getRewardsPtr();
     }
 
@@ -1410,6 +1755,7 @@ pub const World = struct {
 
     /// Get dones pointer for FFI.
     pub fn getDonesPtr(self: *World) ?[*]u8 {
+        if (self.pending_step != null) return null;
         return self.state.getDonesPtr();
     }
 
@@ -1425,6 +1771,7 @@ pub const World = struct {
 
     /// Get body velocities pointer.
     pub fn getBodyVelocitiesPtr(self: *World) ?[*]f32 {
+        if (self.pending_step != null) return null;
         const slice = self.state.getVelocities();
         if (slice.len == 0) return null;
         return @ptrCast(slice.ptr);
@@ -1432,6 +1779,7 @@ pub const World = struct {
 
     /// Get body accelerations pointer.
     pub fn getBodyAccelerationsPtr(self: *World) ?[*]f32 {
+        if (self.pending_step != null) return null;
         const slice = self.state.getAccelerations();
         if (slice.len == 0) return null;
         return @ptrCast(slice.ptr);
@@ -1439,6 +1787,7 @@ pub const World = struct {
 
     /// Get body angular velocities pointer.
     pub fn getBodyAngularVelocitiesPtr(self: *World) ?[*]f32 {
+        if (self.pending_step != null) return null;
         const slice = self.state.getAngularVelocities();
         if (slice.len == 0) return null;
         return @ptrCast(slice.ptr);
@@ -1446,6 +1795,7 @@ pub const World = struct {
 
     /// Get joint positions pointer.
     pub fn getJointPositionsPtr(self: *World) ?[*]f32 {
+        if (self.pending_step != null) return null;
         const slice = self.state.getJointPositions();
         if (slice.len == 0) return null;
         return slice.ptr;
@@ -1453,6 +1803,7 @@ pub const World = struct {
 
     /// Get joint velocities pointer.
     pub fn getJointVelocitiesPtr(self: *World) ?[*]f32 {
+        if (self.pending_step != null) return null;
         const slice = self.state.getJointVelocities();
         if (slice.len == 0) return null;
         return slice.ptr;
@@ -1460,6 +1811,7 @@ pub const World = struct {
 
     /// Get contact counts pointer.
     pub fn getContactCountsPtr(self: *World) ?[*]u32 {
+        if (self.pending_step != null) return null;
         const slice = self.state.contact_counts_buffer.getSlice(u32);
         if (slice.len == 0) return null;
         return slice.ptr;
@@ -1467,6 +1819,7 @@ pub const World = struct {
 
     /// Get sensor data pointer.
     pub fn getSensorDataPtr(self: *World) ?[*]f32 {
+        if (self.pending_step != null) return null;
         // Sensor readings are written into the observations buffer by the
         // read_sensors kernel. Return that data for FFI consumers.
         return self.state.getObservationsPtr();
@@ -1474,6 +1827,7 @@ pub const World = struct {
 
     /// Get contacts buffer pointer.
     pub fn getContactsPtr(self: *World) ?*anyopaque {
+        if (self.pending_step != null) return null;
         const slice = self.state.contacts_buffer.getSlice(u8);
         if (slice.len == 0) return null;
         return @ptrCast(slice.ptr);
@@ -1481,6 +1835,7 @@ pub const World = struct {
 
     /// Set body positions from external buffer.
     pub fn setBodyPositions(self: *World, positions: []const f32, mask: ?[]const u8) !void {
+        if (self.pending_step != null) return error.StepPending;
         const dest = self.state.getPositions();
         const expected = self.config.num_envs * self.params.num_bodies * 4;
         if (positions.len < expected) return error.InvalidSize;
@@ -1515,6 +1870,7 @@ pub const World = struct {
 
     /// Set body velocities from external buffer.
     pub fn setBodyVelocities(self: *World, velocities: []const f32, mask: ?[]const u8) !void {
+        if (self.pending_step != null) return error.StepPending;
         const dest = self.state.getVelocities();
         const expected = self.config.num_envs * self.params.num_bodies * 4;
         if (velocities.len < expected) return error.InvalidSize;
@@ -1574,29 +1930,11 @@ pub const World = struct {
     }
 
     pub fn deinit(self: *World) void {
-        if (self.initial_state) |*init_state| {
-            init_state.deinit();
-        }
-
+        if (self.pending_step != null) self.waitStep() catch {};
         // Free color ranges if allocated
         if (self.color_ranges) |ranges| {
             self.allocator.free(ranges);
         }
-
-        // Free persistent stepSubset backup buffers
-        if (self.subset_backup_positions) |b| self.allocator.free(b);
-        if (self.subset_backup_quaternions) |b| self.allocator.free(b);
-        if (self.subset_backup_velocities) |b| self.allocator.free(b);
-        if (self.subset_backup_accelerations) |b| self.allocator.free(b);
-        if (self.subset_backup_angular_velocities) |b| self.allocator.free(b);
-        if (self.subset_backup_joint_positions) |b| self.allocator.free(b);
-        if (self.subset_backup_joint_velocities) |b| self.allocator.free(b);
-        if (self.subset_backup_joint_torques) |b| self.allocator.free(b);
-        if (self.subset_backup_observations) |b| self.allocator.free(b);
-        if (self.subset_backup_rewards) |b| self.allocator.free(b);
-        if (self.subset_backup_dones) |b| self.allocator.free(b);
-        if (self.subset_backup_contact_counts) |b| self.allocator.free(b);
-        if (self.subset_backup_contacts) |b| self.allocator.free(b);
 
         self.body_data_buffer.deinit();
         self.joint_data_buffer.deinit();
@@ -1616,6 +1954,16 @@ pub const World = struct {
         self.prev_contacts_buffer.deinit();
         self.prev_contact_counts_buffer.deinit();
         self.warm_start_factor_buffer.deinit();
+        self.active_env_ids_buffer.deinit();
+        self.env_dispatch_params_buffer.deinit();
+        self.task_params_buffer.deinit();
+        self.episode_steps_buffer.deinit();
+        self.initial_positions_buffer.deinit();
+        self.initial_quaternions_buffer.deinit();
+        self.initial_velocities_buffer.deinit();
+        self.initial_angular_velocities_buffer.deinit();
+        self.initial_joint_positions_buffer.deinit();
+        self.initial_joint_velocities_buffer.deinit();
 
         self.state.deinit();
         self.pipelines.deinit();

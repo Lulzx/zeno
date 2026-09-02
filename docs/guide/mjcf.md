@@ -102,15 +102,24 @@ Collision geometry and visual shape.
 
 **Geometry Types:**
 
-| Type | Size Format | Description |
-|------|-------------|-------------|
-| `sphere` | radius | Sphere |
-| `capsule` | radius, half-length | Cylinder with hemisphere caps |
-| `box` | half-x, half-y, half-z | Rectangular box |
-| `cylinder` | radius, half-height | Cylinder |
-| `plane` | - | Infinite ground plane |
-| `mesh` | - | Convex mesh (loaded from STL/OBJ) |
-| `hfield` | - | Heightfield terrain |
+| Type | Size Format | Parser | Metal contact pairs |
+|------|-------------|--------|---------------------|
+| `sphere` | radius | Supported | sphere, capsule, box, cylinder, plane |
+| `capsule` | radius, half-length | Supported | sphere, capsule, box, plane |
+| `box` | half-x, half-y, half-z | Supported | sphere, capsule, box, plane |
+| `cylinder` | radius, half-height | Supported | sphere, plane |
+| `plane` | - | Supported | sphere, capsule, box, cylinder |
+| `mesh` | - | Approximate metadata | Not yet resolved |
+| `hfield` | - | Approximate metadata | Not yet resolved |
+
+This table describes the batched Metal `World.step` path. The standalone CPU
+narrow-phase research module implements additional pair functions, but their
+presence does not make those contacts active in GPU simulation. Mesh and
+heightfield conversion currently use placeholder size/inertia data rather than
+loaded collision topology. Supported Metal pairs compose body pose with local
+geom position and orientation; capsule `fromto` supplies its local axis. The
+sphere-cylinder and cylinder-plane implementations use the exact finite,
+oriented cylinder; other cylinder pairings are still outside this boundary.
 
 **Capsule with `fromto`:**
 

@@ -35,6 +35,15 @@ class ZenoEnv:
         Random seed for reproducibility.
     substeps : int
         Number of physics substeps per step() call.
+    zero_copy_outputs : bool
+        Return observation, reward, and done views backed directly by Metal
+        shared memory. Views are overwritten by subsequent steps; copy them
+        before storing transitions. Defaults to False for compatibility.
+    enable_profiling : bool
+        Enable host-side command encoding and synchronization counters.
+    task_config : dict, optional
+        Parameters for the bounded Metal locomotion reward/termination kernel.
+        No task kernel runs when omitted.
 
     Examples
     --------
@@ -55,6 +64,9 @@ class ZenoEnv:
         max_contacts_per_env: int = 64,
         seed: int = 42,
         substeps: int = 1,
+        zero_copy_outputs: bool = False,
+        task_config: Optional[Dict[str, Any]] = None,
+        enable_profiling: bool = False,
     ):
         self._world = ZenoWorld(
             mjcf_path=mjcf_path,
@@ -65,12 +77,16 @@ class ZenoEnv:
             max_contacts_per_env=max_contacts_per_env,
             seed=seed,
             substeps=substeps,
+            enable_profiling=enable_profiling,
         )
 
         self._num_envs = num_envs
         self._step_count = 0
         self._max_episode_steps = 1000
         self._mjcf_path = mjcf_path  # Store for viewer
+        self._zero_copy_outputs = zero_copy_outputs
+        if task_config is not None:
+            self._world.configure_task(**task_config)
 
         # Cache observation and action shapes
         self._obs_shape = (num_envs, self._world.obs_dim)
@@ -125,7 +141,9 @@ class ZenoEnv:
         """
         self._world.reset(mask)
         self._step_count = 0
-        return self._world.get_observations().copy()
+        return self._world.get_observations(
+            zero_copy=self._zero_copy_outputs
+        )
 
     def step(
         self, actions: np.ndarray, substeps: int = 0
@@ -151,19 +169,63 @@ class ZenoEnv:
         info : dict
             Additional information.
         """
-        # Ensure actions are float32 and correct shape
+        self.step_async(actions, substeps)
+        return self.step_wait()
+
+    def step_async(
+        self,
+        actions: np.ndarray,
+        substeps: int = 0,
+        reset_mask: Optional[np.ndarray] = None,
+    ) -> None:
+        """Commit a Metal step, optionally fusing selected resets before it."""
         actions = np.asarray(actions, dtype=np.float32)
         if actions.shape != self._action_shape:
             actions = actions.reshape(self._action_shape)
+        if reset_mask is None:
+            self._world.step_async(actions, substeps)
+        else:
+            self._world.step_with_reset_async(actions, reset_mask, substeps)
 
-        # Step physics
-        self._world.step(actions, substeps)
+    def get_action_buffer(self) -> np.ndarray:
+        """Return the writable Metal shared-memory action array."""
+        return self._world.get_action_buffer()
+
+    def step_current_actions_async(
+        self,
+        substeps: int = 0,
+        reset_mask: Optional[np.ndarray] = None,
+    ) -> None:
+        """Commit a step without copying actions from another NumPy array."""
+        self._world.step_current_actions_async(substeps, reset_mask)
+
+    def step_current_actions(
+        self,
+        substeps: int = 0,
+        reset_mask: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+        """Step synchronously using the writable shared action buffer."""
+        self.step_current_actions_async(substeps, reset_mask)
+        return self.step_wait()
+
+    def step_wait(
+        self,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+        """Wait for the committed step and collect synchronized outputs."""
+        self._world.step_wait()
         self._step_count += 1
 
         # Get results
-        observations = self._world.get_observations().copy()
-        rewards = self._world.get_rewards()
-        dones = self._world.get_dones()
+        observations = self._world.get_observations(
+            zero_copy=self._zero_copy_outputs
+        )
+        rewards = self._world.get_rewards(
+            zero_copy=self._zero_copy_outputs
+        )
+        dones_u8 = self._world.get_dones(
+            zero_copy=self._zero_copy_outputs
+        )
+        dones = dones_u8.view(np.bool_) if self._zero_copy_outputs else dones_u8.astype(bool)
 
         # Check for truncation (max episode steps)
         truncated = np.zeros(self._num_envs, dtype=bool)
@@ -175,7 +237,7 @@ class ZenoEnv:
             "truncated": truncated,
         }
 
-        return observations, rewards, dones.astype(bool), info
+        return observations, rewards, dones, info
 
     def get_body_positions(self) -> np.ndarray:
         """
@@ -204,6 +266,10 @@ class ZenoEnv:
     def close(self) -> None:
         """Release resources."""
         self._world.close()
+
+    def configure_task(self, **kwargs: Any) -> None:
+        """Configure bounded GPU-side reward and termination evaluation."""
+        self._world.configure_task(**kwargs)
 
     def __enter__(self):
         return self

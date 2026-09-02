@@ -87,6 +87,26 @@ const rewards = world.getRewards();   // []f32, length num_envs
 const dones = world.getDones();       // []u8, length num_envs
 ```
 
+Optional reward and termination evaluation can remain in the Metal step:
+
+```zig
+try world.configureTask(.{
+    .enabled = 1,
+    .root_body = 0,
+    .forward_axis = 0,
+    .forward_reward_weight = 1.0,
+    .control_cost_weight = 0.01,
+    .healthy_bonus = 1.0,
+    .healthy_z_min = 0.2,
+    .healthy_z_max = 2.0,
+    .terminate_when_unhealthy = 1,
+    .max_episode_steps = 1000,
+});
+```
+
+This bounded locomotion primitive is configurable Zeno behavior, not automatic
+parity with a named external environment.
+
 ### Body State
 
 ```zig
@@ -119,6 +139,22 @@ for (&mask, 0..) |*m, i| {
 }
 try world.reset(&mask);
 ```
+
+### Shared Action Submission
+
+Callers can write policy output directly into `world.state.getActions()` and
+submit without copying it again:
+
+```zig
+const actions = world.state.getActions();
+policy.writeActions(actions);
+try world.stepCurrentActionsAsync(0);
+try world.waitStep();
+```
+
+Do not access that shared slice while the step is pending. For Gymnasium-style
+reset-before-step, `stepWithResetCurrentActionsAsync(mask, substeps)` prepends a
+compact reset in the same Metal command buffer while preserving these actions.
 
 ## Scene Structure
 

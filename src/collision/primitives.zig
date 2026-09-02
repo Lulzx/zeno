@@ -443,7 +443,8 @@ pub const GeomGPU = extern struct {
 
 // Helper functions
 
-fn normalToQuat(normal: [3]f32) [4]f32 {
+/// Quaternion rotating the local +Z axis onto a direction.
+pub fn normalToQuat(normal: [3]f32) [4]f32 {
     // Convert normal to quaternion that rotates Z-axis to normal
     const z: [3]f32 = .{ 0, 0, 1 };
     const n = normalize(normal);

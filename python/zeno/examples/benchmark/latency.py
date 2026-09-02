@@ -28,6 +28,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=int, default=1000, help="Steps to measure")
     parser.add_argument("--warmup", type=int, default=100, help="Warmup steps")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--zero-copy-outputs", action="store_true", help="Return shared-memory output views")
     return parser
 
 
@@ -41,6 +42,7 @@ def main():
     print(f"Environment: {args.env}")
     print(f"Parallel environments: {args.num_envs}")
     print(f"Measurement steps: {args.steps}")
+    print(f"Zero-copy outputs: {args.zero_copy_outputs}")
     print()
 
     mjcf_path = get_asset(f"{args.env}.xml")
@@ -48,6 +50,7 @@ def main():
         mjcf_path=mjcf_path,
         num_envs=args.num_envs,
         seed=args.seed,
+        zero_copy_outputs=args.zero_copy_outputs,
     )
 
     rng = np.random.default_rng(args.seed)

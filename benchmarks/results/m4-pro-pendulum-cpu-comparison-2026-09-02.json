@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "claim_boundary": "throughput-only; simulator semantics are not matched",
+  "model": "assets/pendulum.xml",
+  "num_envs": 1024,
+  "num_steps": 1000,
+  "warmup_steps": 10,
+  "repeats": 5,
+  "seed": 42,
+  "provenance": {
+    "system": "Darwin",
+    "machine": "arm64",
+    "macos": "26.7",
+    "macos_build": "25G227",
+    "python": "3.13.4",
+    "zig": "0.16.0",
+    "mujoco": "3.12.0",
+    "chip": "Apple M4 Pro",
+    "cpu_configuration": "proc 12:8:4:0",
+    "memory": "24 GB",
+    "gpu": "Apple M4 Pro",
+    "gpu_cores": "16",
+    "metal_family": "spdisplays_metal4"
+  },
+  "zeno_metal": {
+    "samples_seconds": [
+      0.5129198330032523,
+      0.5003753749988391,
+      0.4547470420002355,
+      0.4373663750011474,
+      0.4397032500055502
+    ],
+    "median_seconds": 0.4547470420002355,
+    "min_seconds": 0.4373663750011474,
+    "max_seconds": 0.5129198330032523,
+    "median_env_steps_per_second": 2251801.3432168067,
+    "median_ms_per_batch_step": 0.4547470420002355,
+    "creation_median_seconds": 0.003085541000473313,
+    "observation_dim": 2,
+    "action_dim": 1,
+    "final_output_checksum": 4301.7392578125
+  },
+  "mujoco_sequential_cpu": {
+    "samples_seconds": [
+      2.2801158340007532,
+      2.5242634160022135,
+      2.3092452499986393,
+      2.177536750001309,
+      2.426981791999424
+    ],
+    "median_seconds": 2.3092452499986393,
+    "min_seconds": 2.177536750001309,
+    "max_seconds": 2.5242634160022135,
+    "median_env_steps_per_second": 443434.92749442847,
+    "median_ms_per_batch_step": 2.3092452499986393,
+    "creation_median_seconds": 0.20653045800281689,
+    "nq": 1,
+    "nv": 1,
+    "nu": 1,
+    "final_state_checksum": -0.3681029057773368
+  },
+  "observed_throughput_ratio": 5.078087456800748
+}

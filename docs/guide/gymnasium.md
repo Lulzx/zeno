@@ -16,12 +16,27 @@ env = gym.make("Zeno/Ant-v0")
 
 ## Available Environments
 
-| Environment ID | Model | Actions | Description |
-|----------------|-------|---------|-------------|
-| `Zeno/Pendulum-v0` | pendulum.xml | 1 | Inverted pendulum |
-| `Zeno/Cartpole-v0` | cartpole.xml | 1 | Cart-pole balancing |
-| `Zeno/Ant-v0` | ant.xml | 8 | Quadruped locomotion |
-| `Zeno/Humanoid-v0` | humanoid.xml | 13 | Bipedal humanoid |
+| Environment ID | Model | Actions | Default Metal task |
+|----------------|-------|--------:|--------------------|
+| `Zeno/Pendulum-v0` | pendulum.xml | 1 | None; raw physics |
+| `Zeno/Cartpole-v0` | cartpole.xml | 1 | None; raw physics |
+| `Zeno/Ant-v0` | ant.xml | 8 | Forward/control/health |
+| `Zeno/Humanoid-v0` | humanoid.xml | 13 | Forward/control/health |
+| `Zeno/HalfCheetah-v0` | cheetah.xml | 6 | Forward/control |
+| `Zeno/Hopper-v0` | hopper.xml | 3 | Forward/control/health |
+| `Zeno/Walker2d-v0` | walker.xml | 6 | Forward/control/health |
+| `Zeno/Swimmer-v0` | swimmer.xml | 4 | Forward/control |
+| `Zeno/Reacher-v0` | reacher.xml | 2 | None; raw physics |
+| `Zeno/Pusher-v0` | pusher.xml | 7 | None; raw physics |
+
+The six locomotion presets above run through Zeno's configurable Metal task
+kernel and are enabled for registered IDs and short-name `make_vec()` calls.
+They are Zeno-owned objectives, not replicas of Gymnasium/MuJoCo reward scales,
+termination rules, or benchmark thresholds. Models that need upright-angle or
+target-distance terms remain raw physics until those terms exist natively;
+returning a constant placeholder reward would be misleading. Passing an MJCF
+path also remains raw physics, while an explicit `task_config` overrides a
+short-name preset.
 
 ## Single Environment
 
@@ -92,6 +107,19 @@ for _ in range(10000):
     obs, rewards, terminateds, truncateds, infos = envs.step(actions)
     # No need to manually reset - done automatically
 ```
+
+`ZenoVectorEnv.step_async(actions)` commits native Metal work immediately;
+`step_wait()` synchronizes and performs Gymnasium bookkeeping. This permits
+independent CPU work between the two calls. It is not merely a deferred call to
+the synchronous `step` method, and a second submission is rejected while one is
+pending.
+
+For Gymnasium's `NEXT_STEP` autoreset mode, environments marked done by the
+previous call are reset at the start of the next `step_async`. Zeno encodes that
+compact reset and the following full-batch physics step into one command buffer,
+without a host synchronization between them. Stable-Baselines3 requires reset
+observations in the same return that reports terminal observations, so its
+adapter retains a separate immediate post-step reset to preserve that contract.
 
 ## Integration with RL Libraries
 
@@ -209,11 +237,12 @@ env = gym.make("MyRobot-v0")
 
 3. **Avoid Python loops**: Let Zeno handle the batched computation
 
-4. **Minimize data copies**: The returned arrays are views into GPU memory
+4. **Minimize data copies**: Opt into shared-memory output views when the
+   consumer finishes reading each transition before the next step
 
 ```python
 # Good - native vectorization
-envs = make_vec("ant", num_envs=1024)
+envs = make_vec("ant", num_envs=1024, zero_copy_outputs=True)
 
 # Slower - Python loop overhead
 envs = gym.vector.SyncVectorEnv([

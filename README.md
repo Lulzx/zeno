@@ -15,7 +15,7 @@ The name references Zeno of Elea, whose paradoxes on motion and infinity are fou
 Zeno is a **research engine, not a validated MuJoCo replacement**. Honest framing of where things stand:
 
 - **Solid**: the staged Metal compute pipeline, batched SoA state layout, unified-memory zero-copy access, MJCF loading, Python/Gymnasium bindings, and the XPBD solver skeleton with graph-coloring parallelism.
-- **Implemented but not rigorously validated**: contact stability under stacking, friction behavior, joint drift over long horizons, energy conservation, and agreement with trusted reference simulators. "Runs and looks plausible" is a much lower bar than "production-correct physics," and Zeno has not yet earned the higher one.
+- **Implemented but not broadly validated**: two-sphere stacking, sliding-to-rolling friction, driven Pendulum drift, and collision-free energy proxies now have bounded long-horizon regressions. Larger stacks, other contact shapes and joint graphs, general energy conservation, and agreement with trusted reference simulators remain research work. "Runs and looks plausible" is a much lower bar than "production-correct physics," and Zeno has not yet earned the higher one.
 - **Experimental**: soft bodies (PBD cloth/volumetric), SPH fluids, PBR materials/rendering, tendons, and the swarm platform. These exist behind the Zig API and have unit tests, but should be treated as prototypes.
 
 If you need physics you can trust unconditionally today, use MuJoCo. If you want high-throughput batched rollouts on a Mac and can tolerate a young engine, Zeno is for you.
@@ -25,14 +25,14 @@ If you need physics you can trust unconditionally today, use MuJoCo. If you want
 ### Core Engine
 - **Native Metal Compute** — Hand-written MSL shaders, staged compute pipeline (actions → forces → integrate → collision → constraint solve → sensors)
 - **Unified Memory** — Zero-copy CPU↔GPU via Apple Silicon shared memory
-- **Batched Simulation** — 1,024 to 16,384+ parallel environments
+- **Batched Simulation** — full `World.step` verified from 64 through 16,384 parallel environments
 - **SoA Memory Layout** — float4-aligned, coalesced GPU access
 
 ### Physics
 - **Rigid Body Dynamics** — Semi-implicit Euler integration, quaternion rotations with renormalization
 - **XPBD Constraint Solver** — Extended Position-Based Dynamics with graph coloring for race-free parallel solving
 - **Joint Constraints** — Fixed, revolute, prismatic, ball, free, universal joints
-- **Collision Detection** — Spatial hashing broad phase, GJK+EPA for convex hulls, sphere/capsule/box/plane/mesh/heightfield primitives
+- **Collision Detection** — Metal spatial-hash broad phase with complete verified sphere/capsule/box/plane pair coverage, including oriented box SAT, plus exact sphere-cylinder and cylinder-plane contacts used by the bundled Pusher model; other cylinder pairs, meshes, and heightfields remain outside the GPU contact boundary
 - **Contact Resolution** — XPBD contact solver with warm starting and contact caching for temporal coherence
 - **Adaptive Substeps** — Dynamic substep adjustment based on constraint violation
 
@@ -51,18 +51,40 @@ If you need physics you can trust unconditionally today, use MuJoCo. If you want
 
 ## Performance
 
-**What these numbers are:** wall-clock throughput of Zeno's own pipeline on its supported workload subset, measured on an Apple M4 Pro (14-core CPU, 20-core GPU). They are **not** a semantics-matched comparison with MuJoCo: MuJoCo does richer physics per step (different solver, contact model, and numerical tolerances), and Zeno's benchmark harness includes simplified kernel paths. A GPU engine stepping thousands of simplified environments will always look dramatically faster than a CPU engine doing more work per step — treat cross-simulator ratios as throughput ratios, not physics-equivalence claims.
+**What these numbers are:** wall-clock throughput of Zeno's own pipeline on its supported workload subset, measured on an Apple M4 Pro (12-core CPU, 16-core GPU, 24 GiB unified memory). They are **not** a semantics-matched comparison with MuJoCo: MuJoCo does richer physics per step (different solver, contact model, and numerical tolerances). A GPU engine stepping thousands of simplified environments will always look dramatically faster than a CPU engine doing more work per step — treat cross-simulator ratios as throughput ratios, not physics-equivalence claims.
 
 ### Engine pipeline throughput (real MJCF models, full `World.step`)
 
 | Environment | 1024 envs × 1000 steps | Throughput |
 |-------------|------------------------|-----------------|
-| Pendulum    | 345 ms                 | 2.97M steps/sec |
-| Cartpole    | 375 ms                 | 2.73M steps/sec |
-| Ant         | 699 ms                 | 1.47M steps/sec |
-| Humanoid    | 1367 ms                | 0.75M steps/sec |
+| Pendulum    | 416 ms                 | 2.46M steps/sec |
+| Cartpole    | 409 ms                 | 2.50M steps/sec |
+| Pusher      | 741 ms                 | 1.38M steps/sec |
+| Ant         | 712 ms                 | 1.44M steps/sec |
+| Humanoid    | 3,014 ms               | 0.34M steps/sec |
 
-Medians of 5 runs. Throughput is lower than earlier published figures because those were measured while broad-phase collision bugs were skipping work; the corrected pipeline does the collision passes it previously dropped. Note these timers measure CPU encode time rather than GPU execution, so treat them as pipeline-throughput indicators, not device-utilization numbers.
+Medians of 5 runs on September 2, 2026 using macOS 26.7 (25G227) and Zig 0.16.0. Throughput is lower than earlier published figures because those were measured while broad-phase and narrow-phase bugs were skipping work. The table includes synchronous GPU completion; the optional per-stage profiler measures CPU command-encoding time rather than GPU stage duration.
+
+A separate same-machine, five-repeat Pendulum experiment measured 2.252M
+environment-steps/s through Zeno's batched Metal Python API and 0.443M through
+a sequential MuJoCo CPU loop, an observed throughput ratio of 5.08×. This is a
+comparison of execution strategies, not a matched-semantics simulator speedup.
+The full samples and provenance are in
+[`benchmarks/results/m4-pro-pendulum-cpu-comparison-2026-09-02.json`](benchmarks/results/m4-pro-pendulum-cpu-comparison-2026-09-02.json).
+
+### Full-engine Ant scaling
+
+| Environments | Batch-step latency | Throughput | Reported state memory |
+|-------------:|-------------------:|-----------:|----------------------:|
+| 64 | 0.326 ms | 0.196M steps/sec | 0.4 MB |
+| 256 | 0.448 ms | 0.571M steps/sec | 1.5 MB |
+| 1,024 | 0.712 ms | 1.44M steps/sec | 6.0 MB |
+| 4,096 | 0.940 ms | 4.36M steps/sec | 24.0 MB |
+| 16,384 | 3.129 ms | 5.24M steps/sec | 95.9 MB |
+
+These are the complete `World.step` path, not the synthetic kernels below. All
+five sorted samples and configuration are stored in
+[`benchmarks/results/m4-pro-full-world-scaling-2026-09-02.json`](benchmarks/results/m4-pro-full-world-scaling-2026-09-02.json).
 
 ### Scaling (synthetic GPU benchmark)
 
@@ -287,6 +309,25 @@ positions = env.get_body_positions()          # Get body positions
 quaternions = env.get_body_quaternions()      # Get body orientations
 ```
 
+The same step can be committed immediately with `env.step_async(actions)` and
+synchronized later with `env.step_wait()`, allowing independent CPU work to
+overlap Metal execution. One step may be in flight per world.
+
+For policies that can target an existing NumPy destination,
+`env.get_action_buffer()` returns the writable unified-memory action array and
+`env.step_current_actions_async()` submits it without another staging copy.
+The view must not be accessed until `step_wait()` completes.
+
+An optional `task_config={...}` keeps a bounded locomotion reward, health
+termination, and episode horizon in the Metal command stream. It is disabled
+by default and does not imply reward parity with Gymnasium/MuJoCo tasks.
+
+Registered and short-name Gymnasium locomotion environments use explicit
+Zeno-owned Metal presets for Ant, Humanoid, HalfCheetah, Hopper, Walker2d, and
+Swimmer. Pendulum, Cartpole, Reacher, Pusher, direct `ZenoEnv`, and MJCF-path
+calls remain raw physics unless given `task_config`; no external reward
+thresholds or reference-task equivalence are claimed.
+
 ### C API
 
 ```c
@@ -295,8 +336,13 @@ ZenoWorldHandle zeno_world_create(const char* mjcf_path, const ZenoConfig* confi
 void zeno_world_destroy(ZenoWorldHandle world);
 
 // Simulation
-void zeno_world_step(ZenoWorldHandle world, const float* actions, uint32_t substeps);
-void zeno_world_reset(ZenoWorldHandle world, const uint8_t* env_mask);
+ZenoError zeno_world_step(ZenoWorldHandle world, const float* actions, uint32_t substeps);
+ZenoError zeno_world_step_async(ZenoWorldHandle world, const float* actions, uint32_t substeps);
+ZenoError zeno_world_step_current_actions_async(ZenoWorldHandle world, uint32_t substeps);
+ZenoError zeno_world_step_with_reset_async(ZenoWorldHandle world, const float* actions, const uint8_t* reset_mask, uint32_t substeps);
+ZenoError zeno_world_step_with_reset_current_actions_async(ZenoWorldHandle world, const uint8_t* reset_mask, uint32_t substeps);
+ZenoError zeno_world_step_wait(ZenoWorldHandle world);
+ZenoError zeno_world_reset(ZenoWorldHandle world, const uint8_t* env_mask);
 
 // State access (zero-copy pointers)
 float* zeno_world_get_observations(ZenoWorldHandle world);
@@ -359,8 +405,8 @@ Parsing an element is not the same as matching MuJoCo's runtime semantics for it
 zig build bench
 
 # Run Python comparison
-python benchmarks/compare_mujoco.py --envs 1024 --steps 1000
-python benchmarks/validate_physics.py
+PYTHONPATH=python python3 benchmarks/compare_mujoco.py --envs 1024 --steps 1000
+PYTHONPATH=python python3 benchmarks/validate_physics.py
 ```
 
 The benchmark suite currently mixes four different kinds of measurement; be careful which one you cite:

@@ -94,13 +94,14 @@ zig build bench
 
 # Python comparison with MuJoCo
 pip install mujoco  # Optional, for comparison
-python benchmarks/compare_mujoco.py --envs 1024 --steps 1000
+PYTHONPATH=python python3 benchmarks/compare_mujoco.py --envs 1024 --steps 1000
 ```
 
-The comparison reports a same-machine throughput ratio. It is not a simulator
+The comparison reports five samples, their median and range, fixed-seed
+configuration, and non-sensitive machine provenance. It is not a simulator
 speedup or physics-parity claim because model and solver semantics are not
-matched. Use `python benchmarks/validate_physics.py` for the bounded ballistic
-trajectory validation.
+matched. Use `PYTHONPATH=python python3 benchmarks/validate_physics.py` for the
+bounded ballistic trajectory validation.
 
 ## Troubleshooting
 

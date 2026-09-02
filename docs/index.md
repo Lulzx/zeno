@@ -34,7 +34,7 @@ Zeno is a GPU-accelerated rigid body physics simulation engine optimized for rei
 
 ## Features
 
-- **Collision Primitives**: Sphere, capsule, box, cylinder, plane, mesh, heightfield
+- **Collision Geometry Parsing**: Sphere, capsule, box, cylinder, plane, mesh, heightfield; Metal `World.step` has complete sphere/capsule/box/plane pair coverage plus sphere-cylinder and cylinder-plane, while other cylinder pairs, meshes, and heightfields are not resolved
 - **Joint Types**: Free, ball, hinge, slide, fixed, universal
 - **Tendons**: Fixed and spatial tendons with spring behavior
 - **Equality Constraints**: Weld, connect, joint, tendon constraints
@@ -50,16 +50,17 @@ Benchmarked on Apple M4 Pro with real MJCF models (full `World.step`, medians of
 
 | Environment | 1024 envs × 1000 steps | Throughput |
 |-------------|------------------------|-----------------|
-| Pendulum    | 345 ms  | 2.97M steps/sec |
-| Cartpole    | 375 ms  | 2.73M steps/sec |
-| Ant         | 699 ms  | 1.47M steps/sec |
-| Humanoid    | 1367 ms | 0.75M steps/sec |
+| Pendulum    | 416 ms  | 2.46M steps/sec |
+| Cartpole    | 409 ms  | 2.50M steps/sec |
+| Pusher      | 741 ms  | 1.38M steps/sec |
+| Ant         | 712 ms  | 1.44M steps/sec |
+| Humanoid    | 3,014 ms | 0.34M steps/sec |
 
 These are wall-clock throughput figures for Zeno's own pipeline, **not** a semantics-matched
 comparison against MuJoCo — Zeno does simplified per-step physics, so cross-simulator ratios
-would measure throughput, not physics equivalence. The timers also measure CPU encode time
-rather than GPU execution. A matched-semantics MuJoCo parity benchmark is planned but does not
-exist yet.
+would measure throughput, not physics equivalence. These table values include synchronous GPU
+completion; the optional per-stage profiler measures CPU encode time rather than GPU duration.
+A matched-semantics MuJoCo parity benchmark is planned but does not exist yet.
 
 ## Quick Example
 

@@ -13,6 +13,7 @@ Features
 - Stable-Baselines3 compatibility
 """
 
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
@@ -44,54 +45,129 @@ ENV_CONFIGS = {
     "Pendulum": {
         "mjcf_file": "pendulum.xml",
         "max_episode_steps": 200,
-        "reward_threshold": -200.0,
     },
     "Cartpole": {
         "mjcf_file": "cartpole.xml",
         "max_episode_steps": 500,
-        "reward_threshold": 475.0,
     },
     "Ant": {
         "mjcf_file": "ant.xml",
         "max_episode_steps": 1000,
-        "reward_threshold": 6000.0,
     },
     "Humanoid": {
         "mjcf_file": "humanoid.xml",
         "max_episode_steps": 1000,
-        "reward_threshold": 6000.0,
     },
     "HalfCheetah": {
         "mjcf_file": "cheetah.xml",
         "max_episode_steps": 1000,
-        "reward_threshold": 4800.0,
     },
     "Hopper": {
         "mjcf_file": "hopper.xml",
         "max_episode_steps": 1000,
-        "reward_threshold": 3800.0,
     },
     "Walker2d": {
         "mjcf_file": "walker.xml",
         "max_episode_steps": 1000,
-        "reward_threshold": 5000.0,
     },
     "Swimmer": {
         "mjcf_file": "swimmer.xml",
         "max_episode_steps": 1000,
-        "reward_threshold": 360.0,
     },
     "Reacher": {
         "mjcf_file": "reacher.xml",
         "max_episode_steps": 50,
-        "reward_threshold": -3.75,
     },
     "Pusher": {
         "mjcf_file": "pusher.xml",
         "max_episode_steps": 100,
-        "reward_threshold": 0.0,
     },
 }
+
+
+# Zeno-owned task presets whose semantics fit the current Metal task kernel.
+# They are deliberately not copies of Gymnasium/MuJoCo rewards. Body 0 is the
+# static world body in Zeno's MJCF importer, so locomotion roots are body 1.
+# Episode horizons stay in the wrappers so Gymnasium reports truncation rather
+# than incorrectly converting a time limit into native termination.
+TASK_PRESETS = {
+    "ant.xml": {
+        "root_body": 1,
+        "forward_axis": 0,
+        "forward_reward_weight": 1.0,
+        "control_cost_weight": 0.01,
+        "healthy_bonus": 1.0,
+        "healthy_z_min": 0.2,
+        "healthy_z_max": 1.0,
+        "terminate_when_unhealthy": True,
+    },
+    "humanoid.xml": {
+        "root_body": 1,
+        "forward_axis": 0,
+        "forward_reward_weight": 1.0,
+        "control_cost_weight": 0.01,
+        "healthy_bonus": 1.0,
+        "healthy_z_min": 0.8,
+        "healthy_z_max": 2.0,
+        "terminate_when_unhealthy": True,
+    },
+    "cheetah.xml": {
+        "root_body": 1,
+        "forward_axis": 0,
+        "forward_reward_weight": 1.0,
+        "control_cost_weight": 0.05,
+        "healthy_z_min": -1.0e30,
+        "healthy_z_max": 1.0e30,
+    },
+    "hopper.xml": {
+        "root_body": 1,
+        "forward_axis": 0,
+        "forward_reward_weight": 1.0,
+        "control_cost_weight": 0.01,
+        "healthy_bonus": 1.0,
+        "healthy_z_min": 0.7,
+        "healthy_z_max": 2.0,
+        "terminate_when_unhealthy": True,
+    },
+    "walker.xml": {
+        "root_body": 1,
+        "forward_axis": 0,
+        "forward_reward_weight": 1.0,
+        "control_cost_weight": 0.01,
+        "healthy_bonus": 1.0,
+        "healthy_z_min": 0.8,
+        "healthy_z_max": 2.0,
+        "terminate_when_unhealthy": True,
+    },
+    "swimmer.xml": {
+        "root_body": 1,
+        "forward_axis": 0,
+        "forward_reward_weight": 1.0,
+        "control_cost_weight": 0.0001,
+        "healthy_z_min": -1.0e30,
+        "healthy_z_max": 1.0e30,
+    },
+}
+
+
+def _resolve_model_path(model: str) -> Path:
+    """Resolve repository, wheel-bundled, and user-cache MJCF assets."""
+    path = Path(model)
+    if path.exists():
+        return path
+
+    filename = path.name if path.suffix == ".xml" else f"{path.name}.xml"
+    asset_dirs = [
+        Path(__file__).parent.parent / "assets",  # Installed wheel
+        Path(__file__).parent.parent.parent.parent / "assets",  # Checkout
+        Path.cwd() / "assets",
+        Path.home() / ".zeno" / "assets",
+    ]
+    for asset_dir in asset_dirs:
+        candidate = asset_dir / filename
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Could not find model: {model}")
 
 
 class ZenoGymnasiumEnv(gym.Env if HAS_GYMNASIUM else object):
@@ -151,8 +227,9 @@ class ZenoGymnasiumEnv(gym.Env if HAS_GYMNASIUM else object):
 
         # Force single environment
         kwargs["num_envs"] = 1
-        self._env = ZenoEnv(mjcf_path=mjcf_path, **kwargs)
-        self._mjcf_path = mjcf_path
+        resolved_path = _resolve_model_path(mjcf_path)
+        self._env = ZenoEnv(mjcf_path=str(resolved_path), **kwargs)
+        self._mjcf_path = str(resolved_path)
         self.render_mode = render_mode
         self._max_episode_steps = max_episode_steps
         self._elapsed_steps = 0
@@ -188,6 +265,11 @@ class ZenoGymnasiumEnv(gym.Env if HAS_GYMNASIUM else object):
     def spec(self) -> Optional['EnvSpec']:
         """Return the environment spec."""
         return getattr(self, '_spec', None)
+
+    @spec.setter
+    def spec(self, value: Optional['EnvSpec']) -> None:
+        """Allow Gymnasium to attach its runtime environment specification."""
+        self._spec = value
 
     def reset(
         self,
@@ -480,7 +562,7 @@ class ZenoVectorEnv(VectorEnv if HAS_GYMNASIUM else object):
             "_elapsed_steps": self._elapsed_steps.copy(),
         }
 
-        return obs.astype(np.float32), infos
+        return obs.astype(np.float32, copy=False), infos
 
     def step(
         self, actions: np.ndarray
@@ -506,21 +588,21 @@ class ZenoVectorEnv(VectorEnv if HAS_GYMNASIUM else object):
         infos : dict
             Dictionary of info arrays.
         """
-        actions = np.asarray(actions, dtype=np.float32)
+        self.step_async(actions)
+        return self.step_wait()
 
-        # Auto-reset environments that were done last step
-        if np.any(self._autoreset_envs):
-            # Store final observations before reset
-            self._env.reset(self._autoreset_envs.astype(np.uint8))
-            self._elapsed_steps[self._autoreset_envs] = 0
-            self._autoreset_envs[:] = False
-
-        # Step physics
-        obs, rewards, dones, env_info = self._env.step(actions)
+    def _finish_step(
+        self,
+        obs: np.ndarray,
+        rewards: np.ndarray,
+        dones: np.ndarray,
+        env_info: Dict[str, Any],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+        """Apply Gymnasium bookkeeping after native GPU synchronization."""
         self._elapsed_steps += 1
 
         # Determine termination/truncation
-        terminated = dones.astype(bool)
+        terminated = dones.astype(bool, copy=False)
         truncated = self._elapsed_steps >= self._max_episode_steps
 
         # Mark for auto-reset
@@ -541,8 +623,8 @@ class ZenoVectorEnv(VectorEnv if HAS_GYMNASIUM else object):
                 infos["final_info"][i] = {"episode_step": int(self._elapsed_steps[i])}
 
         return (
-            obs.astype(np.float32),
-            rewards.astype(np.float32),
+            obs.astype(np.float32, copy=False),
+            rewards.astype(np.float32, copy=False),
             terminated,
             truncated,
             infos
@@ -553,7 +635,7 @@ class ZenoVectorEnv(VectorEnv if HAS_GYMNASIUM else object):
         seed: Optional[Union[int, List[int]]] = None,
         options: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Async reset (immediate for Zeno as it's GPU-native)."""
+        """Store reset parameters for Gymnasium's reset_wait contract."""
         self._pending_reset = True
         self._reset_seed = seed
         self._reset_options = options
@@ -571,8 +653,17 @@ class ZenoVectorEnv(VectorEnv if HAS_GYMNASIUM else object):
         return self.reset(seed=seed, options=options)
 
     def step_async(self, actions: np.ndarray) -> None:
-        """Async step (stores actions for step_wait)."""
-        self._pending_actions = np.asarray(actions, dtype=np.float32)
+        """Reset pending episodes, then commit physics before returning."""
+        if self._pending_actions is not None:
+            raise RuntimeError("step_async called while another step is pending")
+        actions = np.asarray(actions, dtype=np.float32)
+        reset_mask = None
+        if np.any(self._autoreset_envs):
+            reset_mask = self._autoreset_envs.astype(np.uint8)
+            self._elapsed_steps[self._autoreset_envs] = 0
+            self._autoreset_envs[:] = False
+        self._env.step_async(actions, reset_mask=reset_mask)
+        self._pending_actions = actions
 
     def step_wait(
         self, timeout: Optional[float] = None
@@ -580,9 +671,11 @@ class ZenoVectorEnv(VectorEnv if HAS_GYMNASIUM else object):
         """Wait for async step to complete."""
         if self._pending_actions is None:
             raise RuntimeError("step_async must be called before step_wait")
-        result = self.step(self._pending_actions)
-        self._pending_actions = None
-        return result
+        try:
+            result = self._env.step_wait()
+        finally:
+            self._pending_actions = None
+        return self._finish_step(*result)
 
     def call(self, name: str, *args, **kwargs) -> Tuple[Any, ...]:
         """Call a method on all environments."""
@@ -644,8 +737,6 @@ def register_envs() -> None:
     if not HAS_GYMNASIUM:
         return
 
-    from pathlib import Path
-
     for env_name, config in ENV_CONFIGS.items():
         env_id = f"Zeno/{env_name}-v0"
 
@@ -653,9 +744,11 @@ def register_envs() -> None:
             gym.register(
                 id=env_id,
                 entry_point="zeno.gym.registration:ZenoGymnasiumEnv",
-                kwargs={"mjcf_path": config["mjcf_file"]},
+                kwargs={
+                    "mjcf_path": config["mjcf_file"],
+                    "task_config": TASK_PRESETS.get(config["mjcf_file"]),
+                },
                 max_episode_steps=config["max_episode_steps"],
-                reward_threshold=config.get("reward_threshold"),
             )
         except gym.error.Error:
             # Already registered
@@ -694,29 +787,16 @@ def make_vec(
     >>> obs, info = envs.reset()
     >>> print(obs.shape)  # (1024, obs_dim)
     """
-    from pathlib import Path
-
-    # Find MJCF file
+    # A recognized short model name opts into an explicit Zeno task preset.
+    # Passing a path remains a raw-physics operation unless task_config is set.
     path = Path(model)
-    if not path.exists():
-        asset_dirs = [
-            Path(__file__).parent.parent / "assets",  # Installed wheel
-            Path(__file__).parent.parent.parent.parent / "assets",
-            Path.cwd() / "assets",
-            Path.home() / ".zeno" / "assets",
-        ]
+    named_model = not path.exists()
+    path = _resolve_model_path(model)
 
-        if not model.endswith(".xml"):
-            model = f"{model}.xml"
-
-        for asset_dir in asset_dirs:
-            asset_path = asset_dir / model
-            if asset_path.exists():
-                path = asset_path
-                break
-
-    if not path.exists():
-        raise FileNotFoundError(f"Could not find model: {model}")
+    if named_model and "task_config" not in kwargs:
+        preset = TASK_PRESETS.get(path.name)
+        if preset is not None:
+            kwargs["task_config"] = dict(preset)
 
     return ZenoVectorEnv(mjcf_path=str(path), num_envs=num_envs, **kwargs)
 

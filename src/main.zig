@@ -135,6 +135,22 @@ pub const ZenoProfilingData = extern struct {
     num_active_constraints: u32 = 0,
 };
 
+/// Bounded GPU-side locomotion reward and termination configuration.
+pub const ZenoTaskConfig = extern struct {
+    enabled: u32 = 0,
+    root_body: u32 = 0,
+    forward_axis: u32 = 0,
+    max_episode_steps: u32 = 0,
+    forward_reward_weight: f32 = 0,
+    control_cost_weight: f32 = 0,
+    healthy_bonus: f32 = 0,
+    healthy_z_min: f32 = 0,
+    healthy_z_max: f32 = 0,
+    terminate_when_unhealthy: u32 = 0,
+    _pad0: u32 = 0,
+    _pad1: u32 = 0,
+};
+
 /// Error codes.
 pub const ZenoError = enum(i32) {
     success = 0,
@@ -145,7 +161,20 @@ pub const ZenoError = enum(i32) {
     out_of_memory = -5,
     invalid_argument = -6,
     not_implemented = -7,
+    step_pending = -8,
+    no_pending_step = -9,
+    execution_failed = -10,
 };
+
+fn mapWorldError(err: anyerror) ZenoError {
+    return switch (err) {
+        error.InvalidSize, error.InvalidTaskConfig => .invalid_argument,
+        error.StepPending => .step_pending,
+        error.NoPendingStep => .no_pending_step,
+        error.ExecutionFailed => .execution_failed,
+        else => .metal_error,
+    };
+}
 
 // Global allocator for C API
 var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -261,9 +290,7 @@ export fn zeno_world_step(
     const action_count = world_ptr.config.num_envs * world_ptr.params.num_actuators;
     const actions_slice = actions[0..action_count];
 
-    world_ptr.step(actions_slice, substeps) catch {
-        return .metal_error;
-    };
+    world_ptr.step(actions_slice, substeps) catch |err| return mapWorldError(err);
 
     return .success;
 }
@@ -282,14 +309,99 @@ export fn zeno_world_step_subset(
     const actions_slice = actions[0..action_count];
     const mask_slice = env_mask[0..world_ptr.config.num_envs];
 
-    world_ptr.stepSubset(actions_slice, mask_slice, substeps) catch |err| {
-        return switch (err) {
-            error.InvalidSize => .invalid_argument,
-            else => .metal_error,
-        };
-    };
+    world_ptr.stepSubset(actions_slice, mask_slice, substeps) catch |err| return mapWorldError(err);
 
     return .success;
+}
+
+/// Encode and commit a simulation step, returning before GPU completion.
+export fn zeno_world_step_async(
+    handle: ZenoWorldHandle,
+    actions: [*]const f32,
+    substeps: u32,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    const action_count = world_ptr.config.num_envs * world_ptr.params.num_actuators;
+    world_ptr.stepAsync(actions[0..action_count], substeps) catch |err| return mapWorldError(err);
+    return .success;
+}
+
+/// Commit a step using actions already present in the shared Metal buffer.
+export fn zeno_world_step_current_actions_async(
+    handle: ZenoWorldHandle,
+    substeps: u32,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    world_ptr.stepCurrentActionsAsync(substeps) catch |err| return mapWorldError(err);
+    return .success;
+}
+
+/// Reset selected environments, then step the full batch in one submission.
+export fn zeno_world_step_with_reset_async(
+    handle: ZenoWorldHandle,
+    actions: [*]const f32,
+    reset_mask: [*]const u8,
+    substeps: u32,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    const action_count = world_ptr.config.num_envs * world_ptr.params.num_actuators;
+    world_ptr.stepWithResetAsync(
+        actions[0..action_count],
+        reset_mask[0..world_ptr.config.num_envs],
+        substeps,
+    ) catch |err| return mapWorldError(err);
+    return .success;
+}
+
+/// Fused reset/full-step using actions already in the shared Metal buffer.
+export fn zeno_world_step_with_reset_current_actions_async(
+    handle: ZenoWorldHandle,
+    reset_mask: [*]const u8,
+    substeps: u32,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    world_ptr.stepWithResetCurrentActionsAsync(
+        reset_mask[0..world_ptr.config.num_envs],
+        substeps,
+    ) catch |err| return mapWorldError(err);
+    return .success;
+}
+
+/// Encode and commit a compact subset step without waiting.
+export fn zeno_world_step_subset_async(
+    handle: ZenoWorldHandle,
+    actions: [*]const f32,
+    env_mask: [*]const u8,
+    substeps: u32,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    const action_count = world_ptr.config.num_envs * world_ptr.params.num_actuators;
+    world_ptr.stepSubsetAsync(
+        actions[0..action_count],
+        env_mask[0..world_ptr.config.num_envs],
+        substeps,
+    ) catch |err| return mapWorldError(err);
+    return .success;
+}
+
+/// Wait for the in-flight step and publish synchronized shared-memory state.
+export fn zeno_world_step_wait(handle: ZenoWorldHandle) ZenoError {
+    if (handle == null) return .invalid_handle;
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    world_ptr.waitStep() catch |err| return mapWorldError(err);
+    return .success;
+}
+
+/// Whether this world owns an in-flight Metal step.
+export fn zeno_world_step_pending(handle: ZenoWorldHandle) bool {
+    if (handle == null) return false;
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.hasPendingStep();
 }
 
 /// Reset environments.
@@ -303,11 +415,34 @@ export fn zeno_world_reset(
 
     if (env_mask) |mask| {
         const mask_slice = mask[0..world_ptr.config.num_envs];
-        world_ptr.reset(mask_slice);
+        world_ptr.reset(mask_slice) catch |err| return mapWorldError(err);
     } else {
-        world_ptr.reset(null);
+        world_ptr.reset(null) catch |err| return mapWorldError(err);
     }
 
+    return .success;
+}
+
+/// Configure or disable GPU-side reward and termination evaluation.
+export fn zeno_world_configure_task(
+    handle: ZenoWorldHandle,
+    config: *const ZenoTaskConfig,
+) ZenoError {
+    if (handle == null) return .invalid_handle;
+
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    world_ptr.configureTask(.{
+        .enabled = config.enabled,
+        .root_body = config.root_body,
+        .forward_axis = config.forward_axis,
+        .max_episode_steps = config.max_episode_steps,
+        .forward_reward_weight = config.forward_reward_weight,
+        .control_cost_weight = config.control_cost_weight,
+        .healthy_bonus = config.healthy_bonus,
+        .healthy_z_min = config.healthy_z_min,
+        .healthy_z_max = config.healthy_z_max,
+        .terminate_when_unhealthy = config.terminate_when_unhealthy,
+    }) catch |err| return mapWorldError(err);
     return .success;
 }
 
@@ -323,6 +458,7 @@ export fn zeno_world_reset_to_state(
     if (handle == null) return .invalid_handle;
 
     const world_ptr: *World = @ptrCast(@alignCast(handle));
+    if (world_ptr.hasPendingStep()) return .step_pending;
     const num_envs: usize = @intCast(world_ptr.config.num_envs);
     const num_bodies: usize = @intCast(world_ptr.params.num_bodies);
     const total_floats = num_envs * num_bodies * 4;
@@ -415,6 +551,13 @@ export fn zeno_world_get_observations(handle: ZenoWorldHandle) ?[*]f32 {
 
     const world_ptr: *World = @ptrCast(@alignCast(handle));
     return world_ptr.getObservationsPtr();
+}
+
+/// Get writable pointer to the unified-memory action buffer.
+export fn zeno_world_get_actions(handle: ZenoWorldHandle) ?[*]f32 {
+    if (handle == null) return null;
+    const world_ptr: *World = @ptrCast(@alignCast(handle));
+    return world_ptr.getActionsPtr();
 }
 
 /// Get pointer to rewards buffer.
@@ -513,6 +656,7 @@ export fn zeno_world_get_body_positions(handle: ZenoWorldHandle) ?[*]f32 {
     if (handle == null) return null;
 
     const world_ptr: *World = @ptrCast(@alignCast(handle));
+    if (world_ptr.hasPendingStep()) return null;
     const positions = world_ptr.getBodyPositions();
     if (positions.len == 0) return null;
 
@@ -524,6 +668,7 @@ export fn zeno_world_get_body_quaternions(handle: ZenoWorldHandle) ?[*]f32 {
     if (handle == null) return null;
 
     const world_ptr: *World = @ptrCast(@alignCast(handle));
+    if (world_ptr.hasPendingStep()) return null;
     const quats = world_ptr.getBodyQuaternions();
     if (quats.len == 0) return null;
 
@@ -575,6 +720,7 @@ export fn zeno_world_get_joint_forces(handle: ZenoWorldHandle) ?[*]f32 {
     if (handle == null) return null;
 
     const world_ptr: *World = @ptrCast(@alignCast(handle));
+    if (world_ptr.hasPendingStep()) return null;
     const slice = world_ptr.state.joint_torques_buffer.getSlice(f32);
     if (slice.len == 0) return null;
     return slice.ptr;
@@ -624,9 +770,7 @@ export fn zeno_world_set_body_positions(
         mask_slice = m[0..world_ptr.config.num_envs];
     }
 
-    world_ptr.setBodyPositions(pos_slice, mask_slice) catch {
-        return .metal_error;
-    };
+    world_ptr.setBodyPositions(pos_slice, mask_slice) catch |err| return mapWorldError(err);
 
     return .success;
 }
@@ -649,9 +793,7 @@ export fn zeno_world_set_body_velocities(
         mask_slice = m[0..world_ptr.config.num_envs];
     }
 
-    world_ptr.setBodyVelocities(vel_slice, mask_slice) catch {
-        return .metal_error;
-    };
+    world_ptr.setBodyVelocities(vel_slice, mask_slice) catch |err| return mapWorldError(err);
 
     return .success;
 }
@@ -666,6 +808,7 @@ export fn zeno_world_set_gravity(
     if (handle == null) return .invalid_handle;
 
     const world_ptr: *World = @ptrCast(@alignCast(handle));
+    if (world_ptr.hasPendingStep()) return .step_pending;
     world_ptr.params.gravity_x = gx;
     world_ptr.params.gravity_y = gy;
     world_ptr.params.gravity_z = gz;
@@ -682,6 +825,7 @@ export fn zeno_world_set_timestep(
     if (timestep <= 0) return .invalid_argument;
 
     const world_ptr: *World = @ptrCast(@alignCast(handle));
+    if (world_ptr.hasPendingStep()) return .step_pending;
     world_ptr.config.timestep = timestep;
     const substeps = @max(world_ptr.config.substeps, 1);
     world_ptr.params.dt = timestep / @as(f32, @floatFromInt(substeps));
@@ -696,6 +840,7 @@ export fn zeno_world_get_profiling(
 ) ZenoError {
     if (handle == null) return .invalid_handle;
     const world_ptr: *World = @ptrCast(@alignCast(handle));
+    if (world_ptr.hasPendingStep()) return .step_pending;
     const profiling = world_ptr.getProfilingData();
     data.* = .{
         .integrate_ns = profiling.integrate_ns,
@@ -740,6 +885,9 @@ export fn zeno_error_string(error_code: i32) [*:0]const u8 {
         -5 => "out of memory",
         -6 => "invalid argument",
         -7 => "not implemented",
+        -8 => "step already pending",
+        -9 => "no pending step",
+        -10 => "GPU execution failed",
         else => "unknown error",
     };
 }

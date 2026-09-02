@@ -450,6 +450,111 @@ class TestGymnasiumAPI:
         finally:
             env.close()
 
+    def test_named_ant_vector_uses_explicit_zeno_metal_task_preset(self):
+        _skip_if_no_lib()
+        if not _has_gymnasium():
+            pytest.skip("gymnasium is not installed")
+        from zeno.gym import make_vec
+
+        env = make_vec("ant", num_envs=4, max_episode_steps=2)
+        try:
+            env.reset()
+            actions = np.zeros((4, env.single_action_space.shape[0]), dtype=np.float32)
+            _, rewards, terminated, truncated, _ = env.step(actions)
+            assert np.all(np.isfinite(rewards))
+            assert np.all(rewards > 0.5)
+            assert not terminated.any()
+            assert not truncated.any()
+
+            _, _, terminated, truncated, _ = env.step(actions)
+            # The wrapper owns the horizon: it must be truncation, not native
+            # task termination from the GPU done buffer.
+            assert not terminated.any()
+            assert truncated.all()
+        finally:
+            env.close()
+
+    def test_registered_ant_resolves_asset_and_uses_task_preset(self):
+        _skip_if_no_lib()
+        gymnasium = pytest.importorskip("gymnasium")
+        import zeno.gym  # noqa: F401 - triggers registration
+
+        env = gymnasium.make("Zeno/Ant-v0")
+        try:
+            observation, _ = env.reset()
+            observation, reward, terminated, truncated, _ = env.step(
+                np.zeros(env.action_space.shape, dtype=np.float32)
+            )
+            assert observation.shape == env.observation_space.shape
+            assert np.isfinite(reward)
+            assert reward > 0.5
+            assert not terminated
+            assert not truncated
+        finally:
+            env.close()
+
+    def test_model_path_remains_raw_physics_without_implicit_task(self):
+        _skip_if_no_lib()
+        if not _has_gymnasium():
+            pytest.skip("gymnasium is not installed")
+        from zeno.gym import make_vec
+
+        env = make_vec(str(ASSETS_DIR / "ant.xml"), num_envs=2)
+        try:
+            env.reset()
+            actions = np.zeros((2, env.single_action_space.shape[0]), dtype=np.float32)
+            _, rewards, terminated, _, _ = env.step(actions)
+            np.testing.assert_array_equal(rewards, np.zeros(2, dtype=np.float32))
+            assert not terminated.any()
+        finally:
+            env.close()
+
+    def test_explicit_task_config_overrides_named_preset(self):
+        _skip_if_no_lib()
+        if not _has_gymnasium():
+            pytest.skip("gymnasium is not installed")
+        from zeno.gym import make_vec
+
+        env = make_vec(
+            "ant",
+            num_envs=2,
+            task_config={
+                "root_body": 1,
+                "healthy_bonus": 3.0,
+                "healthy_z_min": -100.0,
+                "healthy_z_max": 100.0,
+            },
+        )
+        try:
+            env.reset()
+            actions = np.zeros((2, env.single_action_space.shape[0]), dtype=np.float32)
+            _, rewards, _, _, _ = env.step(actions)
+            np.testing.assert_allclose(rewards, 3.0, atol=1e-5)
+        finally:
+            env.close()
+
+    @pytest.mark.parametrize(
+        "model",
+        ["ant", "humanoid", "cheetah", "hopper", "walker", "swimmer"],
+    )
+    def test_all_supported_named_task_presets_run_on_metal(self, model):
+        _skip_if_no_lib()
+        if not _has_gymnasium():
+            pytest.skip("gymnasium is not installed")
+        from zeno.gym import make_vec
+
+        env = make_vec(model, num_envs=2)
+        try:
+            env.reset()
+            actions = np.full(
+                (2, env.single_action_space.shape[0]), 0.2, dtype=np.float32
+            )
+            _, rewards, _, _, _ = env.step(actions)
+            assert np.all(np.isfinite(rewards))
+            assert np.any(rewards != 0.0)
+        finally:
+            env.close()
+
 
 # ===================================================================
 # 4. Multi-Env Batching
@@ -885,6 +990,23 @@ class TestAdditionalStateAPI:
         assert acc.shape == (2, world.num_bodies, 4)
         assert np.all(np.isfinite(acc))
 
+    def test_low_level_vector_lengths_are_validated_before_ffi(self):
+        _skip_if_no_lib()
+        from zeno._ffi import ZenoWorld
+
+        world = ZenoWorld(mjcf_string=PENDULUM_MJCF, num_envs=2)
+        try:
+            short_actions = np.zeros((1, world.action_dim), dtype=np.float32)
+            actions = np.zeros((2, world.action_dim), dtype=np.float32)
+            with pytest.raises(ValueError, match="actions must contain"):
+                world.step(short_actions)
+            with pytest.raises(ValueError, match="env_mask must contain"):
+                world.step_subset(actions, np.array([1], dtype=np.uint8))
+            with pytest.raises(ValueError, match="mask must contain"):
+                world.reset(np.array([1], dtype=np.uint8))
+        finally:
+            world.close()
+
     def test_sensor_data_shape_matches_observation_dim(self):
         _skip_if_no_lib()
         from zeno._ffi import ZenoWorld
@@ -894,6 +1016,232 @@ class TestAdditionalStateAPI:
 
         sensor_data = world.get_sensor_data()
         assert sensor_data.shape == (3, world.obs_dim)
+
+    def test_step_outputs_can_remain_zero_copy(self):
+        _skip_if_no_lib()
+        from zeno.env import ZenoEnv
+
+        env = ZenoEnv(
+            mjcf_string=PENDULUM_MJCF,
+            num_envs=8,
+            zero_copy_outputs=True,
+        )
+        try:
+            reset_obs = env.reset()
+            obs_view = env._world.get_observations(zero_copy=True)
+            assert np.shares_memory(reset_obs, obs_view)
+
+            actions = np.zeros(env.action_shape, dtype=np.float32)
+            obs, rewards, dones, _ = env.step(actions)
+            assert np.shares_memory(obs, env._world.get_observations(zero_copy=True))
+            assert np.shares_memory(rewards, env._world.get_rewards(zero_copy=True))
+            assert np.shares_memory(dones, env._world.get_dones(zero_copy=True))
+            assert obs.dtype == np.float32
+            assert rewards.dtype == np.float32
+            assert dones.dtype == np.bool_
+        finally:
+            env.close()
+
+
+# ===================================================================
+# 5.6 GPU Task Outputs
+# ===================================================================
+
+class TestGPUTaskOutputs:
+    """Reward, termination, and episode clocks are evaluated on Metal."""
+
+    def test_low_level_reward_horizon_and_masked_reset(self):
+        _skip_if_no_lib()
+        from zeno._ffi import ZenoWorld
+
+        world = ZenoWorld(mjcf_string=PENDULUM_MJCF, num_envs=3)
+        try:
+            world.configure_task(
+                root_body=0,
+                max_episode_steps=2,
+                control_cost_weight=0.25,
+                healthy_bonus=1.5,
+                healthy_z_min=-100.0,
+                healthy_z_max=100.0,
+                terminate_when_unhealthy=True,
+            )
+            actions = np.full((3, world.action_dim), 0.5, dtype=np.float32)
+
+            world.step(actions)
+            np.testing.assert_allclose(world.get_rewards(), 1.4375, atol=1e-6)
+            assert not world.get_dones().any()
+
+            world.step(actions)
+            assert world.get_dones().all()
+
+            world.reset(np.array([0, 1, 0], dtype=np.uint8))
+            np.testing.assert_array_equal(world.get_dones(), [1, 0, 1])
+            np.testing.assert_allclose(world.get_rewards(), [1.4375, 0.0, 1.4375])
+        finally:
+            world.close()
+
+    def test_high_level_task_config_and_validation(self):
+        _skip_if_no_lib()
+        from zeno.env import ZenoEnv
+
+        env = ZenoEnv(
+            mjcf_string=PENDULUM_MJCF,
+            num_envs=2,
+            zero_copy_outputs=True,
+            task_config={
+                "root_body": 0,
+                "max_episode_steps": 1,
+                "healthy_bonus": 2.0,
+                "healthy_z_min": -100.0,
+                "healthy_z_max": 100.0,
+            },
+        )
+        try:
+            _, rewards, dones, _ = env.step(
+                np.zeros(env.action_shape, dtype=np.float32)
+            )
+            np.testing.assert_allclose(rewards, 2.0, atol=1e-6)
+            assert dones.all()
+            with pytest.raises(ValueError, match="Invalid task configuration"):
+                env.configure_task(
+                    root_body=env._world.num_bodies,
+                    healthy_z_min=0.0,
+                    healthy_z_max=1.0,
+                )
+        finally:
+            env.close()
+
+
+# ===================================================================
+# 5.7 True Async Submission
+# ===================================================================
+
+class TestAsyncSubmission:
+    """Async APIs commit native Metal work before wait."""
+
+    def test_low_level_pending_lifecycle_and_read_guard(self):
+        _skip_if_no_lib()
+        from zeno._ffi import ZenoWorld
+
+        world = ZenoWorld(mjcf_string=PENDULUM_MJCF, num_envs=8)
+        try:
+            actions = np.zeros((8, world.action_dim), dtype=np.float32)
+            world.step_async(actions)
+            assert world.step_pending
+            with pytest.raises(RuntimeError, match="not synchronized"):
+                world.get_observations()
+            with pytest.raises(RuntimeError, match="error code -8"):
+                world.step_async(actions)
+            world.step_wait()
+            assert not world.step_pending
+            assert np.all(np.isfinite(world.get_observations()))
+            with pytest.raises(RuntimeError, match="error code -9"):
+                world.step_wait()
+        finally:
+            world.close()
+
+    def test_writable_shared_actions_skip_staging_copy(self):
+        _skip_if_no_lib()
+        from zeno.env import ZenoEnv
+
+        copied = ZenoEnv(mjcf_string=PENDULUM_MJCF, num_envs=8)
+        shared = ZenoEnv(mjcf_string=PENDULUM_MJCF, num_envs=8)
+        try:
+            actions = np.linspace(
+                0.04, 0.32, num=8 * copied.action_dim, dtype=np.float32
+            ).reshape(copied.action_shape)
+            shared_actions = shared.get_action_buffer()
+            assert shared_actions.shape == shared.action_shape
+            assert shared_actions.flags.writeable
+            shared_actions[:] = actions
+
+            copied_obs, _, _, _ = copied.step(actions)
+            shared.step_current_actions_async()
+            assert shared._world.step_pending
+            with pytest.raises(RuntimeError, match="not synchronized"):
+                shared.get_action_buffer()
+            shared_obs, _, _, _ = shared.step_wait()
+            np.testing.assert_allclose(shared_obs, copied_obs, atol=1e-5)
+            np.testing.assert_allclose(shared_actions, actions, atol=0)
+        finally:
+            copied.close()
+            shared.close()
+
+    def test_high_level_and_vector_step_async_submit_immediately(self):
+        _skip_if_no_lib()
+        from zeno.env import ZenoEnv
+
+        env = ZenoEnv(mjcf_string=PENDULUM_MJCF, num_envs=4)
+        try:
+            actions = np.zeros(env.action_shape, dtype=np.float32)
+            env.step_async(actions)
+            assert env._world.step_pending
+            obs, rewards, dones, _ = env.step_wait()
+            assert obs.shape == (4, env.observation_dim)
+            assert rewards.shape == dones.shape == (4,)
+            assert not env._world.step_pending
+        finally:
+            env.close()
+
+        if _has_gymnasium():
+            from zeno.gym.registration import ZenoVectorEnv
+
+            vector_env = ZenoVectorEnv(
+                mjcf_path=str(ASSETS_DIR / "pendulum.xml"),
+                num_envs=4,
+            )
+            try:
+                actions = np.zeros((4, vector_env._env.action_dim), dtype=np.float32)
+                vector_env.step_async(actions)
+                assert vector_env._env._world.step_pending
+                result = vector_env.step_wait()
+                assert result[0].shape[0] == 4
+                assert not vector_env._env._world.step_pending
+            finally:
+                vector_env.close()
+
+    def test_gym_next_step_autoreset_is_fused_into_native_submission(self):
+        _skip_if_no_lib()
+        if not _has_gymnasium():
+            pytest.skip("gymnasium is not installed")
+        from unittest.mock import patch
+        from zeno.gym.registration import ZenoVectorEnv
+
+        env = ZenoVectorEnv(
+            mjcf_path=str(ASSETS_DIR / "pendulum.xml"),
+            num_envs=4,
+        )
+        try:
+            env._autoreset_envs[:] = [False, True, False, True]
+            env._elapsed_steps[:] = [3, 3, 3, 3]
+            actions = np.full((4, env._env.action_dim), 0.25, dtype=np.float32)
+            with patch.object(env._env, "reset", side_effect=AssertionError("separate reset")):
+                env.step_async(actions)
+                assert env._env._world.step_pending
+                assert env._elapsed_steps.tolist() == [3, 0, 3, 0]
+                observations, rewards, terminated, truncated, _ = env.step_wait()
+            assert observations.shape[0] == 4
+            assert rewards.shape == terminated.shape == truncated.shape == (4,)
+            assert env._elapsed_steps.tolist() == [4, 1, 4, 1]
+        finally:
+            env.close()
+
+    def test_sb3_step_async_delegates_to_native_submission(self):
+        pytest.importorskip("stable_baselines3")
+        from zeno.gym import make_sb3_env
+
+        env = make_sb3_env("pendulum", num_envs=2)
+        try:
+            actions = np.zeros((2, env.action_space.shape[0]), dtype=np.float32)
+            env.step_async(actions)
+            assert env.env._env._world.step_pending
+            observations, rewards, dones, infos = env.step_wait()
+            assert observations.shape[0] == 2
+            assert rewards.shape == dones.shape == (2,)
+            assert len(infos) == 2
+            assert not env.env._env._world.step_pending
+        finally:
+            env.close()
 
 
 # ===================================================================

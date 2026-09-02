@@ -1,6 +1,8 @@
 # Profiling Guide
 
-Zeno provides built-in GPU profiling to help identify performance bottlenecks and optimize your simulations.
+Zeno provides lightweight host-side step profiling for regression checks. It
+does not currently expose per-kernel GPU timestamps; use Metal System Trace for
+GPU bottleneck claims.
 
 ## Using the Profiling API
 
@@ -8,57 +10,54 @@ Zeno provides built-in GPU profiling to help identify performance bottlenecks an
 import zeno
 
 # Create environment
-env = zeno.make("ant.xml", num_envs=1024)
+env = zeno.make("ant.xml", num_envs=1024, enable_profiling=True)
 
 # Run simulation
 for _ in range(100):
     env.step(actions)
 
 # Get profiling data
-profile = env.get_profiling_data()
+profile = env._world.get_profiling_data()
 print(profile)
 ```
 
 ## Profiling Data Structure
 
-The profiling data returns timing information for each GPU kernel:
+The current ABI returns four command-encoding stage aggregates, host submission
+plus blocking-wait cost, and work counts:
 
 ```python
 {
-    'apply_actions': 0.12,       # ms - Convert control inputs to torques
-    'apply_joint_forces': 0.08,  # ms - Map torques to body forces
-    'update_kinematic': 0.05,    # ms - Update kinematic body positions
-    'compute_forces': 0.15,      # ms - Gravity, damping forces
-    'integrate': 0.18,           # ms - Semi-implicit Euler
-    'broad_phase': 0.22,         # ms - Spatial hashing collision detection
-    'narrow_phase': 0.35,        # ms - Precise contact generation
-    'solve_joints': 0.45,        # ms - XPBD joint constraint solver
-    'solve_contacts': 0.40,      # ms - Contact constraint solver
-    'update_joint_states': 0.10, # ms - Inverse kinematics for sensors
-    'read_sensors': 0.08,        # ms - Generate observations
-    'total': 2.18,               # ms - Total step time
+    'integrate_ms': 0.02,
+    'collision_broad_ms': 0.03,
+    'collision_narrow_ms': 0.04,
+    'constraint_solve_ms': 0.05,
+    'total_step_ms': 0.70,
+    'num_contacts': 128,
+    'num_active_constraints': 4096,
 }
 ```
 
+The four stage values time CPU command encoding, not shader execution. For an
+explicit asynchronous step, `total_step_ms` excludes independent CPU work
+between `step_async` and `step_wait`; it includes submission and blocking wait
+cost. Do not add stage values and interpret the sum as GPU duration.
+
 ## Identifying Bottlenecks
 
-### Typical Performance Profile
+### Interpreting the counters
 
-For most simulations, the following stages dominate:
-
-1. **solve_joints** (20-30%): XPBD constraint iterations
-2. **solve_contacts** (15-25%): Contact resolution
-3. **narrow_phase** (10-20%): Contact detection
-4. **integrate** (5-10%): Physics integration
+Use `total_step_ms` to catch host-observed regressions under a fixed workload,
+and the count fields to explain changes in work. Do not rank GPU kernels by the
+stage aggregates; capture the workload in Instruments for that analysis.
 
 ### Common Bottlenecks
 
 | Symptom | Likely Cause | Solution |
 |---------|--------------|----------|
-| High `solve_joints` | Too many constraints or iterations | Reduce `contact_iterations`, simplify model |
-| High `solve_contacts` | Many active contacts | Reduce `max_contacts_per_env` |
-| High `narrow_phase` | Complex collision geometry | Use simpler collision shapes |
-| High `broad_phase` | Too many geometries | Reduce geom count, use collision groups |
+| High active-constraint count | More joint/constraint work | Simplify the model or inspect solver configuration |
+| High contact count | Contact-rich workload | Inspect collision filtering and contact limits |
+| Higher total host time | More work, submission contention, or system noise | Repeat isolated runs and inspect Metal System Trace |
 
 ## Optimization Strategies
 

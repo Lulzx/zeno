@@ -120,6 +120,11 @@ pub fn build(b: *std.Build) void {
         "benchmarks/bench_collision.zig",
         "benchmarks/bench_envs.zig",
         "benchmarks/bench_full_physics.zig",
+        "benchmarks/bench_masked_step.zig",
+        "benchmarks/bench_task_outputs.zig",
+        "benchmarks/bench_async_step.zig",
+        "benchmarks/bench_autoreset.zig",
+        "benchmarks/bench_action_staging.zig",
         "benchmarks/bench_swarm.zig",
     };
 
@@ -139,6 +144,53 @@ pub fn build(b: *std.Build) void {
 
         const run_bench = b.addRunArtifact(bench);
         bench_step.dependOn(&run_bench.step);
+
+        // The aggregate benchmark step intentionally runs independent build
+        // graph branches concurrently. Expose the engine-pipeline workload as
+        // an isolated target so throughput measurements are not contaminated
+        // by the synthetic, collision, integration, and swarm benchmarks.
+        if (std.mem.eql(u8, bench_file, "benchmarks/bench_full_physics.zig")) {
+            const full_physics_step = b.step(
+                "bench-full-physics",
+                "Run the full World.step benchmark in isolation",
+            );
+            full_physics_step.dependOn(&run_bench.step);
+        }
+        if (std.mem.eql(u8, bench_file, "benchmarks/bench_masked_step.zig")) {
+            const masked_step = b.step(
+                "bench-masked-step",
+                "Compare compact GPU masked stepping with legacy CPU memcpy preservation",
+            );
+            masked_step.dependOn(&run_bench.step);
+        }
+        if (std.mem.eql(u8, bench_file, "benchmarks/bench_task_outputs.zig")) {
+            const task_outputs_step = b.step(
+                "bench-task-outputs",
+                "Compare Metal and CPU reward/termination evaluation",
+            );
+            task_outputs_step.dependOn(&run_bench.step);
+        }
+        if (std.mem.eql(u8, bench_file, "benchmarks/bench_async_step.zig")) {
+            const async_step = b.step(
+                "bench-async-step",
+                "Measure Metal submission latency and CPU overlap",
+            );
+            async_step.dependOn(&run_bench.step);
+        }
+        if (std.mem.eql(u8, bench_file, "benchmarks/bench_autoreset.zig")) {
+            const autoreset = b.step(
+                "bench-autoreset",
+                "Compare separate and fused Metal autoreset submissions",
+            );
+            autoreset.dependOn(&run_bench.step);
+        }
+        if (std.mem.eql(u8, bench_file, "benchmarks/bench_action_staging.zig")) {
+            const action_staging = b.step(
+                "bench-action-staging",
+                "Measure unified-memory action staging overhead",
+            );
+            action_staging.dependOn(&run_bench.step);
+        }
     }
 
     // Runtime source compilation remains the default so development builds are

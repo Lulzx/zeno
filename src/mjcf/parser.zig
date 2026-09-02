@@ -1249,6 +1249,10 @@ fn convertGeom(mjcf_geom: *const schema.MjcfGeom) primitives.Geom {
                     (p1[2] + p2[2]) * 0.5,
                 };
                 geom.size = .{ mjcf_geom.size[0], length * 0.5, 0 };
+                // MJCF fromto defines both the center and axis. Zeno capsules
+                // are locally +Z aligned, so preserve that orientation for
+                // CPU and Metal collision paths.
+                geom.local_quat = primitives.normalToQuat(.{ dx, dy, dz });
             } else {
                 geom.size = .{ mjcf_geom.size[0], mjcf_geom.size[1], 0 };
             }

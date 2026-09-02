@@ -41,15 +41,17 @@ class ZenoSB3VecEnv(VecEnv):
     def step_async(self, actions: np.ndarray) -> None:
         if self._pending_actions is not None:
             raise RuntimeError("step_async called while another step is pending")
-        self._pending_actions = np.asarray(actions, dtype=np.float32)
+        actions = np.asarray(actions, dtype=np.float32)
+        self.env.step_async(actions)
+        self._pending_actions = actions
 
     def step_wait(self):
         if self._pending_actions is None:
             raise RuntimeError("step_async must be called before step_wait")
-        actions = self._pending_actions
-        self._pending_actions = None
-
-        observations, rewards, terminated, truncated, vector_info = self.env.step(actions)
+        try:
+            observations, rewards, terminated, truncated, vector_info = self.env.step_wait()
+        finally:
+            self._pending_actions = None
         dones = terminated | truncated
         infos = []
         for i in range(self.num_envs):

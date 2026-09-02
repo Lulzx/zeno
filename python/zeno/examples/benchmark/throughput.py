@@ -29,6 +29,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--benchmark-steps", type=int, default=1000, help="Benchmark steps")
     parser.add_argument("--trials", type=int, default=3, help="Number of trials")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--zero-copy-outputs", action="store_true", help="Return shared-memory output views")
     return parser
 
 
@@ -60,6 +61,7 @@ def main():
     print(f"Warmup steps: {args.warmup_steps}")
     print(f"Benchmark steps: {args.benchmark_steps}")
     print(f"Trials: {args.trials}")
+    print(f"Zero-copy outputs: {args.zero_copy_outputs}")
     print()
 
     mjcf_path = get_asset(f"{args.env}.xml")
@@ -67,6 +69,7 @@ def main():
         mjcf_path=mjcf_path,
         num_envs=args.num_envs,
         seed=args.seed,
+        zero_copy_outputs=args.zero_copy_outputs,
     )
 
     print(f"Observation dim: {env.observation_dim}")

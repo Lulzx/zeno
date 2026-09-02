@@ -23,6 +23,9 @@ env = zeno.make(
 | `model` | `str` | required | Path to MJCF XML file |
 | `num_envs` | `int` | `1` | Number of parallel environments |
 | `timestep` | `float` | `0.002` | Physics timestep in seconds |
+| `zero_copy_outputs` | `bool` | `False` | Return step/reset outputs as Metal shared-memory views |
+| `task_config` | `dict` | `None` | Enable bounded Metal reward and termination evaluation |
+| `enable_profiling` | `bool` | `False` | Enable host-side encoding and synchronization counters |
 
 **Returns:** `ZenoEnv` instance
 
@@ -42,6 +45,10 @@ env.timestep          # float: Physics timestep
 #### `reset(mask=None)`
 
 Reset environments to initial state.
+
+Reset templates and state restoration execute on Metal. A masked reset touches
+only selected environments and refreshes their sensor observations before the
+call returns.
 
 ```python
 # Reset all environments
@@ -81,6 +88,86 @@ obs, rewards, dones, info = env.step(actions)
 - `rewards`: `np.ndarray` of shape `(num_envs,)`
 - `dones`: `np.ndarray` of shape `(num_envs,)`, dtype `bool`
 - `info`: `dict` with additional information
+
+For a training loop that consumes each transition before the next simulation
+step, output copies can be removed:
+
+```python
+env = zeno.make("assets/ant.xml", num_envs=1024, zero_copy_outputs=True)
+obs, rewards, dones, info = env.step(actions)
+```
+
+The observation, reward, and done arrays then alias world-owned Metal shared
+memory and are overwritten by later steps. Replay buffers and trajectory
+storage must copy the values they retain.
+
+For CPU policy or rollout bookkeeping that can overlap Metal execution, split
+submission from synchronization:
+
+```python
+env.step_async(actions)       # actions copied; Metal work committed now
+do_independent_cpu_work()
+obs, rewards, dones, info = env.step_wait()
+```
+
+`step_async(actions, reset_mask=mask)` restores the selected environments and
+then advances the full batch in that same Metal command buffer. The supplied
+actions are preserved across the reset and become the first actions of the new
+episodes. This primitive backs Gymnasium's `NEXT_STEP` autoreset mode; it is not
+a masked physics step.
+
+Only one step may be pending per environment. Starting another step, resetting,
+or reconfiguring the world while a step is pending raises an error. New
+zero-copy state access is also rejected until `step_wait()`; previously acquired
+shared-memory views must not be read or written while GPU work is in flight.
+
+CPU or accelerator policies that can write into a NumPy-compatible destination
+may also remove action staging:
+
+```python
+actions = env.get_action_buffer()  # writable Metal storageModeShared view
+policy.write_actions(actions)
+env.step_current_actions_async()
+obs, rewards, dones, info = env.step_wait()
+```
+
+`step_current_actions_async(reset_mask=mask)` combines this with fused
+reset-before-step. The action view is stable for the world's lifetime, but it
+must not be read or written between submission and `step_wait()` because Metal
+may be consuming it. This is unified-memory interop, not a generic PyTorch/JAX
+device-tensor bridge.
+
+#### `configure_task(**parameters)`
+
+Enable a configurable locomotion reward and termination kernel in the same
+Metal command stream as physics:
+
+```python
+env.configure_task(
+    root_body=0,
+    forward_axis=0,
+    forward_reward_weight=1.0,
+    control_cost_weight=0.01,
+    healthy_bonus=1.0,
+    healthy_z_min=0.2,
+    healthy_z_max=2.0,
+    terminate_when_unhealthy=True,
+    max_episode_steps=1000,
+)
+```
+
+The reward is `forward_weight * root_velocity[axis] - control_cost_weight *
+sum(actions**2) + healthy_bonus`, with the bonus present only inside the health
+range. Invalid floating-point state produces zero reward and is unhealthy.
+This is a Zeno task primitive; callers must choose parameters and validate
+semantics for their task rather than assuming equivalence with similarly named
+Gymnasium environments. Pass `enabled=False` to disable it.
+
+`zeno.gym.make_vec()` enables explicit Zeno presets for the short names `ant`,
+`humanoid`, `cheetah`, `hopper`, `walker`, and `swimmer`. Direct `ZenoEnv`
+construction and path-based `make_vec()` calls do not infer task semantics.
+Gymnasium episode limits stay in the wrapper and are reported as truncation;
+the presets do not turn a time limit into native termination.
 
 #### `get_body_positions()`
 

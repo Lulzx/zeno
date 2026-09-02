@@ -77,6 +77,21 @@ ffi.cdef("""
         uint32_t num_active_constraints;
     } ZenoProfilingData;
 
+    typedef struct {
+        uint32_t enabled;
+        uint32_t root_body;
+        uint32_t forward_axis;
+        uint32_t max_episode_steps;
+        float forward_reward_weight;
+        float control_cost_weight;
+        float healthy_bonus;
+        float healthy_z_min;
+        float healthy_z_max;
+        uint32_t terminate_when_unhealthy;
+        uint32_t _pad0;
+        uint32_t _pad1;
+    } ZenoTaskConfig;
+
     typedef enum {
         ZENO_SUCCESS = 0,
         ZENO_INVALID_HANDLE = -1,
@@ -86,6 +101,9 @@ ffi.cdef("""
         ZENO_OUT_OF_MEMORY = -5,
         ZENO_INVALID_ARGUMENT = -6,
         ZENO_NOT_IMPLEMENTED = -7,
+        ZENO_STEP_PENDING = -8,
+        ZENO_NO_PENDING_STEP = -9,
+        ZENO_EXECUTION_FAILED = -10,
     } ZenoError;
 
     // World lifecycle
@@ -108,9 +126,48 @@ ffi.cdef("""
         uint32_t substeps
     );
 
+    int zeno_world_step_async(
+        ZenoWorldHandle world,
+        const float* actions,
+        uint32_t substeps
+    );
+
+    int zeno_world_step_current_actions_async(
+        ZenoWorldHandle world,
+        uint32_t substeps
+    );
+
+    int zeno_world_step_with_reset_async(
+        ZenoWorldHandle world,
+        const float* actions,
+        const uint8_t* reset_mask,
+        uint32_t substeps
+    );
+
+    int zeno_world_step_with_reset_current_actions_async(
+        ZenoWorldHandle world,
+        const uint8_t* reset_mask,
+        uint32_t substeps
+    );
+
+    int zeno_world_step_subset_async(
+        ZenoWorldHandle world,
+        const float* actions,
+        const uint8_t* env_mask,
+        uint32_t substeps
+    );
+
+    int zeno_world_step_wait(ZenoWorldHandle world);
+    bool zeno_world_step_pending(ZenoWorldHandle world);
+
     int zeno_world_reset(
         ZenoWorldHandle world,
         const uint8_t* env_mask
+    );
+
+    int zeno_world_configure_task(
+        ZenoWorldHandle world,
+        const ZenoTaskConfig* config
     );
 
     int zeno_world_reset_to_state(
@@ -123,6 +180,7 @@ ffi.cdef("""
     );
 
     // State access (zero-copy) - Core
+    float* zeno_world_get_actions(ZenoWorldHandle world);
     float* zeno_world_get_observations(ZenoWorldHandle world);
     float* zeno_world_get_rewards(ZenoWorldHandle world);
     uint8_t* zeno_world_get_dones(ZenoWorldHandle world);
@@ -635,6 +693,10 @@ class ZenoWorld:
         cache_key: Optional[str] = None
     ) -> np.ndarray:
         """Create a zero-copy numpy array from a pointer."""
+        if self.step_pending:
+            raise RuntimeError(
+                "shared Metal state is not synchronized; call step_wait() first"
+            )
         if ptr == ffi.NULL:
             return np.zeros(shape, dtype=dtype)
 
@@ -663,11 +725,107 @@ class ZenoWorld:
         substeps : int, optional
             Override number of substeps (0 uses default).
         """
-        actions = np.ascontiguousarray(actions, dtype=np.float32).flatten()
+        actions = np.ascontiguousarray(actions, dtype=np.float32).reshape(-1)
+        expected_actions = self._num_envs * self._action_dim
+        if actions.size != expected_actions:
+            raise ValueError(
+                f"actions must contain {expected_actions} values, got {actions.size}"
+            )
         actions_ptr = ffi.cast("float*", actions.ctypes.data)
         result = _lib.zeno_world_step(self._handle, actions_ptr, substeps)
         if result != 0:
             raise RuntimeError(f"Step failed with error code {result}")
+
+    def step_async(self, actions: np.ndarray, substeps: int = 0) -> None:
+        """Copy actions, encode, and commit a Metal step without waiting."""
+        actions = np.ascontiguousarray(actions, dtype=np.float32).reshape(-1)
+        expected_actions = self._num_envs * self._action_dim
+        if actions.size != expected_actions:
+            raise ValueError(
+                f"actions must contain {expected_actions} values, got {actions.size}"
+            )
+        result = _lib.zeno_world_step_async(
+            self._handle,
+            ffi.cast("float*", actions.ctypes.data),
+            substeps,
+        )
+        if result != 0:
+            raise RuntimeError(f"Async step submission failed with error code {result}")
+
+    def step_with_reset_async(
+        self,
+        actions: np.ndarray,
+        reset_mask: np.ndarray,
+        substeps: int = 0,
+    ) -> None:
+        """Reset masked environments and commit a full Metal step without waiting."""
+        actions = np.ascontiguousarray(actions, dtype=np.float32).reshape(-1)
+        expected_actions = self._num_envs * self._action_dim
+        if actions.size != expected_actions:
+            raise ValueError(
+                f"actions must contain {expected_actions} values, got {actions.size}"
+            )
+        reset_mask = np.ascontiguousarray(reset_mask, dtype=np.uint8).reshape(-1)
+        if reset_mask.size != self._num_envs:
+            raise ValueError(
+                f"reset_mask must contain {self._num_envs} values, got {reset_mask.size}"
+            )
+        result = _lib.zeno_world_step_with_reset_async(
+            self._handle,
+            ffi.cast("float*", actions.ctypes.data),
+            ffi.cast("uint8_t*", reset_mask.ctypes.data),
+            substeps,
+        )
+        if result != 0:
+            raise RuntimeError(
+                f"Fused reset/step submission failed with error code {result}"
+            )
+
+    def step_current_actions_async(
+        self,
+        substeps: int = 0,
+        reset_mask: Optional[np.ndarray] = None,
+    ) -> None:
+        """Commit using actions already written through ``get_action_buffer``."""
+        if reset_mask is None:
+            result = _lib.zeno_world_step_current_actions_async(
+                self._handle, substeps
+            )
+        else:
+            reset_mask = np.ascontiguousarray(reset_mask, dtype=np.uint8).reshape(-1)
+            if reset_mask.size != self._num_envs:
+                raise ValueError(
+                    f"reset_mask must contain {self._num_envs} values, got {reset_mask.size}"
+                )
+            result = _lib.zeno_world_step_with_reset_current_actions_async(
+                self._handle,
+                ffi.cast("uint8_t*", reset_mask.ctypes.data),
+                substeps,
+            )
+        if result != 0:
+            raise RuntimeError(
+                f"Current-action submission failed with error code {result}"
+            )
+
+    def step_wait(self) -> None:
+        """Wait for the committed Metal step and synchronize shared outputs."""
+        result = _lib.zeno_world_step_wait(self._handle)
+        if result != 0:
+            raise RuntimeError(f"Async step wait failed with error code {result}")
+
+    @property
+    def step_pending(self) -> bool:
+        """Whether this world has a committed Metal step in flight."""
+        return bool(_lib.zeno_world_step_pending(self._handle))
+
+    def get_action_buffer(self) -> np.ndarray:
+        """Return the writable NumPy view of the Metal shared action buffer."""
+        ptr = _lib.zeno_world_get_actions(self._handle)
+        return self._make_zero_copy_array(
+            ptr,
+            (self._num_envs, self._action_dim),
+            cache_key="actions",
+        )
 
     def step_subset(
         self,
@@ -690,8 +848,17 @@ class ZenoWorld:
         substeps : int, optional
             Override number of substeps.
         """
-        actions = np.ascontiguousarray(actions, dtype=np.float32).flatten()
-        mask = np.ascontiguousarray(env_mask, dtype=np.uint8)
+        actions = np.ascontiguousarray(actions, dtype=np.float32).reshape(-1)
+        expected_actions = self._num_envs * self._action_dim
+        if actions.size != expected_actions:
+            raise ValueError(
+                f"actions must contain {expected_actions} values, got {actions.size}"
+            )
+        mask = np.ascontiguousarray(env_mask, dtype=np.uint8).reshape(-1)
+        if mask.size != self._num_envs:
+            raise ValueError(
+                f"env_mask must contain {self._num_envs} values, got {mask.size}"
+            )
 
         actions_ptr = ffi.cast("float*", actions.ctypes.data)
         mask_ptr = ffi.cast("uint8_t*", mask.ctypes.data)
@@ -701,6 +868,35 @@ class ZenoWorld:
         )
         if result != 0:
             raise RuntimeError(f"Step subset failed with error code {result}")
+
+    def step_subset_async(
+        self,
+        actions: np.ndarray,
+        env_mask: np.ndarray,
+        substeps: int = 0,
+    ) -> None:
+        """Commit a compact masked Metal step without waiting."""
+        actions = np.ascontiguousarray(actions, dtype=np.float32).reshape(-1)
+        expected_actions = self._num_envs * self._action_dim
+        if actions.size != expected_actions:
+            raise ValueError(
+                f"actions must contain {expected_actions} values, got {actions.size}"
+            )
+        mask = np.ascontiguousarray(env_mask, dtype=np.uint8).reshape(-1)
+        if mask.size != self._num_envs:
+            raise ValueError(
+                f"env_mask must contain {self._num_envs} values, got {mask.size}"
+            )
+        result = _lib.zeno_world_step_subset_async(
+            self._handle,
+            ffi.cast("float*", actions.ctypes.data),
+            ffi.cast("uint8_t*", mask.ctypes.data),
+            substeps,
+        )
+        if result != 0:
+            raise RuntimeError(
+                f"Async subset submission failed with error code {result}"
+            )
 
     def reset(self, mask: Optional[np.ndarray] = None) -> None:
         """
@@ -713,13 +909,54 @@ class ZenoWorld:
             If None, all environments are reset.
         """
         if mask is not None:
-            mask = np.ascontiguousarray(mask, dtype=np.uint8)
+            mask = np.ascontiguousarray(mask, dtype=np.uint8).reshape(-1)
+            if mask.size != self._num_envs:
+                raise ValueError(
+                    f"mask must contain {self._num_envs} values, got {mask.size}"
+                )
             mask_ptr = ffi.cast("uint8_t*", mask.ctypes.data)
         else:
             mask_ptr = ffi.NULL
         result = _lib.zeno_world_reset(self._handle, mask_ptr)
         if result != 0:
             raise RuntimeError(f"Reset failed with error code {result}")
+
+    def configure_task(
+        self,
+        *,
+        enabled: bool = True,
+        root_body: int = 0,
+        forward_axis: int = 0,
+        max_episode_steps: int = 0,
+        forward_reward_weight: float = 0.0,
+        control_cost_weight: float = 0.0,
+        healthy_bonus: float = 0.0,
+        healthy_z_min: float = -1.0e30,
+        healthy_z_max: float = 1.0e30,
+        terminate_when_unhealthy: bool = False,
+    ) -> None:
+        """Configure bounded reward and termination evaluation on Metal.
+
+        The reward is ``forward_weight * root_velocity[axis] -
+        control_cost_weight * sum(actions**2) + healthy_bonus``. The bonus is
+        included only while the root height is inside the configured range.
+        This primitive is intentionally task-configurable and does not imply
+        equivalence with a Gymnasium or MuJoCo reference task.
+        """
+        config = ffi.new("ZenoTaskConfig*")
+        config.enabled = bool(enabled)
+        config.root_body = root_body
+        config.forward_axis = forward_axis
+        config.max_episode_steps = max_episode_steps
+        config.forward_reward_weight = forward_reward_weight
+        config.control_cost_weight = control_cost_weight
+        config.healthy_bonus = healthy_bonus
+        config.healthy_z_min = healthy_z_min
+        config.healthy_z_max = healthy_z_max
+        config.terminate_when_unhealthy = bool(terminate_when_unhealthy)
+        result = _lib.zeno_world_configure_task(self._handle, config)
+        if result != 0:
+            raise ValueError(f"Invalid task configuration (error code {result})")
 
     def reset_to_state(
         self,
@@ -801,19 +1038,26 @@ class ZenoWorld:
         )
         return arr if zero_copy else arr.copy()
 
-    def get_rewards(self) -> np.ndarray:
-        """Get rewards array of shape (num_envs,)."""
+    def get_rewards(self, zero_copy: bool = False) -> np.ndarray:
+        """Get rewards, optionally as a unified-memory view."""
         ptr = _lib.zeno_world_get_rewards(self._handle)
-        arr = self._make_zero_copy_array(ptr, (self._num_envs,))
-        return arr.copy()
+        arr = self._make_zero_copy_array(
+            ptr,
+            (self._num_envs,),
+            cache_key="rewards" if zero_copy else None,
+        )
+        return arr if zero_copy else arr.copy()
 
-    def get_dones(self) -> np.ndarray:
-        """Get done flags array of shape (num_envs,)."""
+    def get_dones(self, zero_copy: bool = False) -> np.ndarray:
+        """Get done flags, optionally as a unified-memory view."""
         ptr = _lib.zeno_world_get_dones(self._handle)
-        if ptr == ffi.NULL:
-            return np.zeros(self._num_envs, dtype=np.uint8)
-        buffer = ffi.buffer(ptr, self._num_envs)
-        return np.frombuffer(buffer, dtype=np.uint8).copy()
+        arr = self._make_zero_copy_array(
+            ptr,
+            (self._num_envs,),
+            dtype=np.uint8,
+            cache_key="dones" if zero_copy else None,
+        )
+        return arr if zero_copy else arr.copy()
 
     def get_body_positions(self, zero_copy: bool = True) -> np.ndarray:
         """

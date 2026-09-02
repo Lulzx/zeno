@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "workload": "Zeno World.step with repository MJCF models",
+  "provenance": {
+    "device": "Apple M4 Pro",
+    "cpu_cores": 12,
+    "gpu_cores": 16,
+    "unified_memory_gib": 24,
+    "unified_memory": true,
+    "macos": "26.7",
+    "macos_build": "25G227",
+    "zig": "0.16.0"
+  },
+  "configuration": {
+    "warmup_steps": 10,
+    "measured_steps": 1000,
+    "repeats": 5,
+    "statistic": "median",
+    "timestep": 0.002,
+    "substeps": 1,
+    "contact_iterations": 4,
+    "max_contacts_per_environment": 64
+  },
+  "ant_scaling": [
+    {
+      "environments": 64,
+      "sorted_samples_ms": [313.5, 322.1, 326.0, 335.9, 339.9],
+      "median_environment_steps_per_second": 196296,
+      "reported_memory_mb": 0.4
+    },
+    {
+      "environments": 256,
+      "sorted_samples_ms": [432.6, 439.0, 448.0, 456.8, 458.4],
+      "median_environment_steps_per_second": 571426,
+      "reported_memory_mb": 1.5
+    },
+    {
+      "environments": 1024,
+      "sorted_samples_ms": [684.4, 685.8, 712.0, 718.4, 730.2],
+      "median_environment_steps_per_second": 1438186,
+      "reported_memory_mb": 6.0
+    },
+    {
+      "environments": 4096,
+      "sorted_samples_ms": [862.4, 875.7, 939.7, 958.3, 965.5],
+      "median_environment_steps_per_second": 4358699,
+      "reported_memory_mb": 24.0
+    },
+    {
+      "environments": 16384,
+      "sorted_samples_ms": [2867.9, 3021.4, 3128.5, 3137.4, 3155.0],
+      "median_environment_steps_per_second": 5236981,
+      "reported_memory_mb": 95.9
+    }
+  ],
+  "model_cross_section_1024_environments": [
+    {"model": "Pendulum", "median_ms": 415.6, "environment_steps_per_second": 2463943},
+    {"model": "Cartpole", "median_ms": 408.8, "environment_steps_per_second": 2504770},
+    {"model": "Pusher", "median_ms": 740.7, "environment_steps_per_second": 1382517},
+    {"model": "Ant", "median_ms": 712.0, "environment_steps_per_second": 1438186},
+    {"model": "Humanoid", "median_ms": 3013.9, "environment_steps_per_second": 339757}
+  ],
+  "claim_boundary": "Zeno throughput and scaling only; no cross-simulator physics equivalence"
+}

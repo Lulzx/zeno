@@ -172,7 +172,7 @@ test "geom fromto syntax" {
         \\<mujoco model="fromto">
         \\    <worldbody>
         \\        <body name="link" pos="0 0 0">
-        \\            <geom type="capsule" fromto="0 0 0 0 0 1" size="0.1"/>
+        \\            <geom type="capsule" fromto="0 0 0 1 0 0" size="0.1"/>
         \\        </body>
         \\    </worldbody>
         \\</mujoco>
@@ -182,6 +182,12 @@ test "geom fromto syntax" {
     defer scene.deinit();
 
     try testing.expect(scene.numGeoms() >= 1);
+    const capsule = scene.geoms.items[0];
+    try testing.expectApproxEqAbs(@as(f32, 0.5), capsule.local_pos[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), capsule.size[1], 1e-6);
+    // fromto rotates Zeno's local +Z capsule axis onto world-local +X.
+    try testing.expectApproxEqAbs(@as(f32, 0.70710677), capsule.local_quat[1], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 0.70710677), capsule.local_quat[3], 1e-5);
 }
 
 test "actuator types" {
