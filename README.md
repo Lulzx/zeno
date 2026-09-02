@@ -1,462 +1,85 @@
-# Zeno: Batched Rigid-Body Simulation for Apple Silicon
+# Zeno
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Platform](https://img.shields.io/badge/platform-macOS-blue.svg)](https://www.apple.com/macos/)
 [![CI](https://github.com/lulzx/zeno/actions/workflows/ci.yml/badge.svg)](https://github.com/lulzx/zeno/actions/workflows/ci.yml)
+[![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black)](https://developer.apple.com/metal/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-**Zeno** is a Metal-native, massively batched rigid-body physics engine written in Zig, built for reinforcement-learning workloads on Apple Silicon. It is designed around unified memory: simulation state lives in shared `MTLBuffer`s that Python sees as zero-copy numpy arrays, and thousands of environments step in parallel on the GPU.
+Zeno is a batched rigid-body simulator for Apple Silicon. The physics runs in
+Metal. The runtime is written in Zig. Python reads and writes shared
+`MTLBuffer` storage through NumPy without a staging copy.
 
-The niche it targets is specific: **Isaac Gym–style batched simulation, but for Macs.** Most robotics simulation stacks assume NVIDIA GPUs or CPU portability; Zeno is built from first principles for Apple's GPU and memory architecture.
+The intended use is simple: run thousands of reinforcement-learning
+environments on the GPU already in a Mac.
 
-The name references Zeno of Elea, whose paradoxes on motion and infinity are foundational to physics and mathematics — fitting for a simulation engine that discretizes continuous motion into parallel computation.
+This is a research engine. It is not a drop-in or physics-equivalent MuJoCo
+replacement. The supported contact set and the measured limits are written
+down in [Status and scope](docs/status.md).
 
-## Project Status
+## Numbers
 
-Zeno is a **research engine, not a validated MuJoCo replacement**. Honest framing of where things stand:
+Full `World.step`, real repository MJCF models, 1,024 environments, 1,000
+steps. Median of five runs on an M4 Pro (16-core GPU, 24 GiB), macOS 26.7,
+Zig 0.16.0:
 
-- **Solid**: the staged Metal compute pipeline, batched SoA state layout, unified-memory zero-copy access, MJCF loading, Python/Gymnasium bindings, and the XPBD solver skeleton with graph-coloring parallelism.
-- **Implemented but not broadly validated**: two-sphere stacking, sliding-to-rolling friction, driven Pendulum drift, and collision-free energy proxies now have bounded long-horizon regressions. Larger stacks, other contact shapes and joint graphs, general energy conservation, and agreement with trusted reference simulators remain research work. "Runs and looks plausible" is a much lower bar than "production-correct physics," and Zeno has not yet earned the higher one.
-- **Experimental**: soft bodies (PBD cloth/volumetric), SPH fluids, PBR materials/rendering, tendons, and the swarm platform. These exist behind the Zig API and have unit tests, but should be treated as prototypes.
+| Model | Environment steps/s |
+|---|---:|
+| Pendulum | 2.46M |
+| Cartpole | 2.50M |
+| Pusher | 1.38M |
+| Ant | 1.44M |
+| Humanoid | 0.34M |
 
-If you need physics you can trust unconditionally today, use MuJoCo. If you want high-throughput batched rollouts on a Mac and can tolerate a young engine, Zeno is for you.
+Ant scales from 0.196M environment steps/s at 64 environments to 5.24M at
+16,384. These are Zeno throughput measurements, not claims of equal work or
+equal physics across simulators. See the [method, raw results, and narrower
+correctness checks](docs/reference/performance.md).
 
-## Features
+## Build
 
-### Core Engine
-- **Native Metal Compute** — Hand-written MSL shaders, staged compute pipeline (actions → forces → integrate → collision → constraint solve → sensors)
-- **Unified Memory** — Zero-copy CPU↔GPU via Apple Silicon shared memory
-- **Batched Simulation** — full `World.step` verified from 64 through 16,384 parallel environments
-- **SoA Memory Layout** — float4-aligned, coalesced GPU access
+Requires macOS 13 or newer, Apple Silicon, and Zig 0.16.x.
 
-### Physics
-- **Rigid Body Dynamics** — Semi-implicit Euler integration, quaternion rotations with renormalization
-- **XPBD Constraint Solver** — Extended Position-Based Dynamics with graph coloring for race-free parallel solving
-- **Joint Constraints** — Fixed, revolute, prismatic, ball, free, universal joints
-- **Collision Detection** — Metal spatial-hash broad phase with complete verified sphere/capsule/box/plane pair coverage, including oriented box SAT, plus exact sphere-cylinder and cylinder-plane contacts used by the bundled Pusher model; other cylinder pairs, meshes, and heightfields remain outside the GPU contact boundary
-- **Contact Resolution** — XPBD contact solver with warm starting and contact caching for temporal coherence
-- **Adaptive Substeps** — Dynamic substep adjustment based on constraint violation
-
-### Integration
-- **MJCF Parser** — Bodies, joints, geoms, actuators, sensors, defaults, inertia (explicit and shape-based)
-- **Python Bindings** — cffi-based, zero-copy numpy arrays via unified memory
-- **Gymnasium API** — Vectorized environment support
-- **Stable-Baselines3** — Direct integration with SB3 and other RL libraries
-- **C ABI** — FFI surface for custom language bindings
-
-### Experimental (Zig API only, prototype quality)
-- **Soft Bodies** — PBD deformable cloth and volumetric bodies
-- **Fluids** — SPH fluid simulation with spatial hashing
-- **Materials** — PBR material definitions with native ImageIO texture decoding
-- **Swarm** — multi-agent grid/graph/message-bus layer on top of the physics world
-
-## Performance
-
-**What these numbers are:** wall-clock throughput of Zeno's own pipeline on its supported workload subset, measured on an Apple M4 Pro (12-core CPU, 16-core GPU, 24 GiB unified memory). They are **not** a semantics-matched comparison with MuJoCo: MuJoCo does richer physics per step (different solver, contact model, and numerical tolerances). A GPU engine stepping thousands of simplified environments will always look dramatically faster than a CPU engine doing more work per step — treat cross-simulator ratios as throughput ratios, not physics-equivalence claims.
-
-### Engine pipeline throughput (real MJCF models, full `World.step`)
-
-| Environment | 1024 envs × 1000 steps | Throughput |
-|-------------|------------------------|-----------------|
-| Pendulum    | 416 ms                 | 2.46M steps/sec |
-| Cartpole    | 409 ms                 | 2.50M steps/sec |
-| Pusher      | 741 ms                 | 1.38M steps/sec |
-| Ant         | 712 ms                 | 1.44M steps/sec |
-| Humanoid    | 3,014 ms               | 0.34M steps/sec |
-
-Medians of 5 runs on September 2, 2026 using macOS 26.7 (25G227) and Zig 0.16.0. Throughput is lower than earlier published figures because those were measured while broad-phase and narrow-phase bugs were skipping work. The table includes synchronous GPU completion; the optional per-stage profiler measures CPU command-encoding time rather than GPU stage duration.
-
-A separate same-machine, five-repeat Pendulum experiment measured 2.252M
-environment-steps/s through Zeno's batched Metal Python API and 0.443M through
-a sequential MuJoCo CPU loop, an observed throughput ratio of 5.08×. This is a
-comparison of execution strategies, not a matched-semantics simulator speedup.
-The full samples and provenance are in
-[`benchmarks/results/m4-pro-pendulum-cpu-comparison-2026-09-02.json`](benchmarks/results/m4-pro-pendulum-cpu-comparison-2026-09-02.json).
-
-### Full-engine Ant scaling
-
-| Environments | Batch-step latency | Throughput | Reported state memory |
-|-------------:|-------------------:|-----------:|----------------------:|
-| 64 | 0.326 ms | 0.196M steps/sec | 0.4 MB |
-| 256 | 0.448 ms | 0.571M steps/sec | 1.5 MB |
-| 1,024 | 0.712 ms | 1.44M steps/sec | 6.0 MB |
-| 4,096 | 0.940 ms | 4.36M steps/sec | 24.0 MB |
-| 16,384 | 3.129 ms | 5.24M steps/sec | 95.9 MB |
-
-These are the complete `World.step` path, not the synthetic kernels below. All
-five sorted samples and configuration are stored in
-[`benchmarks/results/m4-pro-full-world-scaling-2026-09-02.json`](benchmarks/results/m4-pro-full-world-scaling-2026-09-02.json).
-
-### Scaling (synthetic GPU benchmark)
-
-| Environment | Envs  | Time  |
-|-------------|-------|-------|
-| Pendulum    | 1024  | 15ms  |
-| Cartpole    | 1024  | 50ms  |
-| Ant         | 1024  | 45ms  |
-| Humanoid    | 1024  | 69ms  |
-| Ant         | 4096  | 138ms |
-| Ant         | 16384 | 833ms |
-
-A rigorous MuJoCo parity benchmark (matched model semantics, timestep, solver iterations, contact counts, observations, and termination logic) is planned but does not exist yet. Until it does, Zeno makes no apples-to-apples speedup claim.
-
-## Quick Start
-
-### Building from Source
-
-Requirements:
-- macOS 13+ (Ventura or later)
-- Zig 0.16.x (CI and local verification use 0.16.0)
-- Apple Silicon (M1/M2/M3/M4) recommended
-
-```bash
-# Clone the repository
+```sh
 git clone https://github.com/lulzx/zeno.git
 cd zeno
-
-# Build the library
 zig build -Doptimize=ReleaseFast
-
-# Run tests
 zig build test
 ```
 
-### Python Installation
+For Python:
 
-```bash
-pip install -e python/
+```sh
+python3 -m pip install -e python/
 ```
-
-### Running Tests
-
-```bash
-# Zig unit tests
-zig build test
-
-# Python integration tests
-pip install pytest numpy
-python -m pytest tests/test_python_integration.py -v
-```
-
-### Basic Usage (Python)
 
 ```python
-import zeno
 import numpy as np
+import zeno
 
-# Create environment with 1024 parallel instances
 env = zeno.make("ant.xml", num_envs=1024)
-
-# Reset all environments
 obs = env.reset()
 
-# Run simulation
 for _ in range(1000):
-    # Random actions
-    actions = np.random.uniform(-1, 1, (1024, env.action_dim))
-
-    # Step all environments in parallel
+    actions = np.zeros((env.num_envs, env.action_dim), dtype=np.float32)
     obs, rewards, dones, info = env.step(actions)
-
-    # Reset done environments
-    if np.any(dones):
-        env.reset(mask=dones)
 
 env.close()
 ```
 
-### Gymnasium Integration
+The API also supports asynchronous submission, masked stepping, fused reset,
+GPU-side task outputs, Gymnasium vector environments, and Stable-Baselines3.
 
-```python
-import gymnasium as gym
-import zeno.gym  # Register environments
+## Read next
 
-# Single environment
-env = gym.make("Zeno/Ant-v0")
-obs, info = env.reset()
-
-for _ in range(1000):
-    action = env.action_space.sample()
-    obs, reward, terminated, truncated, info = env.step(action)
-    if terminated or truncated:
-        obs, info = env.reset()
-
-# Vectorized environments (native GPU batching)
-from zeno.gym import make_vec
-
-envs = make_vec("ant", num_envs=1024)
-obs, info = envs.reset()
-```
-
-### Zero-Copy State Access
-
-```python
-# Direct access to GPU memory (no copy overhead)
-positions = env._world.get_body_positions(zero_copy=True)
-velocities = env._world.get_body_velocities(zero_copy=True)
-
-# Modify state directly (changes reflected on GPU)
-positions[0, 0, 2] += 0.1
-
-# Checkpointing
-state = env._world.get_state()
-env._world.set_state(state)  # Restore later
-```
-
-### Stable-Baselines3
-
-```python
-from stable_baselines3 import PPO
-from zeno.gym import make_sb3_env
-
-env = make_sb3_env("ant", num_envs=8)
-model = PPO("MlpPolicy", env, verbose=1)
-model.learn(total_timesteps=1_000_000)
-```
-
-### Basic Usage (Zig)
-
-```zig
-const zeno = @import("zeno");
-
-pub fn main() !void {
-    const allocator = std.heap.page_allocator;
-
-    // Load scene from MJCF
-    var scene = try zeno.mjcf.parser.parseFile(allocator, "ant.xml");
-    defer scene.deinit();
-
-    // Create world with 1024 environments
-    var world = try zeno.World.init(allocator, scene, .{
-        .num_envs = 1024,
-        .timestep = 0.002,
-    });
-    defer world.deinit();
-
-    // Simulation loop
-    var actions = [_]f32{0.0} ** (1024 * 8);
-    for (0..1000) |_| {
-        try world.step(&actions, 0);
-    }
-
-    // Zero-copy access to observations
-    const obs = world.getObservations();
-    std.debug.print("Observation[0]: {}\n", .{obs[0]});
-}
-```
-
-## Included Environments
-
-Zeno ships 10 standard robotics environments as MJCF assets:
-
-| Environment | Bodies | Joints | Actuators | Description |
-|-------------|--------|--------|-----------|-------------|
-| Pendulum | 3 | 1 | 1 | Simple inverted pendulum |
-| Cartpole | 3 | 2 | 1 | Classic cart-pole balancing |
-| Ant | 9 | 9 | 8 | Quadruped locomotion |
-| Humanoid | 14 | 14 | 13 | Bipedal humanoid walking |
-| HalfCheetah | 8 | 6 | 6 | Fast running cheetah |
-| Hopper | 5 | 3 | 3 | Single-leg hopping |
-| Walker2d | 8 | 6 | 6 | Bipedal walking |
-| Swimmer | 4 | 2 | 2 | 3-link swimmer |
-| Reacher | 5 | 2 | 2 | 2-link planar arm reaching |
-| Pusher | 6 | 5 | 3 | 3-DOF arm pushing object |
-
-These load and run in batch; their reward/termination semantics are Zeno's own and have not been verified to match the Gymnasium/MuJoCo reference implementations.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Python Layer                             │
-│                   (cffi, zero-copy numpy)                       │
-├─────────────────────────────────────────────────────────────────┤
-│                          C ABI                                  │
-├─────────────────────────────────────────────────────────────────┤
-│                       Zig Runtime                               │
-│   ┌─────────────┐ ┌─────────────┐ ┌─────────────┐               │
-│   │   World     │ │   State     │ │   Metal     │               │
-│   │  (scene)    │ │  (SoA data) │ │  (compute)  │               │
-│   └─────────────┘ └─────────────┘ └─────────────┘               │
-├─────────────────────────────────────────────────────────────────┤
-│                  Unified Memory Pool                            │
-│               (MTLBuffer, storageModeShared)                    │
-├─────────────────────────────────────────────────────────────────┤
-│                    Compute Pipeline                             │
-│  Actions → Forces → Integrate → Collision → XPBD Solve → Obs   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-Shaders are embedded in the binary and compiled at runtime via `newLibraryWithSource`. That keeps development builds self-contained. `zig build metallib` also compiles and installs `zig-out/lib/zeno.metallib` for offline validation and deployments that prefer a precompiled artifact.
-
-## API Reference
-
-### Python API
-
-```python
-# Environment creation
-env = zeno.make(model, num_envs=1, timestep=0.002, ...)
-
-# Properties
-env.num_envs          # Number of parallel environments
-env.observation_dim   # Observation dimension
-env.action_dim        # Action dimension
-env.timestep          # Physics timestep
-
-# Methods
-obs = env.reset(mask=None)                    # Reset environments
-obs, rewards, dones, info = env.step(actions) # Step simulation
-positions = env.get_body_positions()          # Get body positions
-quaternions = env.get_body_quaternions()      # Get body orientations
-```
-
-The same step can be committed immediately with `env.step_async(actions)` and
-synchronized later with `env.step_wait()`, allowing independent CPU work to
-overlap Metal execution. One step may be in flight per world.
-
-For policies that can target an existing NumPy destination,
-`env.get_action_buffer()` returns the writable unified-memory action array and
-`env.step_current_actions_async()` submits it without another staging copy.
-The view must not be accessed until `step_wait()` completes.
-
-An optional `task_config={...}` keeps a bounded locomotion reward, health
-termination, and episode horizon in the Metal command stream. It is disabled
-by default and does not imply reward parity with Gymnasium/MuJoCo tasks.
-
-Registered and short-name Gymnasium locomotion environments use explicit
-Zeno-owned Metal presets for Ant, Humanoid, HalfCheetah, Hopper, Walker2d, and
-Swimmer. Pendulum, Cartpole, Reacher, Pusher, direct `ZenoEnv`, and MJCF-path
-calls remain raw physics unless given `task_config`; no external reward
-thresholds or reference-task equivalence are claimed.
-
-### C API
-
-```c
-// World lifecycle
-ZenoWorldHandle zeno_world_create(const char* mjcf_path, const ZenoConfig* config);
-void zeno_world_destroy(ZenoWorldHandle world);
-
-// Simulation
-ZenoError zeno_world_step(ZenoWorldHandle world, const float* actions, uint32_t substeps);
-ZenoError zeno_world_step_async(ZenoWorldHandle world, const float* actions, uint32_t substeps);
-ZenoError zeno_world_step_current_actions_async(ZenoWorldHandle world, uint32_t substeps);
-ZenoError zeno_world_step_with_reset_async(ZenoWorldHandle world, const float* actions, const uint8_t* reset_mask, uint32_t substeps);
-ZenoError zeno_world_step_with_reset_current_actions_async(ZenoWorldHandle world, const uint8_t* reset_mask, uint32_t substeps);
-ZenoError zeno_world_step_wait(ZenoWorldHandle world);
-ZenoError zeno_world_reset(ZenoWorldHandle world, const uint8_t* env_mask);
-
-// State access (zero-copy pointers)
-float* zeno_world_get_observations(ZenoWorldHandle world);
-float* zeno_world_get_rewards(ZenoWorldHandle world);
-uint8_t* zeno_world_get_dones(ZenoWorldHandle world);
-```
-
-## Project Structure
-
-```
-zeno/
-├── build.zig                 # Build configuration
-├── .github/workflows/        # CI pipeline (GitHub Actions)
-├── src/
-│   ├── main.zig              # C ABI exports
-│   ├── metal/                # Metal infrastructure
-│   ├── physics/              # Physics core (rigid bodies, XPBD; experimental soft bodies, fluids)
-│   ├── collision/            # Collision detection (GJK+EPA, spatial hashing)
-│   ├── world/                # World management
-│   ├── mjcf/                 # MJCF parser (with inertia computation)
-│   ├── render/               # Rendering (materials; experimental)
-│   ├── swarm/                # Multi-agent swarm layer (experimental)
-│   └── shaders/              # Metal compute shaders (embedded at compile time)
-├── python/
-│   └── zeno/                 # Python bindings
-├── assets/                   # MJCF model files
-├── tests/                    # Zig + Python tests
-├── benchmarks/               # Performance benchmarks
-└── docs/                     # Documentation
-```
-
-## MJCF Compatibility
-
-Zeno supports a subset of the MuJoCo XML format:
-
-### Supported Elements
-- `<option>`: timestep, gravity
-- `<default>`: joint/geom default classes with inheritance
-- `<body>`: name, pos, quat, euler
-- `<joint>`: type (hinge, slide, ball, free), axis, range, damping, stiffness, armature
-- `<geom>`: type (sphere, capsule, box, cylinder, plane, mesh, hfield), size, fromto, mass, density, friction
-- `<inertial>`: mass, diaginertia, fullinertia, pos, quat (with automatic shape-based fallback)
-- `<actuator>`: motor, position, velocity, ctrlrange, forcerange, gear, kp, kv
-- `<sensor>`: jointpos, jointvel, framepos, framequat, framelinvel, frameangvel, accelerometer, gyro
-- `<tendon>`: fixed and spatial tendons with spring behavior, wrapping objects
-- `<equality>`: weld, connect, joint, tendon constraints
-- `<asset>`: mesh loading (STL, OBJ) with convex hull approximation, heightfield terrain
-
-Parsing an element is not the same as matching MuJoCo's runtime semantics for it; expect behavioral differences, especially around contacts, solver parameters, and actuator dynamics.
-
-### Not Yet Supported
-- MJCF composite bodies
-- MJCF flexcomp
-- Advanced solver options (CG, Newton)
-
-## Benchmarking
-
-```bash
-# Run Zig benchmarks
-zig build bench
-
-# Run Python comparison
-PYTHONPATH=python python3 benchmarks/compare_mujoco.py --envs 1024 --steps 1000
-PYTHONPATH=python python3 benchmarks/validate_physics.py
-```
-
-The benchmark suite currently mixes four different kinds of measurement; be careful which one you cite:
-
-1. **Synthetic kernel benchmarks** — standalone Metal workloads with simplified integration/constraint kernels; useful for GPU tuning, not physics claims.
-2. **Engine pipeline benchmarks** — full `World.step` over real MJCF models; this is the number that describes Zeno itself.
-3. **Cross-simulator comparisons** — wall-clock vs MuJoCo without matched semantics; throughput indication only.
-4. **Bounded validation** — the live ballistic comparison has a declared error
-   threshold; it validates only that free-body case, not general parity.
-
-## Comparison with Alternatives
-
-| Simulator | Platform | Backend | Batched | Differentiable |
-|-----------|----------|---------|---------|----------------|
-| **Zeno** | macOS | Metal | Yes | No |
-| MuJoCo | Cross-platform | CPU | No | No |
-| Newton | Linux | CUDA/Warp | Yes | Yes |
-| Isaac Lab | Linux | CUDA | Yes | Yes |
-| Brax | Cross-platform | JAX/XLA | Yes | Yes |
-
-Zeno fills a niche none of these target: GPU-accelerated batched simulation on Apple Silicon. It is younger and less validated than all of them; what it offers is throughput on hardware the others ignore.
-
-## Roadmap
-
-- Expand the bounded MuJoCo validation matrix beyond the current ballistic case
-- Physics validation suite: stacking stability, friction cones, joint drift, energy behavior, long-horizon determinism
-- A backend dispatch boundary so the compute stages can be implemented by more than one GPU backend
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+- [Documentation index](docs/index.md)
+- [Install](docs/getting-started/installation.md)
+- [Five-minute start](docs/getting-started/quickstart.md)
+- [Status and scope](docs/status.md)
+- [Python API](docs/guide/python-api.md)
+- [Zig API](docs/guide/zig-api.md)
+- [Architecture](docs/reference/architecture.md)
+- [Performance](docs/reference/performance.md)
+- [Physics model](docs/reference/physics.md)
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
-## References
-
-- MuJoCo: https://mujoco.org/
-- Newton: https://github.com/newton-physics/newton
-- Position Based Dynamics: Müller et al., 2007
-- Metal Best Practices: https://developer.apple.com/metal/
-
-## Citation
-
-```bibtex
-@software{zeno2025,
-  title = {Zeno: Batched Rigid-Body Simulation Engine for Apple Silicon},
-  author = {Lulzx},
-  year = {2025},
-  url = {https://github.com/lulzx/zeno}
-}
-```
+[MIT](LICENSE)

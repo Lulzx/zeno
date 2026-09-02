@@ -1,115 +1,41 @@
-# Zeno
+# Zeno documentation
 
-**High-Performance Batched Robotics Simulation Engine**
+Zeno runs batches of rigid-body worlds with Metal on Apple Silicon. State stays
+in shared memory. Zig owns the runtime; Python supplies the common RL-facing
+interface.
 
-Zeno is a GPU-accelerated rigid body physics simulation engine optimized for reinforcement learning and robot policy training. It is designed from first principles to exploit Apple Silicon's unified memory architecture, achieving **10-100x throughput improvements** over existing solutions for batched parallel environments.
+Start with the shortest path that matches the work:
 
-<div class="grid cards" markdown>
+| Need | Read |
+|---|---|
+| Build Zeno | [Installation](getting-started/installation.md) |
+| Run a model | [Quick start](getting-started/quickstart.md) |
+| Decide whether Zeno fits | [Status and scope](status.md) |
+| Use Python | [Python API](guide/python-api.md) |
+| Use Gymnasium or SB3 | [Gymnasium](guide/gymnasium.md) |
+| Use Zig | [Zig API](guide/zig-api.md) |
+| Understand the pipeline | [Architecture](reference/architecture.md) |
+| Interpret benchmark claims | [Performance](reference/performance.md) |
+| Inspect the equations | [Physics model](reference/physics.md) |
 
--   :material-rocket-launch:{ .lg .middle } __Blazing Fast__
+## Operating rule
 
-    ---
+Parsing an MJCF file proves that Zeno can read it. Running it proves that the
+pipeline executes. Neither proves MuJoCo-equivalent dynamics. Performance and
+correctness claims in these docs name the model, hardware, workload, and test
+boundary.
 
-    Simulate 1024 environments in parallel with native Metal compute shaders.
+## Repository map
 
--   :material-memory:{ .lg .middle } __Zero-Copy Memory__
+| Path | Contents |
+|---|---|
+| `src/world/` | world state and step orchestration |
+| `src/shaders/` | Metal compute kernels |
+| `src/physics/` | constraints and experimental systems |
+| `src/collision/` | contact generation |
+| `src/mjcf/` | MJCF parser |
+| `python/zeno/` | Python, Gymnasium, and SB3 bindings |
+| `benchmarks/` | benchmark programs and recorded results |
+| `tests/` | Zig and Python regressions |
 
-    ---
-
-    Unified memory architecture eliminates CPU-GPU transfer overhead.
-
--   :material-robot:{ .lg .middle } __RL-Optimized__
-
-    ---
-
-    Built for reinforcement learning with Gymnasium integration.
-
--   :material-file-code:{ .lg .middle } __MJCF Compatible__
-
-    ---
-
-    Load existing MuJoCo XML models with tendons, constraints, and terrain.
-
-</div>
-
-## Features
-
-- **Collision Geometry Parsing**: Sphere, capsule, box, cylinder, plane, mesh, heightfield; Metal `World.step` has complete sphere/capsule/box/plane pair coverage plus sphere-cylinder and cylinder-plane, while other cylinder pairs, meshes, and heightfields are not resolved
-- **Joint Types**: Free, ball, hinge, slide, fixed, universal
-- **Tendons**: Fixed and spatial tendons with spring behavior
-- **Equality Constraints**: Weld, connect, joint, tendon constraints
-- **Sensors**: Joint position/velocity, accelerometer, gyro, frame pose
-- **Actuators**: Motor, position servo, velocity servo
-- **Soft Bodies**: PBD deformable cloth and volumetric bodies
-- **Fluids**: SPH fluid simulation with spatial hashing
-- **Materials**: PBR materials with texture support
-
-## Performance
-
-Benchmarked on Apple M4 Pro with real MJCF models (full `World.step`, medians of 5 runs):
-
-| Environment | 1024 envs × 1000 steps | Throughput |
-|-------------|------------------------|-----------------|
-| Pendulum    | 416 ms  | 2.46M steps/sec |
-| Cartpole    | 409 ms  | 2.50M steps/sec |
-| Pusher      | 741 ms  | 1.38M steps/sec |
-| Ant         | 712 ms  | 1.44M steps/sec |
-| Humanoid    | 3,014 ms | 0.34M steps/sec |
-
-These are wall-clock throughput figures for Zeno's own pipeline, **not** a semantics-matched
-comparison against MuJoCo — Zeno does simplified per-step physics, so cross-simulator ratios
-would measure throughput, not physics equivalence. These table values include synchronous GPU
-completion; the optional per-stage profiler measures CPU encode time rather than GPU duration.
-A matched-semantics MuJoCo parity benchmark is planned but does not exist yet.
-
-## Quick Example
-
-```python
-import zeno
-import numpy as np
-
-# Create environment with 1024 parallel instances
-env = zeno.make("ant.xml", num_envs=1024)
-
-# Reset all environments
-obs = env.reset()
-
-# Run simulation
-for _ in range(1000):
-    actions = np.random.uniform(-1, 1, (1024, env.action_dim))
-    obs, rewards, dones, info = env.step(actions)
-
-env.close()
-```
-
-## Why Zeno?
-
-The name references **Zeno of Elea**, whose paradoxes on motion and infinity are foundational to physics and mathematics — fitting for a simulation engine that discretizes continuous motion into parallel computation.
-
-### Design Philosophy
-
-1. **Unified Memory First**: All state lives in shared memory accessible by both CPU and GPU
-2. **Throughput Over Fidelity**: Optimized for RL training, not engineering simulation
-3. **Minimal Abstraction**: Direct Metal API access without intermediate frameworks
-
-## Getting Started
-
-<div class="grid cards" markdown>
-
--   [:material-download: __Installation__](getting-started/installation.md)
-
-    ---
-
-    Build from source and install Python bindings
-
--   [:material-play: __Quick Start__](getting-started/quickstart.md)
-
-    ---
-
-    Run your first simulation in minutes
-
-</div>
-
-## License
-
-Zeno is released under the [MIT License](https://github.com/lulzx/zeno/blob/main/LICENSE).
+This page is the complete documentation index.
